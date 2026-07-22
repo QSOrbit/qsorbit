@@ -11,3 +11,7 @@ class SerialConnectionError(RotorError):
 
 class SerialTimeoutError(RotorError):
     """Raised when a serial read operation times out."""
+
+
+class ProtocolError(RotorError):
+    """Raised when a rotor response cannot be parsed or is out of range."""
