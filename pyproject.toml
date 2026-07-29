@@ -26,6 +26,7 @@ classifiers = [
 ]
 dependencies = [
     "pyserial>=3.5",
+    "skyfield>=1.49",
 ]
 
 [dependency-groups]
