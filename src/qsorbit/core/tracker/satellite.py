@@ -5,14 +5,6 @@ propagator) to turn a two-line element set into position and velocity at
 an arbitrary time. Skyfield handles the orbital mechanics and time-scale
 plumbing (UTC/TT/TDB, leap seconds); this module's job is a small,
 QSOrbit-shaped API around it — see :class:`Satellite`.
-
-A single skyfield timescale is shared by every ``Satellite`` in the
-process, built with ``builtin=True`` so it uses skyfield's bundled
-leap-second/delta-T tables instead of downloading fresh ones at import
-time. That means no network access is required and results are
-identical on every machine and in CI, at the cost of losing sub-second
-delta-T precision for dates far from when skyfield's bundled tables
-were generated — an acceptable trade for this project.
 """
 
 from __future__ import annotations
@@ -20,12 +12,13 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from skyfield.api import EarthSatellite, load
+from skyfield.api import EarthSatellite
 
+from qsorbit.core.rotor import Position
+from qsorbit.core.tracker._shared import require_timezone_aware, ts
 from qsorbit.core.tracker.exceptions import PropagationError, TleError
-from qsorbit.core.tracker.state import EciState
-
-_ts = load.timescale(builtin=True)
+from qsorbit.core.tracker.observer import ObserverLocation
+from qsorbit.core.tracker.state import EciState, TopocentricState
 
 
 class Satellite:
@@ -51,7 +44,7 @@ class Satellite:
                 "look like a TLE."
             )
         try:
-            self._sat = EarthSatellite(line1, line2, name, _ts)
+            self._sat = EarthSatellite(line1, line2, name, ts)
         except ValueError as exc:
             raise TleError(f"Could not parse TLE lines: {exc}") from exc
 
@@ -123,9 +116,11 @@ class Satellite:
     def skyfield_satellite(self) -> EarthSatellite:
         """The underlying skyfield ``EarthSatellite``.
 
-        An escape hatch for advanced use — topocentric conversion (a
-        later chunk) needs the raw skyfield object to subtract an
-        observer position from. Prefer :meth:`state_at` for everyday use.
+        An escape hatch for advanced use — :meth:`topocentric_state`
+        uses this internally to subtract an observer position; reach
+        for it directly only if you need something this class doesn't
+        already expose. Prefer :meth:`state_at` and
+        :meth:`topocentric_state` for everyday use.
         """
         return self._sat
 
@@ -135,10 +130,8 @@ class Satellite:
         Args:
             time: The instant to compute, as a timezone-aware datetime.
                 Any timezone is accepted and converted to UTC internally,
-                but naive datetimes are rejected — satellite math is
-                meaningless without knowing which UTC instant is meant,
-                and silently assuming one would be exactly the kind of
-                bug that's invisible until it isn't.
+                but naive datetimes are rejected — see
+                :func:`~qsorbit.core.tracker._shared.require_timezone_aware`.
 
         Returns:
             The satellite's position and velocity at ``time``, in the
@@ -151,12 +144,8 @@ class Satellite:
                 this TLE's epoch for the elements to still describe a
                 physically sensible orbit.
         """
-        if time.tzinfo is None:
-            raise ValueError(
-                "time must be timezone-aware (e.g. datetime.now(UTC)). Naive "
-                "datetimes are ambiguous about which UTC instant is meant."
-            )
-        t = _ts.from_datetime(time)
+        require_timezone_aware(time)
+        t = ts.from_datetime(time)
         geocentric = self._sat.at(t)
         if geocentric.message is not None:
             raise PropagationError(
@@ -169,4 +158,49 @@ class Satellite:
             time=time.astimezone(UTC),
             position_km=(x, y, z),
             velocity_km_s=(vx, vy, vz),
+        )
+
+    def topocentric_state(self, observer: ObserverLocation, time: datetime) -> TopocentricState:
+        """Compute where this satellite appears from ``observer`` at ``time``.
+
+        This is what a rotor needs to know where to point, and what a
+        Doppler correction needs to know how fast the range is changing.
+
+        Args:
+            observer: The ground observer's location.
+            time: The instant to compute, as a timezone-aware datetime
+                (see :meth:`state_at`).
+
+        Returns:
+            The satellite's azimuth/elevation, range, and range rate as
+            seen from ``observer``.
+
+        Raises:
+            ValueError: If ``time`` is naive (has no ``tzinfo``).
+            PropagationError: If SGP4 cannot compute a valid position at
+                ``time``.
+        """
+        require_timezone_aware(time)
+        t = ts.from_datetime(time)
+        difference = self._sat - observer.skyfield_position
+        topocentric = difference.at(t)
+        message = getattr(topocentric, "message", None)
+        if message is not None:
+            raise PropagationError(
+                f"SGP4 could not compute a valid position at {time.isoformat()}: {message}"
+            )
+        alt, az, distance = topocentric.altaz()
+        *_, range_rate = topocentric.frame_latlon_and_rates(observer.skyfield_position)
+        # az.degrees is always meant to be in [0.0, 360.0) — skyfield's own
+        # contract for a compass bearing — but azimuth is geometrically
+        # undefined at zenith, so floating-point noise can occasionally land
+        # exactly on the 360.0/0.0 boundary or a hair below zero. The `%` here
+        # is specifically compensating for that representation edge, not
+        # forgiving a genuinely out-of-range value the way Position's own
+        # strict validation is designed to catch.
+        azimuth = az.degrees % 360.0
+        return TopocentricState(
+            position=Position(azimuth=azimuth, elevation=alt.degrees),
+            range_km=distance.km,
+            range_rate_km_s=range_rate.km_per_s,
         )
