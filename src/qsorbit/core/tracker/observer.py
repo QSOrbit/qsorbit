@@ -20,9 +20,12 @@ class ObserverLocation:
             is +90.
         longitude: Degrees, ``-180.0 <= longitude <= 180.0``. East is
             positive; west is negative.
-        elevation_m: Height above the WGS84 ellipsoid, in meters.
+        altitude_m: Height above the WGS84 ellipsoid, in meters.
             Defaults to sea level (0.0). Can be negative (e.g. Death
-            Valley) — there's no lower bound worth enforcing.
+            Valley) — there's no lower bound worth enforcing. Named
+            "altitude" rather than skyfield's "elevation" because
+            elsewhere in QSOrbit elevation always means an angle above
+            the horizon.
 
     Raises:
         ValueError: If ``latitude`` or ``longitude`` is out of range.
@@ -30,7 +33,7 @@ class ObserverLocation:
 
     latitude: float
     longitude: float
-    elevation_m: float = 0.0
+    altitude_m: float = 0.0
 
     def __post_init__(self) -> None:
         if not -90.0 <= self.latitude <= 90.0:
@@ -46,4 +49,4 @@ class ObserverLocation:
         :attr:`Satellite.skyfield_satellite
         <qsorbit.core.tracker.satellite.Satellite.skyfield_satellite>`.
         """
-        return wgs84.latlon(self.latitude, self.longitude, elevation_m=self.elevation_m)
+        return wgs84.latlon(self.latitude, self.longitude, elevation_m=self.altitude_m)

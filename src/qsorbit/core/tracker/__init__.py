@@ -10,6 +10,7 @@ from qsorbit.core.tracker.exceptions import PropagationError, TleError, TrackerE
 from qsorbit.core.tracker.observer import ObserverLocation
 from qsorbit.core.tracker.satellite import Satellite
 from qsorbit.core.tracker.state import EciState, TopocentricState
+from qsorbit.core.tracker.target import Target
 
 __all__ = [
     "SPEED_OF_LIGHT_KM_S",
@@ -17,6 +18,7 @@ __all__ = [
     "ObserverLocation",
     "PropagationError",
     "Satellite",
+    "Target",
     "TleError",
     "TopocentricState",
     "TrackerError",
