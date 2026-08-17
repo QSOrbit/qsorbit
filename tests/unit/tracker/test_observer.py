@@ -38,14 +38,14 @@ GOCE
 
 class TestObserverLocationValidation:
     def test_typical_location(self):
-        obs = ObserverLocation(latitude=40.8939, longitude=-83.8917, elevation_m=280.0)
+        obs = ObserverLocation(latitude=40.8939, longitude=-83.8917, altitude_m=280.0)
         assert obs.latitude == 40.8939
         assert obs.longitude == -83.8917
-        assert obs.elevation_m == 280.0
+        assert obs.altitude_m == 280.0
 
-    def test_elevation_defaults_to_sea_level(self):
+    def test_altitude_defaults_to_sea_level(self):
         obs = ObserverLocation(latitude=0.0, longitude=0.0)
-        assert obs.elevation_m == 0.0
+        assert obs.altitude_m == 0.0
 
     def test_latitude_bounds_inclusive(self):
         assert ObserverLocation(latitude=90.0, longitude=0.0).latitude == 90.0
@@ -95,7 +95,7 @@ class TestTopocentricStateOverhead:
 
         state = sat.topocentric_state(observer, t.utc_datetime())
 
-        assert state.position.elevation == pytest.approx(90.0, abs=0.1)
+        assert state.sky_position.elevation == pytest.approx(90.0, abs=0.1)
         assert state.range_km == pytest.approx(_height_km(sat, t), abs=5.0)
 
 
@@ -116,7 +116,7 @@ class TestTopocentricStateHorizon:
 
         state = sat.topocentric_state(observer, rise_or_set_times[0].utc_datetime())
 
-        assert state.position.elevation == pytest.approx(0.0, abs=1.0)
+        assert state.sky_position.elevation == pytest.approx(0.0, abs=1.0)
 
 
 class TestTopocentricStatePropagationError:

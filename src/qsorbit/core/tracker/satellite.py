@@ -14,7 +14,7 @@ from pathlib import Path
 
 from skyfield.api import EarthSatellite
 
-from qsorbit.core.rotor import Position
+from qsorbit.core.geometry import AzEl
 from qsorbit.core.tracker._shared import require_timezone_aware, ts
 from qsorbit.core.tracker.exceptions import PropagationError, TleError
 from qsorbit.core.tracker.observer import ObserverLocation
@@ -106,9 +106,11 @@ class Satellite:
     def epoch(self) -> datetime:
         """The TLE's epoch — the moment its elements are most accurate — as UTC.
 
-        Element sets are only reliable for a week or two either side of
-        this moment; see the "Notes for the work" on this chunk for why
-        that matters.
+        SGP4's accuracy degrades as the requested time moves away from
+        the epoch, because a TLE is a snapshot of orbital elements that
+        real perturbations steadily invalidate. Element sets are
+        generally only reliable for a week or two either side of this
+        moment, which is why tracking software refreshes them often.
         """
         return self._sat.epoch.utc_datetime()
 
@@ -172,8 +174,11 @@ class Satellite:
                 (see :meth:`state_at`).
 
         Returns:
-            The satellite's azimuth/elevation, range, and range rate as
-            seen from ``observer``.
+            The satellite's sky position, range, and range rate as seen
+            from ``observer``. The position is an
+            :class:`~qsorbit.core.geometry.AzEl` — where the satellite
+            *is*, not a rotor command; see :mod:`qsorbit.core.pointing`
+            to turn it into one.
 
         Raises:
             ValueError: If ``time`` is naive (has no ``tzinfo``).
@@ -196,11 +201,11 @@ class Satellite:
         # undefined at zenith, so floating-point noise can occasionally land
         # exactly on the 360.0/0.0 boundary or a hair below zero. The `%` here
         # is specifically compensating for that representation edge, not
-        # forgiving a genuinely out-of-range value the way Position's own
-        # strict validation is designed to catch.
+        # forgiving a genuinely out-of-range value the way AzEl's own strict
+        # validation is designed to catch.
         azimuth = az.degrees % 360.0
         return TopocentricState(
-            position=Position(azimuth=azimuth, elevation=alt.degrees),
+            sky_position=AzEl(azimuth=azimuth, elevation=alt.degrees),
             range_km=distance.km,
             range_rate_km_s=range_rate.km_per_s,
         )
