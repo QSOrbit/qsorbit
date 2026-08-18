@@ -16,10 +16,11 @@ from qsorbit.core.rotor.exceptions import (
     SerialConnectionError,
     SerialTimeoutError,
 )
-from qsorbit.core.rotor.position import Position
+from qsorbit.core.rotor.position import MAX_AXIS_DEGREES, Position
 from qsorbit.core.rotor.serial_port import SerialPort
 
 __all__ = [
+    "MAX_AXIS_DEGREES",
     "Position",
     "ProtocolError",
     "RotorError",
