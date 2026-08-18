@@ -71,14 +71,21 @@ def parse_position(line: bytes) -> Position:
         line: A response line from the rotor, e.g. ``b"AZ180.0 EL45.0\\r\\n"``.
             Surrounding whitespace and line terminators are tolerated.
 
+    Note that a homed rotor legitimately reports small negative angles —
+    ``b"AZ-1.5 EL2.0\\n"`` is a normal reading, not an error — because a
+    :class:`~qsorbit.core.rotor.position.Position` is a mechanical axis
+    angle rather than a compass bearing.
+
     Returns:
         The reported position.
 
     Raises:
         ProtocolError: If the line does not match the expected format, or
-            if it parses but reports angles outside the valid range (which
+            if it parses but the angles couldn't have come from a working
+            rotor (non-finite, or beyond
+            :data:`~qsorbit.core.rotor.position.MAX_AXIS_DEGREES`) — which
             means the rotor sent nonsense, not that the caller made a
-            programming error).
+            programming error.
     """
     match = _POSITION_RE.match(line)
     if match is None:
