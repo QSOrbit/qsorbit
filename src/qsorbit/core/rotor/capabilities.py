@@ -65,7 +65,16 @@ class RotorCapabilities:
         elevation_min_deg: Lowest elevation axis angle this rotor may be
             commanded to.
         elevation_max_deg: Highest elevation axis angle this rotor may be
-            commanded to.
+            commanded to. Note this is *axis travel*, not how high the
+            antenna can point: a boom that rotates past vertical has a
+            legitimate axis angle of 135°, which points at 45° of sky
+            elevation with the base turned 180° round. Sky elevation is
+            capped at 90° by :class:`~qsorbit.core.geometry.AzEl`, and
+            that cap is what every user-facing number obeys. Declaring
+            travel past 90° here is what later permits flip mode, where
+            :func:`~qsorbit.core.pointing.sky_to_rotor` reaches a target
+            as ``azimuth + 180`` and ``180 - elevation`` rather than
+            swinging the azimuth axis half a turn mid-pass.
         azimuth_wrap: What the rotor does when commanded past 360°. See
             :class:`AzimuthWrap`.
         acceptance_window_deg: How close to the target an axis has to

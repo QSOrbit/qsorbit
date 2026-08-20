@@ -11,7 +11,9 @@ implements a subset with SatNOGS-specific extensions. See
 """
 
 from qsorbit.core.rotor.capabilities import AzimuthWrap, RotorCapabilities
+from qsorbit.core.rotor.controller import Arrival, Rotor, RotorStatus
 from qsorbit.core.rotor.exceptions import (
+    HomingError,
     PositionLimitError,
     ProtocolError,
     RotorError,
@@ -35,14 +37,18 @@ from qsorbit.core.rotor.serial_port import SerialPort
 
 __all__ = [
     "MAX_AXIS_DEGREES",
+    "Arrival",
     "AzimuthWrap",
     "Command",
+    "HomingError",
     "Position",
     "PositionLimitError",
     "ProtocolError",
+    "Rotor",
     "RotorCapabilities",
     "RotorError",
     "RotorErrorCode",
+    "RotorStatus",
     "SerialConnectionError",
     "SerialPort",
     "SerialTimeoutError",

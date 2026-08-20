@@ -1,0 +1,133 @@
+# QSOrbit station configuration — example
+#
+# Copy this file to one of the locations QSOrbit searches, in order of
+# precedence:
+#
+#   1. wherever you point --config
+#   2. ./qsorbit.toml            (the current working directory)
+#   3. the per-user config directory:
+#        Windows  %APPDATA%\qsorbit\config.toml
+#        macOS    ~/Library/Application Support/qsorbit/config.toml
+#        Linux    ~/.config/qsorbit/config.toml
+#
+# Then replace every value below with your own. Nothing here is
+# guessed at runtime: missing keys and unknown keys are both startup
+# errors, on purpose. A misspelled travel limit that silently fell back
+# to a default would be a limit you believe is protecting your hardware
+# and isn't.
+
+
+# ---------------------------------------------------------------------
+# Where your antenna is
+# ---------------------------------------------------------------------
+[observer]
+
+# Degrees. North and east are positive; south and west are negative.
+latitude = 40.0000
+longitude = -83.0000
+
+# Height above the WGS84 ellipsoid, in metres. Optional, defaults to 0.
+# Pointing accuracy barely notices this for satellites; it is here
+# because it costs nothing and matters for anything closer.
+altitude_m = 250.0
+
+
+# ---------------------------------------------------------------------
+# How to reach the rotator
+# ---------------------------------------------------------------------
+[rotor]
+
+# Serial port. "COM5" on Windows, "/dev/ttyUSB0" on Linux,
+# "/dev/tty.usbserial-0001" or similar on macOS.
+port = "COM5"
+
+# Optional. The stock SatNOGS firmware hard-codes 19200
+# (#define BAUDRATE 19200), which is the default here.
+baudrate = 19200
+
+# Optional. How long a single read may block, in seconds. This is not
+# the RS-485 turnaround below — this one bounds waiting, that one paces
+# the gap between writing a command and reading its reply.
+timeout_s = 1.0
+
+
+# ---------------------------------------------------------------------
+# What your rotator may safely be told to do
+# ---------------------------------------------------------------------
+#
+# READ THIS SECTION PROPERLY BEFORE CHANGING IT.
+#
+# The SatNOGS firmware applies no limits to a commanded position — not
+# at the command handler, and not in the control loop either. It will
+# accept AZ9999 and drive toward it until someone cuts power. These
+# values are the only thing standing between a bad number and your
+# hardware.
+#
+# They also differ between two builds of the same design, which is why
+# none of them are inferred from the firmware version.
+[rotor.capabilities]
+
+# AXIS TRAVEL LIMITS — how far each joint may rotate from where it
+# homed. These are NOT sky angles, and in particular elevation here is
+# not "how high you can point".
+#
+# Everywhere a person looks — what you type, what QSOrbit prints, what
+# a satellite's position is — elevation runs 0 to 90, because you
+# cannot point higher than straight up. This section is the other side
+# of that translation: the boom on many builds keeps rotating past
+# vertical, and an axis reading of 135 means it has swung over the top
+# and is pointing down the far side. That is a real place the joint can
+# be, and it is worth declaring, because reaching a target at 45
+# elevation by rotating the boom to 135 and the base 180 degrees round
+# is how a pass near the zenith gets tracked without the azimuth axis
+# whipping half a turn mid-pass.
+#
+# Set elevation_max_deg to 90.0 if your boom physically stops at
+# vertical. Set it to 180.0 only if you have confirmed it can rotate
+# past. A command outside these limits is refused and never
+# transmitted.
+azimuth_min_deg = 0.0
+azimuth_max_deg = 360.0
+elevation_min_deg = 0.0
+elevation_max_deg = 180.0
+
+# What your rotator does when commanded past 360 degrees. This one
+# cannot be guessed, and guessing wrong causes physical damage:
+#
+#   "extra_rotation"   Commanding 380 spins the axis the whole way
+#                      around and settles at 20. There is no travel
+#                      past 360; the extra turn is pure cable wrap.
+#                      Verified behaviour on a stock SatNOGS build.
+#
+#   "extended_travel"  The axis really does have more than 360 degrees
+#                      of travel, so 20 and 380 are different physical
+#                      places. Only on such a rotor is it safe to
+#                      command azimuth + 360 to get through a pass that
+#                      crosses north without hitting a cable stop.
+#
+# If you have not tested which one your rotator does, use
+# "extra_rotation" — it is the more cautious of the two.
+azimuth_wrap = "extra_rotation"
+
+# How close to the target an axis must settle to count as arrived.
+#
+# This is not a tolerance for sloppiness. With stock PID gains (Ki = 0
+# on both axes) an axis stops once the control output drops below what
+# the motor needs to break static friction, which leaves a steady-state
+# shortfall of roughly 1.5 degrees in azimuth and 2.1 in elevation on a
+# perfectly healthy rotator. A window smaller than that reports every
+# successful move as a failure. Fine for VHF/UHF beamwidths; revisit it
+# for anything narrower.
+acceptance_window_deg = 2.5
+
+# Gap between writing a command and reading its reply, in seconds. The
+# link is half-duplex, so the transceiver needs time to turn around.
+# 0.15 is reliable on a short link; 0.3 to 0.5 is safer on long cable.
+# An empty reply is far more often a too-short gap than a real fault.
+rs485_turnaround_s = 0.15
+
+# Optional. The firmware version this configuration was verified
+# against. QSOrbit compares it to what the rotator reports at connect
+# and warns on a mismatch. It is never used to infer any of the values
+# above.
+firmware_version = "SatNOGS-v2.2.1"

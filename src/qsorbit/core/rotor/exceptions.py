@@ -17,6 +17,21 @@ class ProtocolError(RotorError):
     """Raised when a rotor response cannot be parsed or is out of range."""
 
 
+class HomingError(RotorError):
+    """Raised when the rotator reports a latched homing failure.
+
+    This one is distinct from every other error because of how it
+    behaves: the firmware's error handler explicitly refuses to clear
+    it, so nothing sent over the serial link recovers it — not
+    ``RESET``, not ``RB``. Only a power cycle will.
+
+    It is also the one error that invalidates everything else. A rotor
+    that failed to home has no valid zero, so every position it reports
+    afterwards is measured from nowhere. That is why connecting raises
+    on this and merely reports the others.
+    """
+
+
 class PositionLimitError(RotorError):
     """Raised when a commanded position is outside a rotor's declared travel.
 
