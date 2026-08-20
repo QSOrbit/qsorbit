@@ -73,7 +73,7 @@ def sky_to_rotor(sky: AzEl) -> Position:
 
 
 def compute_pointing_command(target: Target, observer: ObserverLocation, time: datetime) -> bytes:
-    """Compute the EasyComm command to point a rotor at ``target``.
+    """Compute the rotor command that would point at ``target``.
 
     Args:
         target: What to point at — anything satisfying
@@ -82,9 +82,19 @@ def compute_pointing_command(target: Target, observer: ObserverLocation, time: d
         observer: The ground station's location.
         time: The instant to compute for, as a timezone-aware datetime.
 
+    .. warning::
+
+       The result is **not range-checked against any particular rotor.**
+       It says where the target is, expressed as a command; it does not
+       promise the hardware can go there. Anything that actually drives a
+       rotor must check the position against that rotor's declared
+       :class:`~qsorbit.core.rotor.RotorCapabilities` first, because the
+       controller firmware will accept and attempt whatever it is sent.
+
     Returns:
-        The EasyComm command bytes to send to the rotor, e.g.
-        ``b"AZ180.0 EL45.0\\n"``.
+        The command bytes to send to the rotor, e.g.
+        ``b"AZ180.0 EL45.0\\n"``. A set-position command draws no reply
+        from the firmware.
 
     Raises:
         ValueError: If ``time`` is naive (has no ``tzinfo``).
@@ -92,4 +102,4 @@ def compute_pointing_command(target: Target, observer: ObserverLocation, time: d
             ``time``.
     """
     state = target.topocentric_state(observer, time)
-    return format_set_position(sky_to_rotor(state.sky_position))
+    return bytes(format_set_position(sky_to_rotor(state.sky_position)))
