@@ -93,9 +93,13 @@ class TestComputePointingCommand:
         command = compute_pointing_command(sat, observer, time)
 
         expected_state = sat.topocentric_state(observer, time)
-        assert command == format_set_position(sky_to_rotor(expected_state.sky_position))
+        # bytes() because format_set_position returns a Command, which
+        # carries the wire bytes plus whether the rotor replies to them.
+        # compute_pointing_command hands back only the bytes: it says
+        # where the target is, and nothing here talks to a port.
+        assert command == bytes(format_set_position(sky_to_rotor(expected_state.sky_position)))
 
-    def test_command_is_well_formed_easycomm(self):
+    def test_command_is_well_formed(self):
         sat = Satellite.from_tle(_TEME_EXAMPLE_TLE)
         observer = ObserverLocation(latitude=40.0, longitude=-83.0)
 
