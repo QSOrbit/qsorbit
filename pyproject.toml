@@ -63,7 +63,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-ra --strict-markers --strict-config"
+addopts = "-ra --strict-markers --strict-config -m 'not integration'"
 markers = [
-    "integration: marks tests as integration tests requiring hardware (deselect with '-m \"not integration\"')",
+    "integration: needs a real rotator on a serial port. Deselected by default; run with '-m integration' at the bench.",
 ]
