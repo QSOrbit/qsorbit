@@ -19,7 +19,7 @@ is a few lines of pure string formatting, not the seam.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, tzinfo
 
 from qsorbit.core.geometry import AzEl
 from qsorbit.core.pointing import TickOutcome, TrackSample, rotor_to_sky
@@ -45,7 +45,8 @@ class ReadoutText:
 
     Args:
         target_name: What is being tracked.
-        time: When this sample was computed, formatted.
+        time: When this sample was computed, formatted showing UTC
+            alongside the local system clock — see :func:`format_time`.
         sky_position: Where the target actually is.
         rotor_axis: The rotor's raw axis reading.
         rotor_as_sky: The same reading, converted through
@@ -66,9 +67,27 @@ class ReadoutText:
     outcome: str
 
 
-def format_time(instant: datetime) -> str:
-    """Format an instant for display, always in UTC regardless of its zone."""
-    return instant.astimezone(UTC).strftime("%H:%M:%S UTC")
+def format_time(instant: datetime, *, local_zone: tzinfo | None = None) -> str:
+    """Format an instant for display, in UTC alongside the local system clock.
+
+    Phil's own request: doing the UTC-to-local conversion by eye while
+    watching a pass is exactly the kind of arithmetic this readout
+    should save someone from doing.
+
+    Args:
+        instant: The time to format.
+        local_zone: The zone to show as "local". Defaults to ``None``,
+            which — exactly as with :meth:`datetime.astimezone` itself —
+            means "ask the OS for the system's configured zone", and is
+            what every real caller should leave alone. Tests pass a
+            fixed offset instead: the system's zone varies by machine
+            (and almost certainly differs between Phil's desk and
+            wherever tests run), which would make asserting an exact
+            local time non-portable.
+    """
+    utc = instant.astimezone(UTC).strftime("%H:%M:%S UTC")
+    local = instant.astimezone(local_zone).strftime("%H:%M:%S")
+    return f"{utc}  ({local} local)"
 
 
 def format_azel(sky: AzEl) -> str:

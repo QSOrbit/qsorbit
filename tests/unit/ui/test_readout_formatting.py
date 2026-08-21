@@ -49,13 +49,27 @@ def sample(
 
 
 class TestFormatTime:
-    def test_formats_as_hms_utc(self):
-        assert format_time(datetime(2026, 8, 21, 18, 30, 15, tzinfo=UTC)) == "18:30:15 UTC"
-
-    def test_converts_a_non_utc_zone_to_utc(self):
+    def test_formats_utc_alongside_an_injected_local_zone(self):
         eastern = timezone(timedelta(hours=-4))
-        instant = datetime(2026, 8, 21, 14, 30, 15, tzinfo=eastern)
-        assert format_time(instant) == "18:30:15 UTC"
+        instant = datetime(2026, 8, 21, 18, 30, 15, tzinfo=UTC)
+        assert format_time(instant, local_zone=eastern) == "18:30:15 UTC  (14:30:15 local)"
+
+    def test_converts_a_non_utc_source_zone_to_utc_and_to_local(self):
+        source_zone = timezone(timedelta(hours=-4))
+        instant = datetime(2026, 8, 21, 14, 30, 15, tzinfo=source_zone)
+        pacific = timezone(timedelta(hours=-7))
+        assert format_time(instant, local_zone=pacific) == "18:30:15 UTC  (11:30:15 local)"
+
+    def test_defaults_to_the_systems_own_local_zone(self):
+        # Can't assert an exact local time here - it depends on whatever
+        # machine happens to run this test, which is exactly why every
+        # other test in this class injects a fixed zone instead. This
+        # only proves the no-argument path runs and is still labelled
+        # "local" rather than silently falling back to UTC.
+        instant = datetime(2026, 8, 21, 18, 30, 15, tzinfo=UTC)
+        result = format_time(instant)
+        assert result.startswith("18:30:15 UTC  (")
+        assert result.endswith(" local)")
 
 
 class TestFormatAzEl:
