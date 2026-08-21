@@ -1,4 +1,4 @@
-"""Unit tests for the tracking loop.
+"""Unit tests for the tracking loop, plus rotor_to_sky().
 
 Kept apart from test_pointing.py, which validates the sky-to-rotor seam
 against real orbital math and therefore imports skyfield. Nothing here
@@ -6,6 +6,11 @@ needs an ephemeris: the target is a stub reporting scripted sky
 positions, the rotor is a MagicMock spec'd against the real class, and
 the clock is fake. That keeps the loop's own behaviour — cadence,
 deadband, refusals — separable from whether the astronomy is right.
+
+rotor_to_sky() lives in the same module as the loop and needs no
+ephemeris either, so its tests belong here for the same reason:
+importing qsorbit.core.pointing at all pulls in qsorbit.core.rotor and
+qsorbit.core.tracker, and only the latter needs skyfield.
 
 The rotor mock is spec'd rather than free-form on purpose (the Chunk F
 lesson): a scripted stub that isn't spec'd keeps passing against methods
@@ -27,6 +32,7 @@ from qsorbit.core.pointing import (
     TrackingLoop,
     TrackSample,
     TravelGuardError,
+    rotor_to_sky,
 )
 from qsorbit.core.rotor import (
     AzimuthWrap,
@@ -622,3 +628,62 @@ class TestCleanStop:
 
         assert loop.latest_sample is not None
         assert loop.latest_sample.sky_position == AzEl(180.0, 45.0)
+
+
+# ---------------------------------------------------------------------------
+# rotor_to_sky()
+# ---------------------------------------------------------------------------
+
+
+class TestRotorToSky:
+    def test_returns_an_azel(self):
+        assert isinstance(rotor_to_sky(Position(180.0, 45.0)), AzEl)
+
+    def test_an_in_range_reading_round_trips(self):
+        assert rotor_to_sky(Position(123.4, 56.7)) == AzEl(123.4, 56.7)
+
+    def test_currently_applies_no_correction(self):
+        # Mirrors TestSkyToRotor.test_currently_applies_no_correction in
+        # test_pointing.py: DESIGNED TO FAIL when an alignment offset
+        # lands, so whoever adds one has to consciously touch this
+        # assertion rather than silently changing what every readout
+        # window displays.
+        assert rotor_to_sky(Position(90.0, 30.0)) == AzEl(90.0, 30.0)
+
+    def test_a_freshly_homed_reading_wraps_to_a_compass_bearing(self):
+        # The captured bytes from the first bring-up: AZ-1.5 EL2.0. A
+        # negative axis reading is an ordinary homing settle, not an
+        # error, and its compass direction is 358.5, not -1.5.
+        assert rotor_to_sky(Position(-1.5, 2.0)) == AzEl(358.5, 2.0)
+
+    def test_azimuth_past_360_wraps_to_the_same_bearing_as_no_extra_turns(self):
+        # A rotor commanded to 380 physically ends up pointing where 20
+        # does - the extra rotation is cable wrap, not a different
+        # direction. See AzimuthWrap.EXTRA_ROTATION.
+        assert rotor_to_sky(Position(380.0, 10.0)) == AzEl(20.0, 10.0)
+
+    def test_a_full_extra_turn_wraps_to_the_same_bearing(self):
+        assert rotor_to_sky(Position(720.0, 10.0)) == AzEl(0.0, 10.0)
+
+    def test_elevation_past_vertical_is_clamped_not_rejected(self):
+        # Phil's rotor declares elevation_max_deg=180 (it can rotate past
+        # vertical); AzEl cannot represent that until flip mode exists to
+        # interpret it. Clamping keeps this from raising on a legitimate
+        # axis reading.
+        assert rotor_to_sky(Position(10.0, 95.0)) == AzEl(10.0, 90.0)
+
+    def test_elevation_below_the_declared_floor_is_clamped_not_rejected(self):
+        assert rotor_to_sky(Position(10.0, -95.0)) == AzEl(10.0, -90.0)
+
+    def test_elevation_boundary_values_are_not_clamped_away(self):
+        assert rotor_to_sky(Position(10.0, 90.0)) == AzEl(10.0, 90.0)
+        assert rotor_to_sky(Position(10.0, -90.0)) == AzEl(10.0, -90.0)
+
+    def test_never_raises_on_a_position_the_type_itself_permits(self):
+        # Position accepts anything up to +/-MAX_AXIS_DEGREES (1080).
+        # rotor_to_sky is a display conversion for a live readout: it
+        # must not crash the window on any reading the rotor could
+        # actually report.
+        for azimuth in (-1080.0, -400.0, 0.0, 400.0, 1080.0):
+            for elevation in (-1080.0, -95.0, 0.0, 95.0, 1080.0):
+                rotor_to_sky(Position(azimuth, elevation))

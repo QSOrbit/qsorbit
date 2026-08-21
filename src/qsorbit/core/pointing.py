@@ -180,6 +180,65 @@ def sky_to_rotor(sky: AzEl) -> Position:
     return Position(azimuth=sky.azimuth, elevation=sky.elevation)
 
 
+def rotor_to_sky(position: Position) -> AzEl:
+    """Convert a rotor axis reading into the sky direction it would mean.
+
+    .. note::
+
+       **No correction is currently applied**, exactly as in
+       :func:`sky_to_rotor` — this is that conversion's inverse, and
+       carries the same honesty. It says where an aligned, non-flipped
+       installation would be pointing for this axis reading; it does
+       not know this rig's actual alignment offset, because none is
+       measured yet.
+
+    A :class:`~qsorbit.core.rotor.Position` is a mechanical axis
+    reading, and its domain is wider than :class:`AzEl`'s: multi-turn
+    azimuth travel makes readings past 360° ordinary, a freshly homed
+    axis commonly settles a degree or two past zero (``AZ-1.5 EL2.0``
+    has been observed at the bench), and a rotor whose elevation travel
+    passes vertical can report an axis angle ``AzEl`` cannot represent
+    at all. This function never raises on a reading a real rotor can
+    produce:
+
+    * **Azimuth** is taken modulo 360°. This is not an approximation —
+      the compass direction a rotor physically points depends only on
+      where the axis ends up, not on how many extra turns of cable it
+      took to get there.
+    * **Elevation** is clamped to ``[-90.0, 90.0]``. Once flip mode
+      lands (see this module's docstring), an axis reading past
+      vertical will mean a real, different sky direction reached by
+      way of ``azimuth + 180``, and this function will need to know
+      that to convert it correctly. Until then, a reading outside
+      ``AzEl``'s range means either ordinary stiction overshoot at a
+      declared limit or a rotor whose extra travel this function
+      doesn't yet understand — clamping is the same "be honest about a
+      reading rather than crash on one" policy
+      :class:`TrackingLoop`'s own travel guard already applies; it is
+      not a claim that the clamped value is where the antenna truly
+      points.
+
+    This is :func:`rotor_to_sky`'s first real consumer:
+    :mod:`qsorbit.ui.readout_window` uses it to show what a
+    :class:`TrackSample`'s :attr:`~TrackSample.rotor_position` means as
+    a sky direction, next to :attr:`~TrackSample.sky_position` — the
+    same rotor-vs-sky distinction :class:`TrackSample` already exists
+    to preserve.
+
+    Args:
+        position: An axis reading, e.g. from
+            :meth:`~qsorbit.core.rotor.Rotor.read_position`.
+
+    Returns:
+        The sky direction this reading would correspond to in an
+        aligned, non-flipped installation.
+    """
+    return AzEl(
+        azimuth=position.azimuth % 360.0,
+        elevation=max(-90.0, min(90.0, position.elevation)),
+    )
+
+
 def compute_pointing_command(target: Target, observer: ObserverLocation, time: datetime) -> bytes:
     """Compute the rotor command that would point at ``target``.
 
