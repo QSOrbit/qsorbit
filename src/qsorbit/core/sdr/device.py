@@ -119,6 +119,31 @@ class AppliedSettings:
         """How far the actual sample rate sits from the requested one, in Hz."""
         return self.sample_rate_hz - self.requested.sample_rate_hz
 
+    def offset_from(self, station_hz: float) -> float:
+        """Return where a signal at ``station_hz`` lands in this capture.
+
+        Args:
+            station_hz: The frequency of interest, in Hz.
+
+        Returns:
+            Its offset from the centre actually tuned, in Hz. Positive
+            means above centre.
+
+        Measured from :attr:`center_hz` and not from the requested
+        frequency, which is the entire reason this lives on the applied
+        settings rather than on the config: the PLL quantises, and an
+        offset computed against a frequency the tuner never reached is
+        wrong by exactly the amount nobody thinks to check.
+
+        Small enough to look unnecessary, and here anyway, because
+        getting this sign backwards is the easiest mistake in the area
+        and because bring-up established that captures are made
+        deliberately *off*-centre — a peak at DC cannot be told apart
+        from the RTL-SDR's permanent DC-offset spike, so it proves
+        nothing.
+        """
+        return station_hz - self.center_hz
+
     @property
     def reports_zero_gain(self) -> bool:
         """``True`` if the tuner claims 0.0 dB of gain.

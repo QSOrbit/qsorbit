@@ -150,16 +150,10 @@ class TestDerivedProperties:
     def test_does_not_flag_the_rate_bring_up_used(self):
         assert not a_config(sample_rate_hz=2_048_000).may_drop_samples
 
-    def test_offset_of_a_station_above_centre_is_positive(self):
-        # First light's arrangement: centred 250 kHz below 99.9 MHz, so
-        # the station must appear at +250 kHz. Getting this sign backwards
-        # is the easiest available mistake.
-        config = a_config(center_hz=99_650_000)
-
-        assert config.offset_from(99_900_000) == pytest.approx(250_000.0)
-
-    def test_offset_of_a_station_below_centre_is_negative(self):
-        assert a_config(center_hz=99_650_000).offset_from(99_500_000) == pytest.approx(-150_000.0)
+    # The offset_from() tests that used to live here moved to
+    # test_device.py alongside AppliedSettings, which is where the
+    # method went: an offset has to be measured from the centre the
+    # tuner actually reached, not the one it was asked for.
 
 
 class TestNearestGainStep:

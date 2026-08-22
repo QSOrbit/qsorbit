@@ -292,6 +292,30 @@ class TestConfigure:
 
         assert applied.requested is config
 
+    def test_offset_of_a_station_above_centre_is_positive(self, sdr):
+        # First light's arrangement: centred 250 kHz below 99.9 MHz, so
+        # the station must appear at +250 kHz. Getting this sign
+        # backwards is the easiest available mistake.
+        applied = sdr.configure(a_config(center_hz=99_650_000))
+
+        assert applied.offset_from(99_900_000) == pytest.approx(250_000.0)
+
+    def test_offset_of_a_station_below_centre_is_negative(self, sdr):
+        applied = sdr.configure(a_config(center_hz=99_650_000))
+
+        assert applied.offset_from(99_500_000) == pytest.approx(-150_000.0)
+
+    def test_the_offset_is_measured_from_where_the_tuner_landed(self, sdr):
+        # Why this method is on AppliedSettings and not on SdrConfig.
+        # The fake quantises to 100 Hz exactly as a real PLL does, so
+        # asking for 99,650,050 lands on 99,650,000 - and an offset
+        # measured from the request is wrong by that difference, in a
+        # direction nothing downstream can detect.
+        applied = sdr.configure(a_config(center_hz=99_650_050))
+
+        assert applied.offset_from(99_900_000) == pytest.approx(250_000.0)
+        assert applied.offset_from(99_900_000) != pytest.approx(249_950.0)
+
     def test_remembers_the_last_applied_settings(self, sdr):
         applied = sdr.configure(a_config())
 

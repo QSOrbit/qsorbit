@@ -160,24 +160,14 @@ class SdrConfig:
         """
         return self.sample_rate_hz > RELIABLE_MAX_SAMPLE_RATE_HZ
 
-    def offset_from(self, station_hz: float) -> float:
-        """Return where a signal at ``station_hz`` lands in this capture.
-
-        Args:
-            station_hz: The frequency of interest, in Hz.
-
-        Returns:
-            Its offset from the tuned centre, in Hz. Positive means
-            above centre.
-
-        This is small enough to feel unnecessary, and it is here anyway
-        because getting the sign backwards is the single easiest mistake
-        in this whole area, and because the bring-up established that
-        signals are verified *at a deliberate offset* from centre rather
-        than at DC — a peak at DC is indistinguishable from the
-        RTL-SDR's permanent DC-offset spike, so it proves nothing.
-        """
-        return station_hz - self.center_hz
+    # There is deliberately no offset_from() here, though there was in
+    # PR1. "Where does a station land in this capture" has to be
+    # measured from the centre the tuner *actually* reached, not the one
+    # it was asked for, so the method belongs on
+    # :class:`~qsorbit.core.sdr.device.AppliedSettings` and lives there.
+    # Keeping a copy here that answered the same question from the
+    # requested centre would be offering a subtly wrong number under a
+    # right-looking name.
 
 
 def nearest_gain_step(requested_db: float, supported_db: Sequence[float]) -> float:

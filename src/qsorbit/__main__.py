@@ -1,6 +1,7 @@
 """Command-line entry point for ``python -m qsorbit``.
 
-Three subcommands: ``point``, ``status``, and ``stop``.
+Four subcommands: ``point``, ``status``, ``stop``, and ``sdr`` (itself
+split into ``info`` and ``capture``).
 
 **Computing is the default; moving is opt-in.** ``point`` works out where
 the rotor would have to go and prints it, without opening the serial port
@@ -45,11 +46,37 @@ from qsorbit.core.rotor import (
     SerialPort,
     format_set_position,
 )
+from qsorbit.core.sdr import (
+    AUTO_GAIN,
+    RtlSdr,
+    SdrConfig,
+    SdrError,
+    capture_to_file,
+)
 from qsorbit.core.station import ConfigError, StationConfig, load_station_config
 from qsorbit.core.tracker import Satellite, TrackerError
 
 #: How long ``point --send`` waits for the rotor to settle, in seconds.
 DEFAULT_ARRIVAL_TIMEOUT_S = 90.0
+
+#: Default capture rate — what all of Phase 2's bring-up used.
+DEFAULT_SAMPLE_RATE_HZ = 2_048_000
+
+#: How far below the signal of interest ``sdr capture`` tunes by default,
+#: in kHz. Not a stylistic choice: the RTL-SDR has a permanent DC-offset
+#: spike at the centre of its passband, so a signal tuned to exactly the
+#: centre lands on top of an artifact and its presence proves nothing.
+#: Tuning off-centre is what makes "did we receive it" answerable, and
+#: making it the default is what stops it being forgotten.
+DEFAULT_TUNING_OFFSET_KHZ = 250.0
+
+#: Printed by ``sdr capture`` when the capture has a hole in it.
+NON_CONTIGUOUS_WARNING = (
+    "WARNING: blocks were dropped, so this capture is NOT contiguous. The "
+    "samples are real but there is a gap in them, which will produce wrong "
+    "and plausible-looking results in any analysis. Do not use it as a test "
+    "fixture. See the sidecar for the count."
+)
 
 #: Printed wherever a commanded position is shown. The pointing layer's
 #: sky-to-rotor conversion is an identity today, and an interface that
@@ -61,6 +88,7 @@ UNCALIBRATED_NOTE = (
 )
 
 RotorFactory = Callable[[StationConfig, Callable[[float], None]], Rotor]
+SdrFactory = Callable[[StationConfig], RtlSdr]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -138,10 +166,111 @@ def build_parser() -> argparse.ArgumentParser:
             "cannot stop one that is diverging. The power switch is the real stop."
         ),
     )
+
+    _add_sdr_commands(subcommands)
     return parser
 
 
-def main(argv: Sequence[str] | None = None, *, rotor_factory: RotorFactory | None = None) -> int:
+def _add_sdr_commands(subcommands: argparse._SubParsersAction) -> None:
+    """Add the ``sdr`` group: ``info`` and ``capture``.
+
+    Split out because the group has its own nested subcommands and
+    inlining it would bury the rotor commands.
+    """
+    sdr = subcommands.add_parser(
+        "sdr",
+        help="Inspect the SDR, or capture IQ from it.",
+        description="Receiver-side commands. Nothing here moves the rotor.",
+    )
+    sdr_commands = sdr.add_subparsers(dest="sdr_command", required=True, metavar="COMMAND")
+
+    sdr_commands.add_parser(
+        "info",
+        help="Report what SDR is attached and what it can do.",
+        description=(
+            "Read-only. Opens the device, reports how it identifies itself and "
+            "which gain steps its tuner offers, and closes it again. The gain "
+            "table doubles as a fingerprint of which librtlsdr got loaded."
+        ),
+    )
+
+    capture = sdr_commands.add_parser(
+        "capture",
+        help="Record raw IQ to a file, with a JSON sidecar.",
+        description=(
+            "Captures raw uint8 interleaved I/Q - the same format rtl_sdr.exe "
+            "writes - alongside a sidecar recording what the device actually "
+            "did. By default the tuner is placed below the signal of interest "
+            "rather than on it, because a peak at the centre of the passband "
+            "cannot be told apart from the receiver's own DC spike."
+        ),
+    )
+    target = capture.add_mutually_exclusive_group(required=True)
+    target.add_argument(
+        "--station",
+        type=float,
+        metavar="MHZ",
+        help=(
+            "Signal of interest in MHz. The tuner is placed --offset kHz below "
+            "it, and both the frequency and its offset are recorded in the sidecar."
+        ),
+    )
+    target.add_argument(
+        "--center",
+        type=float,
+        metavar="MHZ",
+        help="Tune here directly, in MHz. No signal of interest is recorded.",
+    )
+    capture.add_argument(
+        "--offset",
+        type=float,
+        default=DEFAULT_TUNING_OFFSET_KHZ,
+        metavar="KHZ",
+        help=(
+            f"How far below --station to tune, in kHz (default "
+            f"{DEFAULT_TUNING_OFFSET_KHZ:.0f}). Ignored with --center."
+        ),
+    )
+    capture.add_argument(
+        "--seconds", type=float, default=2.0, metavar="S", help="Duration (default 2)."
+    )
+    capture.add_argument(
+        "--rate",
+        type=float,
+        default=DEFAULT_SAMPLE_RATE_HZ,
+        metavar="SPS",
+        help=f"Sample rate in samples per second (default {DEFAULT_SAMPLE_RATE_HZ:,}).",
+    )
+    gain = capture.add_mutually_exclusive_group(required=True)
+    gain.add_argument(
+        "--gain",
+        type=float,
+        metavar="DB",
+        help=(
+            "Tuner gain in dB, snapped to the nearest step the device offers. "
+            "Required, and deliberately has no default: a default gain is how a "
+            "capture comes back empty with nobody noticing."
+        ),
+    )
+    gain.add_argument(
+        "--auto-gain",
+        action="store_true",
+        help=(
+            "Let the tuner choose. Rarely what you want - during bring-up this "
+            "reported 0.0 dB and captured a flat noise floor, with no error."
+        ),
+    )
+    capture.add_argument(
+        "--out", required=True, metavar="PATH", help="Where to write the .iq file."
+    )
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    rotor_factory: RotorFactory | None = None,
+    sdr_factory: SdrFactory | None = None,
+) -> int:
     """Run the CLI.
 
     Args:
@@ -149,6 +278,8 @@ def main(argv: Sequence[str] | None = None, *, rotor_factory: RotorFactory | Non
         rotor_factory: Builds the :class:`~qsorbit.core.rotor.Rotor` from
             a config and a homing-progress callback. Injected by tests so
             no serial port is ever opened.
+        sdr_factory: Builds the :class:`~qsorbit.core.sdr.RtlSdr` from a
+            config. Injected by tests so no device is ever opened.
 
     Returns:
         A process exit code: 0 on success, 1 on a failure the operator
@@ -163,13 +294,15 @@ def main(argv: Sequence[str] | None = None, *, rotor_factory: RotorFactory | Non
             return _command_point(args, config, factory)
         if args.command == "status":
             return _command_status(config, factory)
+        if args.command == "sdr":
+            return _command_sdr(args, config, sdr_factory or _open_sdr)
         return _command_stop(config, factory)
     except HomingError as exc:
         # Its own state rather than a generic failure: nothing sent over
         # the link clears it, so "try again" would be the wrong advice.
         print(f"Homing failure: {exc}", file=sys.stderr)
         return 1
-    except (ConfigError, RotorError, TrackerError, OSError, ValueError) as exc:
+    except (ConfigError, RotorError, SdrError, TrackerError, OSError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
@@ -266,6 +399,80 @@ def _command_status(config: StationConfig, factory: RotorFactory) -> int:
         return 0 if status.healthy else 1
 
 
+def _command_sdr(args: argparse.Namespace, config: StationConfig, factory: SdrFactory) -> int:
+    """Dispatch the ``sdr`` group."""
+    if args.sdr_command == "info":
+        return _command_sdr_info(config, factory)
+    return _command_sdr_capture(args, config, factory)
+
+
+def _command_sdr_info(config: StationConfig, factory: SdrFactory) -> int:
+    with factory(config) as sdr:
+        info = sdr.info
+        gains = sdr.supported_gains_db()
+
+        print(f"QSOrbit {__version__}")
+        print(f"Config:    {config.source_path}")
+        print(f"Driver:    {config.sdr.driver_dir or 'system library search path'}")
+        print(f"Device:    {info.describe()}")
+        print(f"Gains:     {len(gains)} steps, {min(gains)} to {max(gains)} dB")
+        print(f"           {' '.join(str(step) for step in gains)}")
+        print(f"Ppm:       {config.sdr.ppm}")
+        print()
+        print(
+            "The gain table belongs to the tuner chip, so it doubles as a "
+            "fingerprint: a V4's R828D reports 29 steps topping out at 49.6 dB, "
+            "and a different table means a different library was loaded than "
+            "the one intended."
+        )
+        return 0
+
+
+def _command_sdr_capture(
+    args: argparse.Namespace, config: StationConfig, factory: SdrFactory
+) -> int:
+    station_hz = args.station * 1e6 if args.station is not None else None
+    if station_hz is not None:
+        center_hz = station_hz - args.offset * 1e3
+    else:
+        center_hz = args.center * 1e6
+
+    sdr_config = SdrConfig(
+        center_hz=center_hz,
+        sample_rate_hz=args.rate,
+        gain_db=AUTO_GAIN if args.auto_gain else args.gain,
+        ppm=config.sdr.ppm,
+    )
+    if sdr_config.may_drop_samples:
+        print(
+            f"Note: {args.rate:,.0f} sps is above what USB reliably sustains on "
+            "many machines. If the capture comes back short, this is the first "
+            "thing to look at."
+        )
+
+    with factory(config) as sdr:
+        print(f"Device:    {sdr.info.describe()}")
+        result = capture_to_file(
+            sdr,
+            sdr_config,
+            args.out,
+            seconds=args.seconds,
+            station_hz=station_hz,
+        )
+
+    print(result.describe())
+    print(f"Sidecar:   {result.sidecar_path}")
+    if result.applied.reports_zero_gain:
+        print(
+            "\nWARNING: the tuner reports 0.0 dB of gain, which nearly always "
+            "means the capture is empty. Set a manual gain."
+        )
+    if not result.is_contiguous:
+        print(f"\n{NON_CONTIGUOUS_WARNING}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _command_stop(config: StationConfig, factory: RotorFactory) -> int:
     with _Connected(config, factory) as rotor:
         position = rotor.stop()
@@ -314,6 +521,11 @@ def _open_rotor(config: StationConfig, on_homing_wait: Callable[[float], None]) 
         timeout=config.serial.timeout_s,
     )
     return Rotor(port, config.capabilities, on_homing_wait=on_homing_wait)
+
+
+def _open_sdr(config: StationConfig) -> RtlSdr:
+    """Build an :class:`RtlSdr` from the station's ``[sdr]`` settings."""
+    return RtlSdr(config.sdr.device_index, driver_dir=config.sdr.driver_dir)
 
 
 def _report_homing_wait(elapsed_s: float) -> None:

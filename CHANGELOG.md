@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - QSOrbit now refuses to open an RTL-SDR Blog V4 through a driver that cannot correctly tune it, rather than streaming samples from the wrong frequency in silence.
 - Tuner gain is snapped to a step the device actually offers, and every setting is read back from the hardware afterwards, so what a capture says it was tuned to is what the radio was really doing.
 - An optional `[sdr]` section in station config, for the driver directory, device index, and crystal correction. Existing config files keep working untouched.
+- Continuous IQ streaming from the SDR: a reader thread feeds a bounded buffer that a consumer drains, so receiving no longer means one blocking read at a time.
+- Streaming reports two kinds of loss separately — samples that never arrived from the device, and blocks discarded because the buffer filled. They have different causes and different fixes, and a single number would send you after the wrong one.
+- `qsorbit sdr capture`, which records raw IQ to a file alongside a JSON sidecar describing what the radio actually did. By default it tunes below the signal of interest rather than onto it, because a peak at the centre of the passband can't be told apart from the receiver's own artifact.
+- A capture that lost blocks says so in its own metadata and exits non-zero, so a recording with a gap in it can't quietly become a test fixture.
+- `qsorbit sdr info`, reporting the attached device and the gain steps its tuner offers.
+
+### Changed
+
+- The helper that works out where a signal sits within a capture now measures from the frequency the tuner actually reached rather than the one it was asked for. The two differ by however much the tuner rounded, and nothing downstream could have noticed.
 
 <!--
 When adding entries, group them under these headings as needed:

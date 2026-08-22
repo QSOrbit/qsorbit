@@ -20,6 +20,12 @@ rather than ``easycomm``: a second SDR family would arrive as another
 backend here, not as a rename.
 """
 
+from qsorbit.core.sdr.capture import (
+    IQ_FORMAT_DESCRIPTION,
+    SIDECAR_VERSION,
+    CaptureResult,
+    capture_to_file,
+)
 from qsorbit.core.sdr.config import (
     AUTO_GAIN,
     MAX_PPM,
@@ -52,29 +58,51 @@ from qsorbit.core.sdr.librtlsdr import (
     load_library,
     register_driver_directory,
 )
+from qsorbit.core.sdr.stream import (
+    BYTES_PER_SAMPLE,
+    DEFAULT_QUEUE_BLOCKS,
+    STALL_THRESHOLD_S,
+    IqStream,
+    LossReport,
+    StreamStats,
+    ThroughputMonitor,
+    byte_rate_for,
+)
 
 __all__ = [
     "AUTO_GAIN",
     "BLOG_V4_MANUFACTURER",
     "BLOG_V4_PRODUCT",
+    "BYTES_PER_SAMPLE",
+    "DEFAULT_QUEUE_BLOCKS",
     "DEFAULT_READ_BYTES",
+    "IQ_FORMAT_DESCRIPTION",
     "MAX_PPM",
     "READ_BLOCK_MULTIPLE",
     "RELIABLE_MAX_SAMPLE_RATE_HZ",
     "SAMPLE_RATE_WINDOWS_HZ",
+    "SIDECAR_VERSION",
+    "STALL_THRESHOLD_S",
     "AppliedSettings",
     "AutoGain",
+    "CaptureResult",
     "DeviceError",
     "DeviceHandle",
     "DeviceInfo",
     "DeviceNotFoundError",
     "DriverError",
     "DriverMismatchError",
+    "IqStream",
     "LibRtlSdr",
+    "LossReport",
     "RtlSdr",
     "SdrConfig",
     "SdrError",
+    "StreamStats",
+    "ThroughputMonitor",
     "TunerType",
+    "byte_rate_for",
+    "capture_to_file",
     "load_library",
     "nearest_gain_step",
     "register_driver_directory",

@@ -8,6 +8,7 @@ Nothing here opens a serial port, and the tests that don't use --send
 assert that no rotor is built at all.
 """
 
+import json
 import textwrap
 from unittest.mock import MagicMock
 
@@ -16,6 +17,7 @@ import pytest
 from qsorbit import __version__
 from qsorbit.__main__ import build_parser, main
 from qsorbit.core.rotor import Arrival, HomingError, Position, Rotor, RotorErrorCode, RotorStatus
+from qsorbit.core.sdr import AppliedSettings, DeviceError, DeviceInfo, TunerType
 
 # Vallado AIAA 2006-6753 Appendix C example, the same TLE used throughout
 # tests/unit/tracker/. Times below sit a few days past its epoch, inside
@@ -389,3 +391,324 @@ class TestFailures:
 
         assert code == 1
         assert "not found" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# SDR
+# ---------------------------------------------------------------------------
+
+V4_GAIN_STEPS_DB = (0.0, 0.9, 12.5, 32.8, 49.6)
+
+
+class FakeSdr:
+    """A stand-in device, written by hand rather than mocked.
+
+    ``capture_to_file`` drives a real streaming thread through this, so
+    it has to behave like a device rather than answer every attribute
+    truthily the way a ``MagicMock`` would — and it caps its output so
+    the reader cannot lap the writer and manufacture a drop that says
+    nothing about real hardware.
+    """
+
+    def __init__(self, *, max_blocks=8, gain_db=None):
+        self.index = 0
+        self.is_open = False
+        self.applied = None
+        self.configured = []
+        self.reads = 0
+        self._max_blocks = max_blocks
+        self._forced_gain = gain_db
+        self.info = DeviceInfo(
+            index=0,
+            name="Generic RTL2832U OEM",
+            manufacturer="RTLSDRBlog",
+            product="Blog V4",
+            serial="",
+            tuner=TunerType.R828D,
+        )
+
+    def __enter__(self):
+        self.is_open = True
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.is_open = False
+
+    def supported_gains_db(self):
+        return V4_GAIN_STEPS_DB
+
+    def configure(self, config):
+        self.configured.append(config)
+        gain = self._forced_gain
+        if gain is None:
+            gain = 0.0 if config.uses_auto_gain else float(config.gain_db)
+        self.applied = AppliedSettings(
+            requested=config,
+            center_hz=config.center_hz,
+            sample_rate_hz=config.sample_rate_hz,
+            gain_db=gain,
+            manual_gain=not config.uses_auto_gain,
+            ppm=config.ppm,
+            agc_enabled=config.enable_agc,
+        )
+        return self.applied
+
+    def read_raw(self, length):
+        if self.reads >= self._max_blocks:
+            raise DeviceError("fake device exhausted")
+        self.reads += 1
+        return bytes([self.reads % 256]) * length
+
+
+def sdr_factory(device=None):
+    """An SDR factory that records its calls and hands back one device."""
+    device = device or FakeSdr()
+
+    def build(config):
+        build.calls.append(config)
+        return device
+
+    build.calls = []
+    build.device = device
+    return build
+
+
+def run_sdr(argv, config_path, factory):
+    return main(["--config", str(config_path), *argv], sdr_factory=factory)
+
+
+class TestSdrParser:
+    def test_sdr_without_a_subcommand_is_a_usage_error(self):
+        with pytest.raises(SystemExit) as exit_info:
+            main(["sdr"])
+
+        assert exit_info.value.code == 2
+
+    def test_capture_needs_somewhere_to_write(self):
+        with pytest.raises(SystemExit):
+            main(["sdr", "capture", "--station", "99.9", "--gain", "32.8"])
+
+    def test_capture_needs_a_gain_decision(self):
+        # No default gain, on purpose: a default is how a capture comes
+        # back empty with nobody noticing.
+        with pytest.raises(SystemExit):
+            main(["sdr", "capture", "--station", "99.9", "--out", "x.iq"])
+
+    def test_a_station_and_an_explicit_centre_are_mutually_exclusive(self):
+        with pytest.raises(SystemExit):
+            main(
+                [
+                    "sdr",
+                    "capture",
+                    "--station",
+                    "99.9",
+                    "--center",
+                    "99.65",
+                    "--gain",
+                    "32.8",
+                    "--out",
+                    "x.iq",
+                ]
+            )
+
+
+class TestSdrInfo:
+    def test_it_reports_the_device_and_its_gain_table(self, config_path, capsys):
+        factory = sdr_factory()
+
+        code = run_sdr(["sdr", "info"], config_path, factory)
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "Blog V4" in out
+        assert "5 steps" in out
+        assert "49.6" in out
+
+    def test_it_closes_the_device_again(self, config_path):
+        factory = sdr_factory()
+
+        run_sdr(["sdr", "info"], config_path, factory)
+
+        assert not factory.device.is_open
+
+
+class TestSdrCapture:
+    def test_it_tunes_below_the_station_by_default(self, config_path, tmp_path):
+        # The off-centre discipline, made the default so it cannot be
+        # forgotten: a peak at the centre of the passband is
+        # indistinguishable from the receiver's own DC spike.
+        factory = sdr_factory()
+
+        run_sdr(
+            [
+                "sdr",
+                "capture",
+                "--station",
+                "99.9",
+                "--gain",
+                "32.8",
+                "--seconds",
+                "0.001",
+                "--rate",
+                "250000",
+                "--out",
+                str(tmp_path / "cap.iq"),
+            ],
+            config_path,
+            factory,
+        )
+
+        assert factory.device.configured[0].center_hz == pytest.approx(99_650_000.0)
+
+    def test_the_offset_is_adjustable(self, config_path, tmp_path):
+        factory = sdr_factory()
+
+        run_sdr(
+            [
+                "sdr",
+                "capture",
+                "--station",
+                "162.55",
+                "--offset",
+                "150",
+                "--gain",
+                "49.6",
+                "--seconds",
+                "0.001",
+                "--rate",
+                "250000",
+                "--out",
+                str(tmp_path / "cap.iq"),
+            ],
+            config_path,
+            factory,
+        )
+
+        assert factory.device.configured[0].center_hz == pytest.approx(162_400_000.0)
+
+    def test_an_explicit_centre_records_no_station(self, config_path, tmp_path):
+        factory = sdr_factory()
+
+        run_sdr(
+            [
+                "sdr",
+                "capture",
+                "--center",
+                "99.65",
+                "--gain",
+                "32.8",
+                "--seconds",
+                "0.001",
+                "--rate",
+                "250000",
+                "--out",
+                str(tmp_path / "cap.iq"),
+            ],
+            config_path,
+            factory,
+        )
+        meta = json.loads((tmp_path / "cap.json").read_text(encoding="utf-8"))
+
+        assert factory.device.configured[0].center_hz == pytest.approx(99_650_000.0)
+        assert "station_hz" not in meta
+
+    def test_it_writes_the_capture_and_its_sidecar(self, config_path, tmp_path, capsys):
+        factory = sdr_factory()
+
+        code = run_sdr(
+            [
+                "sdr",
+                "capture",
+                "--station",
+                "99.9",
+                "--gain",
+                "32.8",
+                "--seconds",
+                "0.001",
+                "--rate",
+                "250000",
+                "--out",
+                str(tmp_path / "cap.iq"),
+            ],
+            config_path,
+            factory,
+        )
+
+        assert code == 0
+        assert (tmp_path / "cap.iq").is_file()
+        assert (tmp_path / "cap.json").is_file()
+        assert "Sidecar" in capsys.readouterr().out
+
+    def test_a_zero_gain_report_is_called_out(self, config_path, tmp_path, capsys):
+        # The bring-up failure in executable form: auto gain reported
+        # 0.0 dB and captured a flat noise floor, with nothing raising.
+        factory = sdr_factory(FakeSdr(gain_db=0.0))
+
+        run_sdr(
+            [
+                "sdr",
+                "capture",
+                "--station",
+                "99.9",
+                "--auto-gain",
+                "--seconds",
+                "0.001",
+                "--rate",
+                "250000",
+                "--out",
+                str(tmp_path / "cap.iq"),
+            ],
+            config_path,
+            factory,
+        )
+
+        assert "0.0 dB" in capsys.readouterr().out
+
+    def test_the_station_config_ppm_is_applied(self, config_path, tmp_path):
+        factory = sdr_factory()
+
+        run_sdr(
+            [
+                "sdr",
+                "capture",
+                "--center",
+                "99.65",
+                "--gain",
+                "32.8",
+                "--seconds",
+                "0.001",
+                "--rate",
+                "250000",
+                "--out",
+                str(tmp_path / "cap.iq"),
+            ],
+            config_path,
+            factory,
+        )
+
+        assert factory.device.configured[0].ppm == 0
+
+    def test_a_bad_sample_rate_is_reported_not_traced(self, config_path, tmp_path, capsys):
+        # 500 kHz falls in the RTL2832U's genuine gap between its two
+        # rate windows. The operator gets a sentence, not a traceback.
+        factory = sdr_factory()
+
+        code = run_sdr(
+            [
+                "sdr",
+                "capture",
+                "--center",
+                "99.65",
+                "--gain",
+                "32.8",
+                "--rate",
+                "500000",
+                "--out",
+                str(tmp_path / "cap.iq"),
+            ],
+            config_path,
+            factory,
+        )
+
+        assert code == 1
+        assert "sample_rate_hz" in capsys.readouterr().err
