@@ -30,7 +30,7 @@ quantise, and spectrum arithmetic must use the actual values.
 |------|--------|---------|
 | `wbfm-99.9.iq` | FM broadcast, 99.9 MHz | Wideband FM demodulation (Chunk E) |
 | `nbfm-noaa-162.550.iq` | NOAA weather radio, 162.550 MHz | Narrowband FM demodulation (Chunk G) |
-| `no-signal-100.05.iq` | Nothing — a real recording of an empty band | Negative fixture (see below) |
+| `nbfm-noaa-162.475.iq` | NOAA weather radio, 162.475 MHz | Second narrowband channel from the same bring-up session |
 
 All captured at 2.048 Msps with the tuner tuned 250 kHz **below** the signal
 of interest.
@@ -43,16 +43,19 @@ presence proves nothing — a correctly tuned radio and a DC artifact look
 identical. Tuning deliberately off-centre and asserting the signal appears
 at the expected offset is a test a mistuned radio fails and cannot fake.
 
-### Why there is a fixture containing nothing
+### Why there should be a fixture containing nothing (currently absent)
 
-`no-signal-100.05.iq` is a genuine recording of an empty band made by real
-hardware: real broadband noise, no signal. Any "did we receive it?" check
-must **fail** against it.
+The set previously included `no-signal-100.05.iq`/`fm-100.3-firstlight.iq`, a
+genuine recording of an empty band made by real hardware — real broadband
+noise, no signal — against which any "did we receive it?" check must
+**fail**. That file was retired (Session 17) and has not yet been
+recaptured; recapturing it is a small pending task, not a design change.
 
-It is a real capture rather than synthetic silence on purpose. Synthetic
-silence is too clean to be a fair test — this file has an ADC standard
-deviation of 12.9, *higher* than a good capture of an actual station, which
-is precisely the trap it exists to catch. Signal level is not signal
+The reasoning for wanting a *real* capture rather than synthetic silence
+still holds and should guide whoever recaptures it: synthetic silence is too
+clean to be a fair test. The retired file had an ADC standard deviation of
+12.9, *higher* than a good capture of an actual station — precisely the trap
+a real negative fixture exists to catch. Signal level is not signal
 presence.
 
 ## Regenerating them
@@ -77,4 +80,13 @@ python sdr-first-light.py --freq 99.9   --gain 32.8 --seconds 2 \
 python sdr-first-light.py --freq 162.550 --gain 49.6 --seconds 2 \
     --smooth 12 --separation 20 --tolerance 15 \
     --out tests/fixtures/iq/nbfm-noaa-162.550.iq
+
+python sdr-first-light.py --freq 162.475 --gain 32.8 --seconds 2 \
+    --smooth 12 --tolerance 15 \
+    --out tests/fixtures/iq/nbfm-noaa-162.475.iq
 ```
+
+(The 162.475 sidecar doesn't record a `--separation` value, so it's omitted
+above rather than guessed — check the sidecar's `smooth_hz`/`tolerance_hz`
+against the script's current flags before relying on this to reproduce it
+exactly.)
