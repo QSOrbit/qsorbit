@@ -22,6 +22,12 @@ env/
 .coverage
 htmlcov/
 
+# Local test fixtures
+# Multi-megabyte IQ captures from real hardware. Regenerate with the bench
+# scripts rather than committing them; see tests/fixtures/iq/README.md.
+tests/fixtures/iq/*.iq
+tests/fixtures/iq/*.json
+
 # Editors and OS
 .vscode/
 .idea/
