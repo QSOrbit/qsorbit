@@ -15,6 +15,7 @@ import pytest
 from qsorbit.core.rotor import AzimuthWrap
 from qsorbit.core.station import (
     ConfigError,
+    SdrSettings,
     SerialSettings,
     StationConfig,
     candidate_config_paths,
@@ -334,3 +335,125 @@ class TestSerialSettings:
 
         assert settings.baudrate == 19200
         assert settings.timeout_s == 1.0
+
+
+SDR_SECTION = """
+    [sdr]
+    driver_dir = "C:\\\\Users\\\\phil\\\\dev\\\\rtlsdr-blog\\\\x64"
+    device_index = 1
+    ppm = -3
+"""
+
+
+class TestSdrSection:
+    """The [sdr] table, which is optional in a way the others are not."""
+
+    def test_absent_section_gives_working_defaults(self, tmp_path):
+        # Every config file written before Phase 2 lacks this section,
+        # and an SDR is not required to point an antenna. Refusing to
+        # load one would break every existing station for no gain.
+        config = load_station_config(write_config(tmp_path))
+
+        assert config.sdr == SdrSettings()
+        assert config.sdr.driver_dir is None
+        assert config.sdr.device_index == 0
+        assert config.sdr.ppm == 0
+
+    def test_reads_every_key(self, tmp_path):
+        config = load_station_config(write_config(tmp_path, VALID_CONFIG + SDR_SECTION))
+
+        assert config.sdr.driver_dir == r"C:\Users\phil\dev\rtlsdr-blog\x64"
+        assert config.sdr.device_index == 1
+        assert config.sdr.ppm == -3
+
+    def test_an_empty_section_is_the_same_as_no_section(self, tmp_path):
+        config = load_station_config(write_config(tmp_path, VALID_CONFIG + "\n[sdr]\n"))
+
+        assert config.sdr == SdrSettings()
+
+    def test_each_key_may_be_omitted_on_its_own(self, tmp_path):
+        config = load_station_config(write_config(tmp_path, VALID_CONFIG + "\n[sdr]\nppm = 7\n"))
+
+        assert config.sdr.ppm == 7
+        assert config.sdr.driver_dir is None
+        assert config.sdr.device_index == 0
+
+    def test_unknown_key_is_an_error(self, tmp_path):
+        # Same strictness as everywhere else: a misspelled driver_dir
+        # that silently fell back to "search the system" would produce
+        # the exact silent-mistune failure the SDR module exists to
+        # prevent.
+        path = write_config(tmp_path, VALID_CONFIG + '\n[sdr]\ndriver_directory = "x"\n')
+
+        with pytest.raises(ConfigError, match="driver_directory"):
+            load_station_config(path)
+
+    def test_unknown_key_message_lists_the_valid_ones(self, tmp_path):
+        path = write_config(tmp_path, VALID_CONFIG + "\n[sdr]\nnope = 1\n")
+
+        with pytest.raises(ConfigError, match="device_index, driver_dir, ppm"):
+            load_station_config(path)
+
+    def test_a_section_that_is_not_a_table_is_an_error(self, tmp_path):
+        # Written before the first table header, or TOML would read it
+        # as a key inside whichever section came last.
+        path = write_config(tmp_path, '\n    sdr = "somewhere"' + VALID_CONFIG)
+
+        with pytest.raises(ConfigError, match=r"\[sdr\] in .* must be a table"):
+            load_station_config(path)
+
+    def test_a_non_integer_device_index_is_an_error(self, tmp_path):
+        path = write_config(tmp_path, VALID_CONFIG + "\n[sdr]\ndevice_index = 1.5\n")
+
+        with pytest.raises(ConfigError, match="device_index"):
+            load_station_config(path)
+
+    def test_a_negative_device_index_is_an_error(self, tmp_path):
+        path = write_config(tmp_path, VALID_CONFIG + "\n[sdr]\ndevice_index = -1\n")
+
+        with pytest.raises(ConfigError, match="device_index"):
+            load_station_config(path)
+
+    def test_an_absurd_ppm_is_an_error(self, tmp_path):
+        path = write_config(tmp_path, VALID_CONFIG + "\n[sdr]\nppm = 50000\n")
+
+        with pytest.raises(ConfigError, match="ppm"):
+            load_station_config(path)
+
+    def test_an_empty_driver_dir_is_an_error(self, tmp_path):
+        # Distinct from omitting it. An empty string looks deliberate
+        # and means nothing.
+        path = write_config(tmp_path, VALID_CONFIG + '\n[sdr]\ndriver_dir = ""\n')
+
+        with pytest.raises(ConfigError, match="driver_dir"):
+            load_station_config(path)
+
+    def test_the_error_names_the_file(self, tmp_path):
+        path = write_config(tmp_path, VALID_CONFIG + "\n[sdr]\nppm = 50000\n")
+
+        with pytest.raises(ConfigError, match=str(path.name)):
+            load_station_config(path)
+
+
+class TestSdrSettings:
+    def test_defaults(self):
+        settings = SdrSettings()
+
+        assert settings.driver_dir is None
+        assert settings.device_index == 0
+        assert settings.ppm == 0
+
+    def test_rejects_a_negative_device_index(self):
+        with pytest.raises(ValueError, match="device_index"):
+            SdrSettings(device_index=-1)
+
+    def test_rejects_a_blank_driver_dir(self):
+        with pytest.raises(ValueError, match="driver_dir"):
+            SdrSettings(driver_dir="   ")
+
+    def test_rejects_an_absurd_ppm(self):
+        with pytest.raises(ValueError, match="ppm"):
+            SdrSettings(ppm=5000)
+
+    def test_accepts_a_realistic_ppm(self):
+        assert SdrSettings(ppm=-12).ppm == -12
