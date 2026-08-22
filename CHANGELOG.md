@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `qsorbit sdr capture`, which records raw IQ to a file alongside a JSON sidecar describing what the radio actually did. By default it tunes below the signal of interest rather than onto it, because a peak at the centre of the passband can't be told apart from the receiver's own artifact.
 - A capture that lost blocks says so in its own metadata and exits non-zero, so a recording with a gap in it can't quietly become a test fixture.
 - `qsorbit sdr info`, reporting the attached device and the gain steps its tuner offers.
+- Power-spectrum framing for the DSP layer: turn a block of IQ samples into a windowed FFT frame in dB, sized for a waterfall consumer, with a frequency axis reported in absolute Hz so a caller never has to reconstruct the bin-to-frequency mapping itself.
+- Integer decimation for IQ samples, chaining automatically into smaller stages for downsampling factors large enough that a single filter design would be numerically unreliable.
+- `numpy` and `scipy` as dependencies, for the DSP layer's FFT and filtering.
 
 ### Changed
 
