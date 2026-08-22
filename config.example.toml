@@ -131,3 +131,54 @@ rs485_turnaround_s = 0.15
 # and warns on a mismatch. It is never used to infer any of the values
 # above.
 firmware_version = "SatNOGS-v2.2.1"
+
+
+# ---------------------------------------------------------------------
+# How to reach your SDR
+# ---------------------------------------------------------------------
+#
+# This whole section is optional. A station that only points an antenna
+# is a complete station, and every config file written before Phase 2
+# does without it.
+#
+# Note what is NOT here: centre frequency, sample rate and gain. Those
+# change when you point at a different satellite, so they belong with
+# the per-satellite profile that asks for them, not with the station.
+# Gain especially is a per-pass judgement — 32.8 dB suited FM broadcast
+# and 49.6 dB suited NOAA weather radio on the same evening — and
+# freezing it here would make it look like a property of your station.
+[sdr]
+
+# Directory containing librtlsdr.
+#
+# Effectively REQUIRED ON WINDOWS, and for a reason that is not
+# obvious: since Python 3.8 neither the working directory nor PATH is
+# searched when resolving a DLL, so the vendor's "copy rtlsdr.dll next
+# to your software" instruction does nothing here. QSOrbit registers
+# this directory explicitly instead.
+#
+# Point it at the x64 folder of the RTL-SDR Blog driver release. The
+# Blog build specifically: an RTL-SDR Blog V4 driven by a stock
+# librtlsdr enumerates, opens and streams perfectly happily while
+# tuning somewhere other than where it was told. QSOrbit refuses to
+# open a V4 through a library it can prove is not the Blog fork, but it
+# cannot prove the converse, so this is worth getting right.
+#
+# On Linux and macOS, leave it out — the package manager puts the
+# library somewhere the loader already looks.
+# Note the single quotes. In TOML they mean "take this string
+# literally", so Windows backslashes need no escaping. With double
+# quotes every backslash has to be doubled, because "\U" begins a
+# Unicode escape and would make this file fail to parse outright.
+driver_dir = 'C:\Users\you\dev\rtlsdr-blog\x64'
+
+# Optional. Which device to open when more than one is attached.
+# Defaults to 0, which is the only device on a single-dongle station.
+device_index = 0
+
+# Optional, defaults to 0. Crystal frequency correction in parts per
+# million — a property of this particular dongle's oscillator, which is
+# why it belongs to the station rather than to the satellite. A real
+# dongle is out by single or low double digits. Leave it at 0 until you
+# have measured yours against a known-accurate signal.
+ppm = 0

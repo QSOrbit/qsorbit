@@ -29,8 +29,9 @@ be a travel limit the operator believes is in force and isn't, on
 hardware whose firmware enforces nothing of its own. Better to refuse to
 start.
 
-This module depends on :mod:`qsorbit.core.rotor` and
-:mod:`qsorbit.core.tracker`, never the other way round. The rotor
+This module depends on :mod:`qsorbit.core.rotor`,
+:mod:`qsorbit.core.sdr` and :mod:`qsorbit.core.tracker`, never the other
+way round. The rotor
 controller takes a :class:`~qsorbit.core.rotor.RotorCapabilities`, not a
 :class:`StationConfig` — so it stays usable without a config file, and
 the dependency arrow only points one way.
@@ -41,11 +42,12 @@ from __future__ import annotations
 import os
 import sys
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from qsorbit.core.rotor import AzimuthWrap, RotorCapabilities
+from qsorbit.core.sdr import MAX_PPM
 from qsorbit.core.tracker import ObserverLocation
 
 #: Name of the config file looked for in the current working directory.
@@ -67,6 +69,16 @@ DEFAULT_BAUDRATE = 19200
 #: bounds how long a read blocks, that one paces the gap between writing
 #: and reading.
 DEFAULT_TIMEOUT_S = 1.0
+
+#: Default RTL-SDR device index. Zero is the only device on a
+#: single-dongle station, which is every station until Phase 3.
+DEFAULT_DEVICE_INDEX = 0
+
+#: Default crystal correction, in parts per million. Zero is an honest
+#: default in a way a default gain would not be: an uncalibrated dongle
+#: really is uncorrected, and the error it leaves is a few kHz at VHF,
+#: which is visible rather than silent.
+DEFAULT_PPM = 0
 
 
 class ConfigError(Exception):
@@ -110,6 +122,53 @@ class SerialSettings:
 
 
 @dataclass(frozen=True)
+class SdrSettings:
+    """How to reach this station's SDR.
+
+    Everything here passes the config-boundary test — none of it changes
+    when you point at a different satellite. Note what is therefore
+    *absent*: centre frequency, sample rate and gain all vary per
+    satellite and per band, so they belong with the profile that asks
+    for them, not here. Gain in particular is a per-pass judgement (the
+    bring-up used 32.8 dB for FM broadcast and 49.6 dB for NOAA weather
+    radio on the same evening), and freezing it into station config
+    would make it look like a property of the station.
+
+    Args:
+        driver_dir: Directory containing librtlsdr. Effectively required
+            on Windows, where neither the working directory nor ``PATH``
+            is searched for a DLL — point it at the ``x64`` folder of
+            the RTL-SDR Blog driver release. Leave unset on Linux and
+            macOS, where the package manager puts the library somewhere
+            the loader already looks.
+        device_index: Which device to open when more than one is
+            attached.
+        ppm: Crystal frequency correction in parts per million. A
+            property of this particular dongle's oscillator, which is
+            exactly why it lives with the station rather than the
+            satellite.
+
+    Raises:
+        ValueError: If a value is outside what any device could use.
+    """
+
+    driver_dir: str | None = None
+    device_index: int = DEFAULT_DEVICE_INDEX
+    ppm: int = DEFAULT_PPM
+
+    def __post_init__(self) -> None:
+        if self.driver_dir is not None and not self.driver_dir.strip():
+            raise ValueError("driver_dir must be a path or omitted entirely, not an empty string.")
+        if self.device_index < 0:
+            raise ValueError(f"device_index must not be negative, got {self.device_index}.")
+        if abs(self.ppm) > MAX_PPM:
+            raise ValueError(
+                f"ppm must be within +/-{MAX_PPM}, got {self.ppm}. A real dongle is "
+                "out by single or low double digits."
+            )
+
+
+@dataclass(frozen=True)
 class StationConfig:
     """Everything QSOrbit needs to know about one ground station.
 
@@ -117,6 +176,10 @@ class StationConfig:
         observer: Where the antenna is.
         serial: How to reach the rotator.
         capabilities: What that rotator may safely be commanded to do.
+        sdr: How to reach the SDR. Defaults to a plain
+            :class:`SdrSettings`, so a config file with no ``[sdr]``
+            section stays valid — every station that predates Phase 2
+            has one, and an SDR is not required to point an antenna.
         source_path: The file this was loaded from, or ``None`` if it
             was constructed directly. Carried so error messages and
             ``status`` output can say which config is in force — with
@@ -127,6 +190,7 @@ class StationConfig:
     observer: ObserverLocation
     serial: SerialSettings
     capabilities: RotorCapabilities
+    sdr: SdrSettings = field(default_factory=SdrSettings)
     source_path: Path | None = None
 
 
@@ -219,10 +283,14 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
     except OSError as exc:
         raise ConfigError(f"Could not read {resolved}: {exc}") from exc
 
-    _reject_unknown_keys(data, {"observer", "rotor"}, section="top level", path=resolved)
+    _reject_unknown_keys(data, {"observer", "rotor", "sdr"}, section="top level", path=resolved)
 
     observer_table = _require_table(data, "observer", path=resolved)
     rotor_table = _require_table(data, "rotor", path=resolved)
+    # Optional, unlike the two above: a station that only points an
+    # antenna is a complete station, and every config file written
+    # before Phase 2 lacks this section.
+    sdr_table = _optional_table(data, "sdr", path=resolved)
     capabilities_table = _require_table(rotor_table, "capabilities", path=resolved, parent="rotor")
 
     _reject_unknown_keys(
@@ -250,6 +318,12 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
             "firmware_version",
         },
         section="rotor.capabilities",
+        path=resolved,
+    )
+    _reject_unknown_keys(
+        sdr_table,
+        {"driver_dir", "device_index", "ppm"},
+        section="sdr",
         path=resolved,
     )
 
@@ -290,6 +364,13 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
                 capabilities_table, "firmware_version", "rotor.capabilities", resolved, None
             ),
         )
+        sdr_settings = SdrSettings(
+            driver_dir=_optional_str(sdr_table, "driver_dir", "sdr", resolved, None),
+            device_index=_optional_int(
+                sdr_table, "device_index", "sdr", resolved, DEFAULT_DEVICE_INDEX
+            ),
+            ppm=_optional_int(sdr_table, "ppm", "sdr", resolved, DEFAULT_PPM),
+        )
     except ValueError as exc:
         # The value objects do the real range checking; re-raised as a
         # ConfigError so the operator gets the file name alongside it.
@@ -299,6 +380,7 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
         observer=observer,
         serial=serial_settings,
         capabilities=capabilities,
+        sdr=sdr_settings,
         source_path=resolved,
     )
 
@@ -330,6 +412,22 @@ def _require_table(
     value = data[key]
     if not isinstance(value, dict):
         raise ConfigError(f"[{section}] in {path} must be a table, got {type(value).__name__}.")
+    return value
+
+
+def _optional_table(data: dict[str, Any], key: str, *, path: Path) -> dict[str, Any]:
+    """Return table ``key``, or an empty one if it is absent.
+
+    An absent optional section and a present-but-empty one are the same
+    thing here, so both come back as ``{}`` and every key inside falls
+    to its default. A section that is present but is *not* a table is
+    still an error — that is a typo, not an omission.
+    """
+    if key not in data:
+        return {}
+    value = data[key]
+    if not isinstance(value, dict):
+        raise ConfigError(f"[{key}] in {path} must be a table, got {type(value).__name__}.")
     return value
 
 
