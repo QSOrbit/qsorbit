@@ -552,6 +552,16 @@ class LibRtlSdr:
         Raises:
             ValueError: If ``length`` is not a positive multiple of 512.
             DeviceError: If the read fails or returns nothing.
+
+        **This method is on a real-time path and its cost is measured.**
+        No USB transfer is in flight between one synchronous read
+        returning and the next being issued, so every microsecond spent
+        here is a microsecond the device's FIFO spends overflowing —
+        time turns directly into lost samples, with nothing anywhere
+        reporting an error. See
+        :class:`~qsorbit.core.sdr.stream.ThroughputMonitor`, and the
+        bench measurement in ``tests/integration/test_sdr_streaming.py``
+        that exists to keep this honest.
         """
         if length <= 0 or length % READ_BLOCK_MULTIPLE != 0:
             raise ValueError(
@@ -569,7 +579,20 @@ class LibRtlSdr:
                 "present but not streaming; a reconnect or power cycle is the "
                 "usual fix."
             )
-        return bytes(buffer[: n_read.value])
+        # NOT bytes(buffer[:n]), which is the obvious spelling and is a
+        # trap: slicing a ctypes array builds a Python *list* of that
+        # many integers, then walks it again to make bytes. At a
+        # 262,144-byte block that measured 3.8 ms in Claude's sandbox
+        # and roughly 6.7 ms on Phil's machine, against a block that is
+        # only 64 ms of samples — which is where 2026-08-22's first
+        # streaming measurement lost 9.5% of the stream. A memoryview
+        # slice is one memcpy and measured 0.008 ms, a ~400x difference.
+        #
+        # Reusing a single buffer across reads was also measured and
+        # deliberately not done: it saves a further 0.009 ms, which is
+        # not worth reasoning about aliasing between the reader thread
+        # and its consumer for.
+        return bytes(memoryview(buffer)[: n_read.value])
 
     # ------------------------------------------------------------------
     # Internals
