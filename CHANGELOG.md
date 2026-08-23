@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A digital baseband mixer, needed because this project's own captures (and the tuning convention worth keeping live) deliberately place the station away from the tuner's centre frequency, to dodge the RTL-SDR's permanent DC-offset spike — the discriminator needs the station sitting at 0 Hz, so demodulation shifts it there first.
 - Audio output via `sounddevice`: streams demodulated audio to the system's default output device, with the same bounded-buffer, oldest-block-discarded shape the SDR streaming layer uses, facing the speaker instead of the dongle. Reports buffer-full drops and playback underruns separately, since they point at opposite problems.
 - `sounddevice` as a dependency, for audio output.
+- Spectrum frames are now produced continuously on a background worker, at a rate a display can actually use rather than the rate the radio can produce them. A live stream is capable of about a thousand spectrum rows a second and a screen can show a few dozen, so the frames nobody would ever see are never computed in the first place.
+- The spectrum pipeline reports frames it deliberately skipped separately from frames it computed and then had to throw away. The first is the design working as intended; the second means whatever is drawing them has fallen behind, and only one of those is worth chasing.
 
 ### Changed
 
