@@ -25,10 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Power-spectrum framing for the DSP layer: turn a block of IQ samples into a windowed FFT frame in dB, sized for a waterfall consumer, with a frequency axis reported in absolute Hz so a caller never has to reconstruct the bin-to-frequency mapping itself.
 - Integer decimation for IQ samples, chaining automatically into smaller stages for downsampling factors large enough that a single filter design would be numerically unreliable.
 - `numpy` and `scipy` as dependencies, for the DSP layer's FFT and filtering.
+- WBFM demodulation: a quadrature discriminator recovers audio from a captured or streamed channel, a de-emphasis filter undoes the transmitter's pre-emphasis, and the result is decimated down to an audio rate. Bench-verified against a real FM broadcast capture.
+- A digital baseband mixer, needed because this project's own captures (and the tuning convention worth keeping live) deliberately place the station away from the tuner's centre frequency, to dodge the RTL-SDR's permanent DC-offset spike — the discriminator needs the station sitting at 0 Hz, so demodulation shifts it there first.
+- Audio output via `sounddevice`: streams demodulated audio to the system's default output device, with the same bounded-buffer, oldest-block-discarded shape the SDR streaming layer uses, facing the speaker instead of the dongle. Reports buffer-full drops and playback underruns separately, since they point at opposite problems.
+- `sounddevice` as a dependency, for audio output.
 
 ### Changed
 
 - The helper that works out where a signal sits within a capture now measures from the frequency the tuner actually reached rather than the one it was asked for. The two differ by however much the tuner rounded, and nothing downstream could have noticed.
+- Decimation now preserves whether its input was real or complex, rather than always returning complex samples — needed so the same decimation code can be reused on the real-valued audio signal downstream of the WBFM discriminator, not only on IQ.
 
 <!--
 When adding entries, group them under these headings as needed:

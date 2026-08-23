@@ -57,6 +57,45 @@ class TestDecimateReducesLength:
         assert decimate(iq, 4).dtype == np.complex64
 
 
+class TestDecimateRealValuedInput:
+    """decimate() also runs on real-valued signals -- specifically the
+    audio demodulate_wbfm() produces downstream of its discriminator,
+    which is why the dtype is preserved rather than hard-coded to complex.
+    """
+
+    def test_output_dtype_is_float32_for_real_input(self):
+        t = np.arange(8_000) / 8_000.0
+        audio = np.sin(2 * np.pi * 50.0 * t).astype(np.float32)
+
+        assert decimate(audio, 4).dtype == np.float32
+
+    def test_a_factor_of_one_returns_a_float32_copy(self):
+        t = np.arange(64) / 8_000.0
+        audio = np.sin(2 * np.pi * 100.0 * t).astype(np.float32)
+
+        result = decimate(audio, 1)
+
+        assert np.array_equal(result, audio)
+        assert result is not audio
+        assert result.dtype == np.float32
+
+    def test_a_low_frequency_real_tone_survives_decimation(self):
+        sample_rate_hz = 48_000.0
+        factor = 4
+        tone_hz = 1_000.0  # well under the post-decimation Nyquist of 6 kHz
+        t = np.arange(4_800) / sample_rate_hz
+        audio = np.sin(2 * np.pi * tone_hz * t).astype(np.float32)
+
+        decimated = decimate(audio, factor)
+        new_rate_hz = sample_rate_hz / factor
+
+        spectrum = np.abs(np.fft.rfft(decimated))
+        freqs = np.fft.rfftfreq(len(decimated), d=1.0 / new_rate_hz)
+        peak_hz = freqs[np.argmax(spectrum)]
+
+        assert peak_hz == pytest.approx(tone_hz, abs=new_rate_hz / len(decimated) * 2)
+
+
 class TestDecimatePreservesALowFrequencyTone:
     def test_a_tone_below_the_new_nyquist_survives_decimation(self):
         sample_rate_hz = 48_000.0
