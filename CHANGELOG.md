@@ -31,10 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sounddevice` as a dependency, for audio output.
 - Spectrum frames are now produced continuously on a background worker, at a rate a display can actually use rather than the rate the radio can produce them. A live stream is capable of about a thousand spectrum rows a second and a screen can show a few dozen, so the frames nobody would ever see are never computed in the first place.
 - The spectrum pipeline reports frames it deliberately skipped separately from frames it computed and then had to throw away. The first is the design working as intended; the second means whatever is drawing them has fallen behind, and only one of those is worth chasing.
+- A live waterfall panel, showing the received spectrum scrolling in real time beside the rotor/sky readout in the same window. Narrow signals survive being squeezed onto a panel's pixels: where many frequency bins share one pixel the display takes the strongest of them rather than the average, so a satellite's carrier stays visible instead of being blended into the quiet either side of it.
+- Both of the waterfall's scales are fixed rather than adapting as it runs. Brightness maps a set dB window, so a signal appearing, fading, or dropping out actually changes what you see instead of being tracked by a scale that moves with it. The time axis is fixed from the first frame for the same reason: a display whose vertical scale is still settling makes a Doppler slope look like it is changing angle when nothing about the signal has.
+- A labelled frequency axis under the waterfall, so a trace can be read as a frequency rather than just a position. Tick spacing follows the span and thins out as the window narrows, and the labels are derived from the same settings the frames were computed with, so they cannot drift out of step with what is being drawn.
 
 ### Changed
 
 - The helper that works out where a signal sits within a capture now measures from the frequency the tuner actually reached rather than the one it was asked for. The two differ by however much the tuner rounded, and nothing downstream could have noticed.
+- The rotor/sky readout is now a panel rather than a window in its own right, so it can share a window with the waterfall — or run without it. Each panel feeds itself, which means looking at a spectrum no longer needs a rotor connected, and watching the rotor no longer needs an SDR.
 - Decimation now preserves whether its input was real or complex, rather than always returning complex samples — needed so the same decimation code can be reused on the real-valued audio signal downstream of the WBFM discriminator, not only on IQ.
 
 <!--

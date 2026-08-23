@@ -1,10 +1,10 @@
 """Pure text formatting for the readout window.
 
-Kept apart from :mod:`qsorbit.ui.readout_window` on purpose: this module
+Kept apart from :mod:`qsorbit.ui.readout_widget` on purpose: this module
 imports nothing from PySide6, only :mod:`qsorbit.core` types, so it can
 be imported and its output tested without Qt installed at all. Every
-label the window shows is built by a function in here; the window's own
-job is only to own the timer and put these strings in widgets.
+label the widget shows is built by a function in here; the widget's own
+job is only to own the timer and put these strings in labels.
 
 The formatting mirrors the honesty already established in
 :mod:`qsorbit.__main__`: sky position and rotor axis position are

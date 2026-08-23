@@ -1,51 +1,48 @@
-"""The rotor-vs-sky readout window — QSOrbit's first PySide6 code.
+"""The rotor-vs-sky readout — QSOrbit's first PySide6 code, as a widget.
 
-A deliberately plain lab instrument (see the Phase 2 brief), not the
-real UI shell: one window, a handful of labels, and a timer. Its purpose
-is to make :class:`~qsorbit.core.pointing.TrackingLoop` watchable while
-it runs against a real rotor, showing sky target and rotor axis
-position as the distinct things :class:`~qsorbit.core.pointing.TrackSample`
-already keeps them as.
+Originally ``ReadoutWindow`` (Chunk B). Chunk F turned it into a plain
+:class:`QWidget` so it can be placed in whatever container the moment
+calls for: today a :class:`~qsorbit.ui.instrument_window.InstrumentWindow`
+beside a waterfall, later a tab, a dock, or a panel on a custom tab. The
+convention it now follows, adopted in Session 19, is that **a UI element
+receives its feed and knows nothing about what contains it** — which is
+what makes the eventual shell a container job rather than a rewrite.
 
-**No threading.** :meth:`~qsorbit.core.pointing.TrackingLoop.tick` never
-blocks or sleeps — see its own docstring — so a ``QTimer`` on the GUI
-thread can call it directly on every timeout. That is only possible
-because the loop's design (Chunk A) split ``tick()`` out from ``run()``
-specifically so a caller with its own clock, like Qt's event loop, could
-drive it without a background thread. The harder question — how a
-*streaming* core feed meets Qt without blocking the event loop — is
-deliberately deferred to the waterfall panel (Chunk F), which will have
-real background work (spectrum frames) to hand off. This window has
-none: reading the rotor and computing one sample is the entire cost of
-a tick, already proven fast enough at 1 Hz on the bench in Chunk A.
+Its purpose is unchanged: make
+:class:`~qsorbit.core.pointing.TrackingLoop` watchable while it runs
+against a real rotor, showing sky target and rotor axis position as the
+distinct things :class:`~qsorbit.core.pointing.TrackSample` already keeps
+them as.
 
-Every label's text comes from :mod:`qsorbit.ui.readout_formatting`,
-which is plain Python with no Qt import — kept that way so the display
-logic can be read, and tested, without pulling PySide6 in at all. This
-module is the thin remainder: own the timer, own the widgets, and put
-the formatted strings in them.
+**No threading, still.** :meth:`~qsorbit.core.pointing.TrackingLoop.tick`
+never blocks or sleeps, so a ``QTimer`` on the GUI thread can call it
+directly on every timeout. The streaming feed next door needs a worker
+thread and a bounded buffer; this one genuinely does not, and pretending
+otherwise would add a thread to make two dissimilar things look alike.
+
+Every label's text comes from :mod:`qsorbit.ui.readout_formatting`, which
+is plain Python with no Qt import. This module is the thin remainder:
+own the timer, own the widgets, put the formatted strings in them.
 
 Boundary rule: this module imports :mod:`qsorbit.core`; nothing in
-``core`` imports ``qsorbit.ui``. This is the first module in the repo
-where that rule is actually load-bearing rather than aspirational.
+``core`` imports ``qsorbit.ui``.
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import QTimer
-from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QGridLayout, QLabel, QMainWindow, QWidget
+from PySide6.QtWidgets import QGridLayout, QLabel, QWidget
 
 from qsorbit.core.pointing import TrackingLoop
 from qsorbit.ui.readout_formatting import UNCALIBRATED_NOTE, readout_text
 
-#: How often the window polls the loop, in milliseconds.
+#: How often the widget polls the loop, in milliseconds.
 #:
 #: A 1 Hz refresh is plenty for a human reading a label — this is a
 #: display cadence, unrelated to
 #: :data:`~qsorbit.core.pointing.DEFAULT_TICK_INTERVAL_S`, which paces
 #: :meth:`~qsorbit.core.pointing.TrackingLoop.run` instead. Here the
-#: window drives the loop itself, one tick per timer timeout, so this
+#: widget drives the loop itself, one tick per timer timeout, so this
 #: value sets the tick cadence too.
 DEFAULT_POLL_INTERVAL_MS = 1000
 
@@ -53,7 +50,7 @@ DEFAULT_POLL_INTERVAL_MS = 1000
 _FIELDS = ("Time", "Sky target", "Rotor axis", "Rotor axis (sky dir.)", "Range", "Last tick")
 
 
-class ReadoutWindow(QMainWindow):
+class ReadoutWidget(QWidget):
     """Shows sky position and rotor axis position as distinct things, live.
 
     Three rotor-adjacent rows, deliberately not collapsed into one:
@@ -63,7 +60,7 @@ class ReadoutWindow(QMainWindow):
     :func:`~qsorbit.core.pointing.rotor_to_sky` so it is directly
     comparable to "Sky target" without doing mod-360 arithmetic by eye.
 
-    The window drives ``loop`` itself: each timer timeout calls
+    The widget drives ``loop`` itself: each timer timeout calls
     :meth:`~qsorbit.core.pointing.TrackingLoop.tick` directly and repaints
     from the sample it returns. A tick that raises — a
     :class:`~qsorbit.core.pointing.TravelGuardError`, a
@@ -74,11 +71,11 @@ class ReadoutWindow(QMainWindow):
     fault sits underneath.
 
     Args:
-        loop: The tracking loop to drive and display. The window neither
+        loop: The tracking loop to drive and display. The widget neither
             builds it nor owns the rotor's connection — whoever
             constructed the loop is responsible for both, exactly as
             :class:`~qsorbit.core.pointing.TrackingLoop`'s own docs
-            describe. Closing the window stops polling; it does not
+            describe. Stopping the widget stops polling; it does not
             stop the rotor, matching the loop's own policy.
         poll_interval_ms: How often to tick, in milliseconds. Defaults
             to :data:`DEFAULT_POLL_INTERVAL_MS`.
@@ -89,15 +86,13 @@ class ReadoutWindow(QMainWindow):
         loop: TrackingLoop,
         *,
         poll_interval_ms: int = DEFAULT_POLL_INTERVAL_MS,
+        parent: QWidget | None = None,
     ) -> None:
-        super().__init__()
+        super().__init__(parent)
         self._loop = loop
         self._target_name = loop.target.name
 
-        self.setWindowTitle(f"QSOrbit - tracking {self._target_name}")
-
-        central = QWidget(self)
-        layout = QGridLayout(central)
+        layout = QGridLayout(self)
         self._value_labels = {}
         for row, caption in enumerate(_FIELDS):
             layout.addWidget(QLabel(f"{caption}:"), row, 0)
@@ -108,22 +103,25 @@ class ReadoutWindow(QMainWindow):
         note_label = QLabel(UNCALIBRATED_NOTE)
         note_label.setWordWrap(True)
         layout.addWidget(note_label, len(_FIELDS), 0, 1, 2)
-        self.setCentralWidget(central)
 
         self._timer = QTimer(self)
         self._timer.setInterval(poll_interval_ms)
         self._timer.timeout.connect(self._on_timer)
         self._timer.start()
 
-    def closeEvent(self, event: QCloseEvent) -> None:
-        """Stop polling on close. Does not stop the rotor - see the class docstring."""
+    @property
+    def target_name(self) -> str:
+        """What is being tracked. A host window uses this for its title."""
+        return self._target_name
+
+    def stop(self) -> None:
+        """Stop polling. Does not stop the rotor - see the class docstring."""
         self._timer.stop()
-        super().closeEvent(event)
 
     def _on_timer(self) -> None:
         try:
             sample = self._loop.tick()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - shown, not swallowed
             self._timer.stop()
             self._value_labels["Last tick"].setText(f"stopped: {exc}")
             return
