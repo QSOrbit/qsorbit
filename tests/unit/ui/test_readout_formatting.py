@@ -1,7 +1,7 @@
 """Unit tests for the readout window's pure formatting helpers.
 
 Deliberately headless: this file imports qsorbit.ui.readout_formatting
-only, never qsorbit.ui.readout_window, so nothing here needs PySide6
+only, never qsorbit.ui.readout_widget, so nothing here needs PySide6
 installed. See that module's docstring for why the split exists.
 """
 

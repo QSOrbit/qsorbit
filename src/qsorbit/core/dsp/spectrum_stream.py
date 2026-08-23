@@ -305,6 +305,18 @@ class SpectrumStream:
     # ------------------------------------------------------------------
 
     @property
+    def config(self) -> SpectrumConfig:
+        """The framing this stream produces, for a consumer that must label it.
+
+        Exposed so a display can derive its frequency axis from the same
+        object the frames came from, rather than being handed a second
+        config that could quietly disagree. An axis that mislabels which
+        frequency a trace sits at is worse than no axis, because it is
+        believed.
+        """
+        return self._config
+
+    @property
     def hop(self) -> int:
         """Samples between frame starts. See :func:`hop_for_frame_rate`."""
         return self._hop
@@ -383,7 +395,7 @@ class SpectrumStream:
             when the device disappears is exactly the silent failure this
             project keeps meeting; a caller driving this from a timer
             should catch, stop the timer, and show the error — the way
-            :class:`~qsorbit.ui.readout_window.ReadoutWindow` already
+            :class:`~qsorbit.ui.readout_widget.ReadoutWidget` already
             does with a failing tick.
 
             **Frames already computed are handed over first, and the

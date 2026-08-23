@@ -219,7 +219,7 @@ def rotor_to_sky(position: Position) -> AzEl:
       points.
 
     This is :func:`rotor_to_sky`'s first real consumer:
-    :mod:`qsorbit.ui.readout_window` uses it to show what a
+    :mod:`qsorbit.ui.readout_widget` uses it to show what a
     :class:`TrackSample`'s :attr:`~TrackSample.rotor_position` means as
     a sky direction, next to :attr:`~TrackSample.sky_position` — the
     same rotor-vs-sky distinction :class:`TrackSample` already exists
