@@ -677,6 +677,13 @@ class IqStream:
         self._default: IqSubscription | None = None
         self._default_claimed = False
         self._not_empty = threading.Condition(threading.Lock())
+        # Separate from _not_empty, and guarding only the start-if-needed
+        # path. With one consumer that path ran on one thread and needed
+        # nothing; with several, two consumers can begin iterating at the
+        # same moment, both find no reader, and both call start() -- one
+        # of which then raises "already been started" from inside a
+        # worker thread, killing a consumer for doing nothing wrong.
+        self._start_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._finished = False
@@ -866,8 +873,7 @@ class IqStream:
                 "unnamed third consumer whose drops nothing would attribute. Call "
                 "subscribe() for this consumer as well."
             )
-        if self._thread is None:
-            self.start()
+        self._ensure_started()
         if self._default_claimed:
             raise DeviceError(
                 "blocks() has already been called on this stream. A second consumer "
@@ -879,9 +885,17 @@ class IqStream:
         return self._default
 
     def _ensure_started(self) -> None:
-        """Start the reader if it is not running. For :class:`IqSubscription`."""
-        if self._thread is None:
-            self.start()
+        """Start the reader if it is not running. For :class:`IqSubscription`.
+
+        Locked because several consumers may reach their first block at
+        the same instant, each on its own thread. :meth:`start` itself
+        stays unlocked and still refuses a second explicit call — that
+        refusal is a real programming error worth reporting, whereas two
+        consumers both saying "start if nobody has" is not.
+        """
+        with self._start_lock:
+            if self._thread is None:
+                self.start()
 
     # ------------------------------------------------------------------
     # Context manager

@@ -1,11 +1,15 @@
 """Command-line entry point for ``python -m qsorbit``.
 
-Four subcommands: ``point``, ``status``, ``stop``, and ``sdr`` (itself
-split into ``info`` and ``capture``).
+Five subcommands: ``point``, ``status``, ``stop``, ``sdr`` (itself split
+into ``info`` and ``capture``), and ``receive`` — the whole vertical
+slice, tracking and receiving a pass together.
 
 **Computing is the default; moving is opt-in.** ``point`` works out where
 the rotor would have to go and prints it, without opening the serial port
-at all. Only ``--send`` moves anything. That asymmetry is deliberate — the
+at all. Only ``--send`` moves anything, and ``receive`` follows the same
+rule — it demodulates a whole pass with nothing connected to the serial
+port, because Doppler correction needs the TLE and the observer rather
+than the rotor. That asymmetry is deliberate — the
 controller firmware applies no position limits at any level, so a command
 that reaches it is a command it attempts, and the cost of an accidental
 slew is measured in cable and gearbox rather than in a retry.
@@ -35,7 +39,26 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 
 from qsorbit import __version__
-from qsorbit.core.pointing import sky_to_rotor
+from qsorbit.core.dsp import (
+    DEFAULT_AUDIO_RATE_HZ,
+    DEFAULT_CLOSE_BELOW_DB,
+    DEFAULT_NBFM_DEVIATION_HZ,
+    DEFAULT_NBFM_IF_RATE_HZ,
+    DEFAULT_OPEN_ABOVE_DB,
+    AudioOutput,
+    DopplerTracker,
+    NbfmConfig,
+    NoiseSquelch,
+    SpectrumConfig,
+    SpectrumStream,
+)
+from qsorbit.core.pointing import TrackingLoop, sky_to_rotor
+from qsorbit.core.receive import (
+    DEFAULT_TRACKING_INTERVAL_S,
+    LoopRangeRate,
+    ReceiveSession,
+    TargetRangeRate,
+)
 from qsorbit.core.rotor import (
     HomingError,
     Position,
@@ -48,6 +71,8 @@ from qsorbit.core.rotor import (
 )
 from qsorbit.core.sdr import (
     AUTO_GAIN,
+    AppliedSettings,
+    IqStream,
     RtlSdr,
     SdrConfig,
     SdrError,
@@ -61,6 +86,11 @@ DEFAULT_ARRIVAL_TIMEOUT_S = 90.0
 
 #: Default capture rate — what all of Phase 2's bring-up used.
 DEFAULT_SAMPLE_RATE_HZ = 2_048_000
+
+#: FFT size for ``receive``'s waterfall. Matches what Chunk F's bench
+#: runs used, so a trace on screen during a pass is directly comparable
+#: with the broadcast-FM runs the display was verified against.
+RECEIVE_FFT_SIZE = 2048
 
 #: How far below the signal of interest ``sdr capture`` tunes by default,
 #: in kHz. Not a stylistic choice: the RTL-SDR has a permanent DC-offset
@@ -168,7 +198,155 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     _add_sdr_commands(subcommands)
+    _add_receive_command(subcommands)
     return parser
+
+
+def _add_receive_command(subcommands: argparse._SubParsersAction) -> None:
+    """Add ``receive``: the whole slice, tracking and receiving together.
+
+    Split out for the same reason the ``sdr`` group is: it has more
+    options than everything else here put together, and inlining it
+    would bury the commands above it.
+    """
+    receive = subcommands.add_parser(
+        "receive",
+        help="Follow a satellite and demodulate its FM downlink.",
+        description=(
+            "Runs the tracking loop and the receive chain together: the SDR "
+            "streams, NBFM demodulates, and the Doppler correction follows the "
+            "pass using range rates computed from the TLE. The rotor is NOT "
+            "moved unless --send is given, and no window opens unless --window "
+            "is. Doppler correction needs the TLE and your location, not the "
+            "rotor, so the whole radio job works with nothing on the serial port."
+        ),
+    )
+    receive.add_argument(
+        "--tle",
+        required=True,
+        metavar="PATH",
+        help="File holding one TLE: two element lines, optionally preceded by a name line.",
+    )
+    receive.add_argument(
+        "--downlink",
+        type=float,
+        required=True,
+        metavar="MHZ",
+        help=(
+            "The satellite's nominal downlink in MHz, as transmitted - not the "
+            "frequency you expect to hear. Doppler is what makes those differ, "
+            "and computing it is this command's job."
+        ),
+    )
+    receive.add_argument(
+        "--offset",
+        type=float,
+        default=DEFAULT_TUNING_OFFSET_KHZ,
+        metavar="KHZ",
+        help=(
+            f"How far below the downlink to place the tuner, in kHz (default "
+            f"{DEFAULT_TUNING_OFFSET_KHZ:.0f}). Same reason as 'sdr capture': the "
+            "receiver's DC spike sits at the centre of its own passband."
+        ),
+    )
+    receive.add_argument(
+        "--rate",
+        type=float,
+        default=DEFAULT_SAMPLE_RATE_HZ,
+        metavar="SPS",
+        help=f"IQ sample rate (default {DEFAULT_SAMPLE_RATE_HZ:,}).",
+    )
+    receive.add_argument(
+        "--if-rate",
+        type=float,
+        default=DEFAULT_NBFM_IF_RATE_HZ,
+        metavar="HZ",
+        help=(
+            f"Channel-filter output rate (default {DEFAULT_NBFM_IF_RATE_HZ:,.0f}). "
+            "Must divide --rate evenly and be more than twice --deviation."
+        ),
+    )
+    receive.add_argument(
+        "--audio-rate",
+        type=float,
+        default=DEFAULT_AUDIO_RATE_HZ,
+        metavar="HZ",
+        help=f"Playback sample rate (default {DEFAULT_AUDIO_RATE_HZ:,.0f}).",
+    )
+    receive.add_argument(
+        "--deviation",
+        type=float,
+        default=DEFAULT_NBFM_DEVIATION_HZ,
+        metavar="HZ",
+        help=(
+            f"Transmitter peak deviation (default {DEFAULT_NBFM_DEVIATION_HZ:,.0f}, "
+            "which suits amateur FM). Wider modes need both this and --if-rate raised."
+        ),
+    )
+    receive.add_argument(
+        "--seconds",
+        type=float,
+        default=None,
+        metavar="S",
+        help="Stop automatically after this long. Default: run until Ctrl-C.",
+    )
+    receive.add_argument(
+        "--interval",
+        type=float,
+        default=DEFAULT_TRACKING_INTERVAL_S,
+        metavar="S",
+        help=f"Seconds between tracking updates (default {DEFAULT_TRACKING_INTERVAL_S:.0f}).",
+    )
+    receive.add_argument(
+        "--send",
+        action="store_true",
+        help=(
+            "Actually move the rotor to follow the pass. Without this nothing "
+            "is transmitted to the controller and the serial port is not opened."
+        ),
+    )
+    receive.add_argument(
+        "--window",
+        action="store_true",
+        help="Open the instrument window - waterfall, plus the readout when --send is given.",
+    )
+    receive.add_argument(
+        "--squelch",
+        action="store_true",
+        help=(
+            "Enable the noise squelch. Off by default: a mute set slightly too "
+            "tight makes a working receiver indistinguishable from a broken one."
+        ),
+    )
+    receive.add_argument(
+        "--squelch-open",
+        type=float,
+        default=DEFAULT_OPEN_ABOVE_DB,
+        metavar="DB",
+        help=f"Quieting at/above which the gate opens (default {DEFAULT_OPEN_ABOVE_DB:.1f}).",
+    )
+    receive.add_argument(
+        "--squelch-close",
+        type=float,
+        default=DEFAULT_CLOSE_BELOW_DB,
+        metavar="DB",
+        help=f"Quieting at/below which it closes (default {DEFAULT_CLOSE_BELOW_DB:.1f}).",
+    )
+    gain = receive.add_mutually_exclusive_group(required=True)
+    gain.add_argument(
+        "--gain",
+        type=float,
+        metavar="DB",
+        help=(
+            "Tuner gain in dB. Required, and deliberately has no default: a "
+            "default gain is how a pass comes back silent with nobody noticing."
+        ),
+    )
+    gain.add_argument(
+        "--auto-gain",
+        action="store_true",
+        help="Let the tuner choose. Rarely what you want - during bring-up it reported 0.0 dB.",
+    )
 
 
 def _add_sdr_commands(subcommands: argparse._SubParsersAction) -> None:
@@ -296,6 +474,8 @@ def main(
             return _command_status(config, factory)
         if args.command == "sdr":
             return _command_sdr(args, config, sdr_factory or _open_sdr)
+        if args.command == "receive":
+            return _command_receive(args, config, factory, sdr_factory or _open_sdr)
         return _command_stop(config, factory)
     except HomingError as exc:
         # Its own state rather than a generic failure: nothing sent over
@@ -471,6 +651,204 @@ def _command_sdr_capture(
         print(f"\n{NON_CONTIGUOUS_WARNING}", file=sys.stderr)
         return 1
     return 0
+
+
+def _command_receive(
+    args: argparse.Namespace,
+    config: StationConfig,
+    rotor_factory: RotorFactory,
+    sdr_factory: SdrFactory,
+) -> int:
+    """Run the vertical slice: track, stream, demodulate, correct, play.
+
+    Reads in the order that fails cheapest first — the TLE before the
+    radio, the radio before the rotor — so a typo in ``--tle`` does not
+    wait behind opening a USB device, and a rotor that will not home does
+    not cost the SDR configuration that already succeeded.
+    """
+    satellite = Satellite.from_file(args.tle)
+    downlink_hz = args.downlink * 1e6
+    center_hz = downlink_hz - args.offset * 1e3
+
+    sdr_config = SdrConfig(
+        center_hz=center_hz,
+        sample_rate_hz=args.rate,
+        gain_db=AUTO_GAIN if args.auto_gain else args.gain,
+        ppm=config.sdr.ppm,
+    )
+
+    with sdr_factory(config) as sdr:
+        applied = sdr.configure(sdr_config)
+        print(f"Target:    {satellite.name}")
+        print(f"Device:    {sdr.info.describe()}")
+        print(
+            f"Tuned:     {applied.center_hz / 1e6:.4f} MHz, downlink "
+            f"{applied.offset_from(downlink_hz) / 1e3:+.1f} kHz from centre "
+            f"(before Doppler)"
+        )
+        if applied.reports_zero_gain:
+            print(
+                "\nWARNING: the tuner reports 0.0 dB of gain, which nearly "
+                "always means you will hear nothing. Set a manual gain."
+            )
+
+        # channel_offset_hz is left at its default here on purpose: the
+        # session replaces it on every block with the Doppler-corrected
+        # value, and seeding it with a static offset would only invite
+        # someone to believe the static one mattered.
+        nbfm = NbfmConfig(
+            sample_rate_hz=applied.sample_rate_hz,
+            if_rate_hz=args.if_rate,
+            audio_rate_hz=args.audio_rate,
+            deviation_hz=args.deviation,
+        )
+        print(
+            f"Chain:     {applied.sample_rate_hz:,.0f} -> {nbfm.if_rate_hz:,.0f} Hz IF "
+            f"(/{nbfm.channel_decimation_factor}) -> {nbfm.audio_rate_hz:,.0f} Hz audio "
+            f"(/{nbfm.audio_decimation_factor})"
+        )
+
+        # Against the centre the tuner ACTUALLY reached, never the one it
+        # was asked for: the PLL quantises, and an offset computed from
+        # the requested frequency is wrong by exactly the amount nobody
+        # thinks to check.
+        doppler = DopplerTracker(downlink_hz, applied.center_hz)
+        squelch = (
+            NoiseSquelch(open_above_db=args.squelch_open, close_below_db=args.squelch_close)
+            if args.squelch
+            else None
+        )
+        print(
+            f"Squelch:   open at/above {args.squelch_open:.1f} dB, "
+            f"close at/below {args.squelch_close:.1f} dB"
+            if squelch is not None
+            else "Squelch:   off - expect full-scale hiss whenever the downlink is idle."
+        )
+
+        if not args.send:
+            print(
+                "Rotor:     not being moved. Doppler correction needs the TLE and "
+                "your location, not the rotor, so this is a complete receive."
+            )
+            return _run_receive(args, config, satellite, applied, nbfm, doppler, squelch, sdr)
+
+        with _Connected(config, rotor_factory) as rotor:
+            print(f"Rotor:     connected, {rotor.firmware_version}")
+            loop = TrackingLoop(satellite, config.observer, rotor, interval_s=args.interval)
+            return _run_receive(
+                args, config, satellite, applied, nbfm, doppler, squelch, sdr, loop=loop
+            )
+
+
+def _run_receive(
+    args: argparse.Namespace,
+    config: StationConfig,
+    satellite: Satellite,
+    applied: AppliedSettings,
+    nbfm: NbfmConfig,
+    doppler: DopplerTracker,
+    squelch: NoiseSquelch | None,
+    sdr: RtlSdr,
+    *,
+    loop: TrackingLoop | None = None,
+) -> int:
+    """Build and run the session. Split out so the rotor's ``with`` stays thin."""
+    stream = IqStream(sdr)
+    spectrum_config = SpectrumConfig(
+        fft_size=RECEIVE_FFT_SIZE,
+        sample_rate_hz=applied.sample_rate_hz,
+        center_freq_hz=applied.center_hz,
+    )
+
+    session = ReceiveSession(
+        stream=stream,
+        nbfm=nbfm,
+        doppler=doppler,
+        audio=AudioOutput(nbfm.audio_rate_hz),
+        range_rate=(
+            # With a window, ReadoutWidget ticks the loop on the GUI
+            # thread as Chunk F proved; the session follows. Headless,
+            # nobody else is ticking, so the session drives.
+            LoopRangeRate(loop, drive=not args.window)
+            if loop is not None
+            else TargetRangeRate(satellite, config.observer)
+        ),
+        squelch=squelch,
+        spectrum_factory=lambda blocks: SpectrumStream(blocks, spectrum_config),
+        tracking_interval_s=args.interval,
+    )
+
+    print(
+        "Receiving - Ctrl-C to stop."
+        if args.seconds is None
+        else f"Receiving for {args.seconds:.0f}s."
+    )
+
+    session.start()
+    try:
+        if args.window:
+            _show_instruments(args, satellite, session, loop)
+        elif session.wait(args.seconds):
+            # The demodulating thread ended before the clock did, which
+            # means the blocks stopped arriving. Sleeping out the rest of
+            # the run would have hidden that behind a normal-looking
+            # exit; session.stop() below raises whatever caused it.
+            print("The stream ended early - see the error below.", file=sys.stderr)
+    except KeyboardInterrupt:
+        print()  # the ^C the terminal echoed deserves its own line
+    finally:
+        stats = session.stop()
+
+    print()
+    print(stats.describe())
+    return 0
+
+
+def _show_instruments(
+    args: argparse.Namespace,
+    satellite: Satellite,
+    session: ReceiveSession,
+    loop: TrackingLoop | None,
+) -> None:
+    """Open the instrument window and run Qt's event loop until it closes.
+
+    **Qt is imported here and nowhere above**, because importing PySide6
+    at module scope would make the entire CLI unusable anywhere it is not
+    installed. Same reasoning as ``core/dsp/audio.py`` deferring
+    ``sounddevice`` and ``core/sdr/librtlsdr.py`` deferring its
+    ``CDLL()`` — a dependency that can fail merely by being imported
+    belongs inside the function that actually needs it.
+
+    The readout is present only when there is a loop to drive, and when
+    it is present **it owns the tick** — which is why the session was
+    built with ``drive=False`` in that case. Two things ticking one loop
+    would double the rotor's serial traffic.
+    """
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from qsorbit.ui.instrument_window import InstrumentWindow
+    from qsorbit.ui.readout_widget import ReadoutWidget
+    from qsorbit.ui.waterfall_widget import WaterfallWidget
+
+    app = QApplication.instance() or QApplication([])
+    window = InstrumentWindow(
+        readout=(
+            ReadoutWidget(loop, poll_interval_ms=int(args.interval * 1000))
+            if loop is not None
+            else None
+        ),
+        waterfall=WaterfallWidget(session.spectrum),
+        title=f"QSOrbit - receiving {satellite.name}",
+    )
+    window.show()
+    if args.seconds is not None:
+        # Honoured rather than ignored: a --seconds that silently did
+        # nothing under --window is precisely the sort of quiet
+        # disagreement between a flag and its behaviour this project
+        # keeps finding the hard way.
+        QTimer.singleShot(int(args.seconds * 1000), app.quit)
+    app.exec()
 
 
 def _command_stop(config: StationConfig, factory: RotorFactory) -> int:

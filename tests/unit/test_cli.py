@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from qsorbit import __version__
-from qsorbit.__main__ import build_parser, main
+from qsorbit.__main__ import DEFAULT_TUNING_OFFSET_KHZ, build_parser, main
 from qsorbit.core.rotor import Arrival, HomingError, Position, Rotor, RotorErrorCode, RotorStatus
 from qsorbit.core.sdr import AppliedSettings, DeviceError, DeviceInfo, TunerType
 
@@ -712,3 +712,61 @@ class TestSdrCapture:
 
         assert code == 1
         assert "sample_rate_hz" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# receive
+# ---------------------------------------------------------------------------
+
+
+class TestReceiveParser:
+    """Parser-level checks only. The session itself is tested in test_receive.py."""
+
+    def test_a_tle_is_required(self):
+        with pytest.raises(SystemExit) as exit_info:
+            build_parser().parse_args(["receive", "--downlink", "145.95", "--gain", "40"])
+        assert exit_info.value.code == 2
+
+    def test_a_downlink_is_required(self):
+        with pytest.raises(SystemExit) as exit_info:
+            build_parser().parse_args(["receive", "--tle", "x", "--gain", "40"])
+        assert exit_info.value.code == 2
+
+    def test_a_gain_choice_is_required(self):
+        # Deliberately has no default, same as 'sdr capture': a default
+        # gain is how a pass comes back silent with nobody noticing.
+        with pytest.raises(SystemExit) as exit_info:
+            build_parser().parse_args(["receive", "--tle", "x", "--downlink", "145.95"])
+        assert exit_info.value.code == 2
+
+    def test_gain_and_auto_gain_are_mutually_exclusive(self):
+        with pytest.raises(SystemExit) as exit_info:
+            build_parser().parse_args(
+                ["receive", "--tle", "x", "--downlink", "145.95", "--gain", "40", "--auto-gain"]
+            )
+        assert exit_info.value.code == 2
+
+    def test_send_defaults_to_off(self):
+        # The safety-relevant default again, and the one that makes a
+        # receive possible with no rotor connected at all.
+        args = build_parser().parse_args(
+            ["receive", "--tle", "x", "--downlink", "145.95", "--gain", "40"]
+        )
+        assert args.send is False
+
+    def test_the_window_and_the_squelch_both_default_to_off(self):
+        # The squelch default is a Chunk G decision with a reason: a mute
+        # set slightly too tight makes a working receiver sound exactly
+        # like a broken one, which is the last thing wanted while
+        # pointing at a weak downlink for the first time.
+        args = build_parser().parse_args(
+            ["receive", "--tle", "x", "--downlink", "145.95", "--gain", "40"]
+        )
+        assert args.window is False
+        assert args.squelch is False
+
+    def test_the_tuning_offset_defaults_to_the_project_convention(self):
+        args = build_parser().parse_args(
+            ["receive", "--tle", "x", "--downlink", "145.95", "--gain", "40"]
+        )
+        assert args.offset == DEFAULT_TUNING_OFFSET_KHZ
