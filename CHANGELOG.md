@@ -42,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The correction is recomputed for every block of samples rather than once per tracking update, by extrapolating between updates. Holding one value between updates leaves a small step in the audio once a second; recomputing removes it, and costs nothing extra.
 - Doppler correction reports the range of correction it applied over a pass, and says plainly when it was working from a stale figure because the tracking loop stopped feeding it — a correction quietly drifting on old data otherwise looks like the receiver wandering off for no reason.
 - Separately named functions for downlink and uplink Doppler correction, so a caller picks a direction by name instead of by sign. The uplink one is reserved and raises rather than guessing: its correction is the reciprocal of the downlink's, not its negation, and the two agree closely enough at orbital speeds that a wrong implementation would pass any tolerance anyone thought to write.
+- One radio can now feed several parts of the application at once — hearing a satellite while watching its trace on the waterfall no longer means choosing one or the other. Each consumer gets its own buffer, so a display that falls behind drops its own frames and leaves the audio alone.
+- Every block of samples now carries the time it arrived, recorded as it comes off the radio rather than worked out later by whatever consumes it. Doppler correction depends on knowing when a block was on the air, and a time derived further downstream is only right for as long as nothing is running late.
 
 ### Changed
 
@@ -50,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The helper that works out where a signal sits within a capture now measures from the frequency the tuner actually reached rather than the one it was asked for. The two differ by however much the tuner rounded, and nothing downstream could have noticed.
 - The rotor/sky readout is now a panel rather than a window in its own right, so it can share a window with the waterfall — or run without it. Each panel feeds itself, which means looking at a spectrum no longer needs a rotor connected, and watching the rotor no longer needs an SDR.
 - Decimation now preserves whether its input was real or complex, rather than always returning complex samples — needed so the same decimation code can be reused on the real-valued audio signal downstream of the WBFM discriminator, not only on IQ.
+- Asking a stream for its blocks twice is now refused rather than quietly answered. It used to appear to work, with each caller receiving roughly every other block and neither having any way to notice.
+- Buffer drops are now reported per consumer as well as for the stream as a whole, so a stalled waterfall can be told apart from a stalled audio path instead of both being one number.
+- Doppler correction is now safe to share between the part of the application that tracks the satellite and the part that demodulates it, which are no longer the same thread.
 
 <!--
 When adding entries, group them under these headings as needed:

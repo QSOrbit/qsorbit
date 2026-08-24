@@ -66,6 +66,40 @@ fix the wrong thing:
     Samples that never reached us across USB, inferred from the sample
     clock. This is the sync-read gap, and the one that would justify
     the async swap.
+
+**One producer, many consumers** (Chunk H). A live session wants the
+same blocks in two places at once — demodulated to audio, and framed
+into a waterfall — and until this chunk that was impossible in a way
+nothing reported: :meth:`IqStream.blocks` was a single generator over a
+single buffer, so a second consumer *interleaved* with the first and
+each quietly got roughly every other block. Both would have looked like
+they were working. Chunk G worked around it by running its bench checks
+as separate passes; the ``receive`` path cannot.
+
+So the buffer is now per-consumer. :meth:`IqStream.subscribe` hands out
+an :class:`IqSubscription` with its own bounded queue and its own drop
+count, and the reader appends the *same* immutable ``bytes`` object to
+each — the fan-out costs one deque append per subscriber inside a lock
+the reader already holds, and no copy. Two consequences worth stating:
+
+* A slow consumer drops its own blocks and nobody else's, which is why
+  the drop count is per subscriber rather than one number for the
+  stream. :attr:`StreamStats.blocks_dropped` keeps its old meaning by
+  reporting the **worst-affected** consumer. Summing them would make a
+  two-consumer stream look twice as lossy as either consumer actually
+  was, which is the same "two faults reported as one number" mistake
+  this module already exists to avoid.
+* :meth:`IqStream.blocks` now **raises** on a second call rather than
+  silently interleaving. The trap is removed at its source rather than
+  left standing next to the safe thing.
+
+**Blocks carry a timestamp** (Chunk H, same reason). Doppler correction
+is recomputed at each block's midpoint, so it needs to know when a
+block's samples were on the air. That timestamp has to be taken where
+the block is read: deriving it in the consumer is accurate only while
+the consumer keeps up, and is wrong by the whole queue depth exactly
+when it does not. See :class:`TimedBlock` for what it does and does not
+promise.
 """
 
 from __future__ import annotations
@@ -75,6 +109,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Final
 
 from qsorbit.core.sdr.device import DEFAULT_READ_BYTES, RtlSdr
@@ -103,6 +138,108 @@ STALL_THRESHOLD_S: Final = 0.001
 #: block at 2.048 Msps is about 64 ms, so this is generous; it exists
 #: for the pathological case described in :meth:`IqStream.stop`.
 DEFAULT_JOIN_TIMEOUT_S: Final = 5.0
+
+#: How often a waiting consumer re-checks while idle. Does not add
+#: latency to a block that arrives — the reader notifies — it only
+#: bounds how long a shutdown can sit unnoticed.
+DEFAULT_POLL_S: Final = 0.5
+
+#: Name of the implicit subscription :meth:`IqStream.blocks` uses, so
+#: that a single-consumer stream still labels its statistics with
+#: something rather than with a blank.
+DEFAULT_SUBSCRIBER_NAME: Final = "default"
+
+
+def _utc_now() -> datetime:
+    """The current instant, timezone-aware.
+
+    Deliberately a **wall** clock, and deliberately not the monotonic
+    one :class:`ThroughputMonitor` uses. The two clocks answer different
+    questions and conflating them is an easy, invisible mistake: the
+    monitor measures elapsed time, where a wall clock can step
+    backwards, while a block timestamp exists to be compared against
+    :attr:`~qsorbit.core.pointing.TrackSample.time` and
+    :attr:`~qsorbit.core.dsp.spectrum_stream.SpectrumFrame.time`, which
+    are wall clock. Nothing here measures a duration.
+    """
+    return datetime.now(UTC)
+
+
+@dataclass(frozen=True)
+class TimedBlock:
+    """One raw IQ block and when its samples arrived.
+
+    Args:
+        data: Raw interleaved uint8 I/Q, exactly as the device returned
+            it. Shared between every subscriber rather than copied —
+            ``bytes`` is immutable, so this is safe and free.
+        read_at: When the read that produced this block **returned**,
+            timezone-aware. The block's samples therefore span
+            ``[read_at - duration_s, read_at]``, which is why
+            :attr:`midpoint` subtracts rather than adds.
+        duration_s: How long the block's samples represent, from the
+            sample rate the device actually reported.
+
+    **What this timestamp does not promise.** It is taken when the block
+    finished arriving at the host, so it trails the antenna by however
+    deep librtlsdr's USB pipeline happens to be. That lag is unknown to
+    us but small and essentially constant, and a constant offset shifts
+    a Doppler correction by the Doppler *rate* times the lag — at most a
+    few tens of hertz at UHF against a channel sixteen kilohertz wide.
+    Fine for what this is for, and not a timestamp to build anything
+    precise on. Same caveat, same wording, as
+    :attr:`~qsorbit.core.dsp.spectrum_stream.SpectrumFrame.time`.
+    """
+
+    data: bytes
+    read_at: datetime
+    duration_s: float
+
+    @property
+    def midpoint(self) -> datetime:
+        """The instant halfway through this block's samples.
+
+        The midpoint rather than either edge because it removes a
+        systematic half-block bias from a per-block correction for free
+        — :meth:`~qsorbit.core.dsp.tuning.DopplerTracker.offset_at` asks
+        for exactly this, and computing it here rather than in each
+        caller is what stops one of them getting the sign wrong.
+        """
+        return self.read_at - timedelta(seconds=self.duration_s / 2.0)
+
+
+@dataclass(frozen=True)
+class SubscriberStats:
+    """What one consumer of a stream actually received.
+
+    Args:
+        name: The subscription's label, as given to
+            :meth:`IqStream.subscribe`.
+        blocks_offered: Blocks the reader put in front of this consumer
+            — every block read while it was subscribed. Named *offered*
+            rather than *delivered* on purpose: a block that is queued
+            and then evicted before the consumer gets to it was offered
+            and not delivered, and calling that "delivered" would make
+            the two numbers below fail to add up in a way nobody would
+            notice until they tried to reconcile them.
+        blocks_dropped: Blocks evicted because *this* consumer's queue
+            was full. Nobody else's queue is affected, which is the
+            whole point of keeping the count here: a waterfall that
+            stalls does not make the audio path look broken.
+        queue_blocks: This consumer's buffer depth.
+    """
+
+    name: str
+    blocks_offered: int
+    blocks_dropped: int
+    queue_blocks: int
+
+    def describe(self) -> str:
+        """Summarise one consumer in a single line."""
+        return (
+            f"{self.name}: {self.blocks_offered:,} offered, "
+            f"{self.blocks_dropped:,} dropped, depth {self.queue_blocks}"
+        )
 
 
 @dataclass(frozen=True)
@@ -296,18 +433,30 @@ class StreamStats:
     Args:
         blocks_read: Blocks the reader pulled from the device.
         bytes_read: Bytes those blocks contained.
-        blocks_dropped: Blocks discarded because the buffer was full —
+        blocks_dropped: Blocks discarded because a buffer was full —
             **our** loss, exactly counted, caused by a slow consumer.
             Fixing this means a larger buffer or a faster consumer;
             changing how the device is read would not touch it.
+
+            With more than one consumer this is the **worst-affected**
+            one, not the sum. Each consumer has its own queue and drops
+            independently, so summing would report a stream as twice as
+            lossy as either consumer actually experienced. The
+            per-consumer detail is in :attr:`subscribers`, and that is
+            where to look before concluding anything about which
+            consumer is behind.
         block_bytes: Bytes requested per read.
-        queue_blocks: Buffer depth in blocks.
+        queue_blocks: Buffer depth in blocks, per consumer.
         reader_stopped_cleanly: Whether the reader thread exited within
             its join timeout. ``False`` means a read is wedged — see
             :meth:`IqStream.stop`.
         loss: Samples that never crossed USB — the sync-read gap, and
             the number that would justify moving to
             ``rtlsdr_read_async``.
+        subscribers: One entry per consumer, in subscription order.
+            Defaults to empty so that the many places which build a
+            :class:`StreamStats` by hand — tests, fixtures — keep
+            working unchanged.
     """
 
     blocks_read: int
@@ -317,6 +466,7 @@ class StreamStats:
     queue_blocks: int
     reader_stopped_cleanly: bool
     loss: LossReport
+    subscribers: tuple[SubscriberStats, ...] = ()
 
     @property
     def dropped_bytes(self) -> int:
@@ -326,18 +476,123 @@ class StreamStats:
     def describe(self) -> str:
         """Return a summary that keeps the two faults visibly separate."""
         clean = "" if self.reader_stopped_cleanly else "  reader DID NOT stop cleanly\n"
+        # Listed only when there is more than one, because for a single
+        # consumer the line would restate the buffer line directly above
+        # it, and a report that says the same number twice invites the
+        # reader to look for a difference that is not there.
+        per_consumer = (
+            "".join(f"  consumer {entry.describe()}\n" for entry in self.subscribers)
+            if len(self.subscribers) > 1
+            else ""
+        )
         return (
             f"blocks read {self.blocks_read:,} of {self.block_bytes:,} bytes\n"
             f"  at the device (USB):  {self.loss.describe()}\n"
             f"  at our buffer:        {self.blocks_dropped:,} block(s) dropped "
-            f"({self.dropped_bytes:,} bytes), depth {self.queue_blocks}\n" + clean
+            f"({self.dropped_bytes:,} bytes), depth {self.queue_blocks}\n" + per_consumer + clean
         )
+
+
+class IqSubscription:
+    """One consumer's independent view of an :class:`IqStream`.
+
+    Handed out by :meth:`IqStream.subscribe`; never constructed
+    directly. Each subscription has its own bounded queue, so consumers
+    cannot steal blocks from one another and a slow one drops only its
+    own — the failure that used to happen silently when two callers
+    shared a single :meth:`IqStream.blocks` generator.
+
+    The queue **discards the oldest block** when full, matching
+    :class:`IqStream`'s original policy and
+    :class:`~qsorbit.core.dsp.audio.AudioOutput`'s: a consumer
+    recovering from a hiccup should see the present rather than replay a
+    backlog it can never catch up on.
+    """
+
+    def __init__(self, stream: IqStream, name: str, queue_blocks: int) -> None:
+        self._stream = stream
+        self._name = name
+        self._queue_blocks = queue_blocks
+        self._queue: deque[TimedBlock] = deque(maxlen=queue_blocks)
+        self._offered = 0
+        self._dropped = 0
+
+    @property
+    def name(self) -> str:
+        """The label this subscription's statistics are reported under."""
+        return self._name
+
+    @property
+    def stats(self) -> SubscriberStats:
+        """What this consumer has received so far."""
+        return SubscriberStats(
+            name=self._name,
+            blocks_offered=self._offered,
+            blocks_dropped=self._dropped,
+            queue_blocks=self._queue_blocks,
+        )
+
+    def blocks(self, poll_s: float = DEFAULT_POLL_S) -> Iterator[bytes]:
+        """Yield this consumer's blocks as raw bytes, until the reader finishes.
+
+        The plain form, for a consumer that does not care when a block
+        arrived — a waterfall, a capture. Use :meth:`timed_blocks` where
+        the time matters.
+
+        Args:
+            poll_s: See :data:`DEFAULT_POLL_S`.
+
+        Yields:
+            Raw interleaved I/Q blocks, oldest first.
+
+        Raises:
+            DeviceError: Anything the reader thread hit, re-raised once
+                this consumer's queue drains.
+        """
+        for timed in self.timed_blocks(poll_s):
+            yield timed.data
+
+    def timed_blocks(self, poll_s: float = DEFAULT_POLL_S) -> Iterator[TimedBlock]:
+        """Yield this consumer's blocks with their timestamps.
+
+        Args:
+            poll_s: See :data:`DEFAULT_POLL_S`.
+
+        Yields:
+            :class:`TimedBlock`, oldest first.
+
+        Raises:
+            DeviceError: Anything the reader thread hit is re-raised
+                here once this consumer's queue drains, rather than
+                vanishing with the thread. **Every** consumer is told,
+                not just whichever one happens to drain first — see
+                :meth:`IqStream._reraise`.
+        """
+        stream = self._stream
+        stream._ensure_started()
+        while True:
+            with stream._not_empty:
+                while not self._queue and not stream._finished:
+                    stream._not_empty.wait(poll_s)
+                if self._queue:
+                    block = self._queue.popleft()
+                else:
+                    break
+            yield block
+        stream._reraise()
+
+    def _offer(self, block: TimedBlock) -> None:
+        """Put a block in this consumer's queue. Called with the lock held."""
+        if len(self._queue) == self._queue_blocks:
+            self._dropped += 1
+        self._queue.append(block)
+        self._offered += 1
 
 
 class IqStream:
     """A reader thread pulling IQ blocks from a device into a bounded buffer.
 
-    Usage::
+    One consumer, which is most callers::
 
         with IqStream(sdr) as stream:
             for block in stream.blocks():
@@ -345,6 +600,16 @@ class IqStream:
                 if enough:
                     break
         print(stream.stats.describe())
+
+    Two consumers — the ``receive`` path's shape. Subscribe **before**
+    starting the reader, then hand each subscription to its consumer::
+
+        stream = IqStream(sdr)
+        audio = stream.subscribe("audio")
+        waterfall = stream.subscribe("waterfall")
+        with stream:
+            ...  # audio.timed_blocks() on one thread,
+                 # waterfall.blocks() feeding a SpectrumStream on another
 
     The buffer **discards the oldest block** when it is full. Two
     reasons. For a live consumer — a waterfall, an audio path — stale
@@ -366,8 +631,11 @@ class IqStream:
             *between* reads, so halving the block size doubles how many
             gaps occur per second. If a measurement comes back bad, try
             a larger block before concluding the design is wrong.
-        queue_blocks: Buffer depth.
-        clock: Monotonic clock, injectable for tests.
+        queue_blocks: Buffer depth, **per consumer**.
+        clock: Monotonic clock for the loss accounting, injectable for
+            tests. Never a wall clock — see :class:`ThroughputMonitor`.
+        now: Wall clock for block timestamps, injectable for tests.
+            Deliberately a second, separate clock: see :func:`_utc_now`.
 
     Raises:
         DeviceError: If the device is not open, or has never been
@@ -383,6 +651,7 @@ class IqStream:
         block_bytes: int = DEFAULT_READ_BYTES,
         queue_blocks: int = DEFAULT_QUEUE_BLOCKS,
         clock: Callable[[], float] = time.monotonic,
+        now: Callable[[], datetime] = _utc_now,
     ) -> None:
         if block_bytes <= 0:
             raise ValueError(f"block_bytes must be positive, got {block_bytes}.")
@@ -400,9 +669,13 @@ class IqStream:
         self._device = device
         self._block_bytes = block_bytes
         self._queue_blocks = queue_blocks
-        self._monitor = ThroughputMonitor(byte_rate_for(applied.sample_rate_hz), clock=clock)
+        self._byte_rate = byte_rate_for(applied.sample_rate_hz)
+        self._monitor = ThroughputMonitor(self._byte_rate, clock=clock)
+        self._now = now
 
-        self._blocks: deque[bytes] = deque(maxlen=queue_blocks)
+        self._subscribers: list[IqSubscription] = []
+        self._default: IqSubscription | None = None
+        self._default_claimed = False
         self._not_empty = threading.Condition(threading.Lock())
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -410,7 +683,6 @@ class IqStream:
         self._error: BaseException | None = None
         self._blocks_read = 0
         self._bytes_read = 0
-        self._blocks_dropped = 0
         self._stopped_cleanly = True
 
     # ------------------------------------------------------------------
@@ -422,10 +694,59 @@ class IqStream:
         """``True`` while the reader thread is alive."""
         return self._thread is not None and self._thread.is_alive()
 
+    def subscribe(self, name: str) -> IqSubscription:
+        """Add a consumer with its own bounded queue, before the reader starts.
+
+        Args:
+            name: A label for this consumer, used in
+                :attr:`StreamStats.subscribers`. Must be unique within
+                the stream, since the statistics are read by it.
+
+        Returns:
+            The subscription to hand that consumer.
+
+        Raises:
+            DeviceError: If the reader has already started. A
+                subscription made after the fact would silently miss
+                everything read so far, and a consumer that begins
+                mid-stream with no record of where it joined is exactly
+                the quiet gap this module exists to make visible.
+                Dynamic, mid-run subscription is not built because
+                nothing needs it yet: the ``receive`` path knows both of
+                its consumers before the first read, and a
+                :class:`IqStream` is constructed per listening session.
+            ValueError: If ``name`` is empty or already taken.
+        """
+        if self._thread is not None:
+            raise DeviceError(
+                f"Cannot subscribe {name!r} after the reader has started -- it would "
+                "silently miss every block already read. Subscribe before start(), or "
+                "before entering the 'with' block, which starts the reader."
+            )
+        if not name:
+            raise ValueError("A subscription needs a name; it is what labels the statistics.")
+        if any(existing.name == name for existing in self._subscribers):
+            raise ValueError(
+                f"A subscriber named {name!r} already exists. Names label the "
+                "per-consumer statistics, so two consumers sharing one would make "
+                "the report unreadable."
+            )
+        subscription = IqSubscription(self, name, self._queue_blocks)
+        self._subscribers.append(subscription)
+        return subscription
+
     def start(self) -> None:
-        """Start the reader thread. Starting twice is an error."""
+        """Start the reader thread. Starting twice is an error.
+
+        If nothing has subscribed, the implicit single-consumer
+        subscription :meth:`blocks` uses is created here, so a stream
+        started and left unconsumed still buffers and still counts its
+        drops exactly as it did before the fan-out existed.
+        """
         if self._thread is not None:
             raise DeviceError("This stream has already been started; build a new one.")
+        if not self._subscribers:
+            self._default = self.subscribe(DEFAULT_SUBSCRIBER_NAME)
         self._thread = threading.Thread(
             target=self._read_loop,
             name=f"qsorbit-iq-reader-{self._device.index}",
@@ -464,52 +785,103 @@ class IqStream:
     @property
     def stats(self) -> StreamStats:
         """The run's statistics. Stable once :meth:`stop` has returned."""
+        per_consumer = tuple(subscriber.stats for subscriber in self._subscribers)
         return StreamStats(
             blocks_read=self._blocks_read,
             bytes_read=self._bytes_read,
-            blocks_dropped=self._blocks_dropped,
+            # The worst-affected consumer, not the sum -- see the field's
+            # docstring. With one consumer the two are the same number,
+            # which is why this reads identically to how it always has.
+            blocks_dropped=max((entry.blocks_dropped for entry in per_consumer), default=0),
             block_bytes=self._block_bytes,
             queue_blocks=self._queue_blocks,
             reader_stopped_cleanly=self._stopped_cleanly,
             loss=self._monitor.report(),
+            subscribers=per_consumer,
         )
 
     # ------------------------------------------------------------------
     # Consuming
     # ------------------------------------------------------------------
 
-    def blocks(self, poll_s: float = 0.5) -> Iterator[bytes]:
+    def blocks(self, poll_s: float = DEFAULT_POLL_S) -> Iterator[bytes]:
         """Yield blocks as they arrive, until the reader finishes.
 
-        Starts the reader if it is not already running, so the common
-        case needs no separate :meth:`start` call.
+        The single-consumer convenience. Starts the reader if it is not
+        already running, so the common case needs no separate
+        :meth:`start` call.
 
         Args:
-            poll_s: How often the wait re-checks while idle. Does not
-                add latency to a block that arrives — the reader
-                notifies — it only bounds how long a shutdown can sit
-                unnoticed.
+            poll_s: See :data:`DEFAULT_POLL_S`.
 
-        Yields:
-            Raw interleaved I/Q blocks, oldest first.
+        Returns:
+            An iterator over raw interleaved I/Q blocks, oldest first.
 
         Raises:
-            DeviceError: Anything the reader thread hit is re-raised
-                here once the stream drains, rather than vanishing with
-                the thread.
+            DeviceError: If called twice, or on a stream that has
+                explicit subscribers. Both used to *work*, in the worst
+                sense: a second consumer interleaved with the first and
+                each silently received roughly every other block, with
+                nothing reporting an error and both looking like they
+                worked. Call :meth:`subscribe` once per consumer
+                instead.
+
+                Also re-raises anything the reader thread hit, once this
+                consumer's queue drains.
         """
+        return self._claim_default().blocks(poll_s)
+
+    def timed_blocks(self, poll_s: float = DEFAULT_POLL_S) -> Iterator[TimedBlock]:
+        """As :meth:`blocks`, but each block carries when it arrived.
+
+        Args:
+            poll_s: See :data:`DEFAULT_POLL_S`.
+
+        Returns:
+            An iterator over :class:`TimedBlock`, oldest first.
+
+        Raises:
+            DeviceError: Exactly as :meth:`blocks` — the two share one
+                implicit subscription, so claiming either claims both.
+        """
+        return self._claim_default().timed_blocks(poll_s)
+
+    def _claim_default(self) -> IqSubscription:
+        """Return the implicit subscription, or explain why there isn't one.
+
+        Deliberately **not** a generator, and neither are :meth:`blocks`
+        nor :meth:`timed_blocks`: a generator function's body does not
+        run until the first ``next()``, so a second ``blocks()`` call
+        would sit there looking accepted and only fail later, from a
+        stack frame that does not mention the mistake. Returning an
+        iterator built by a plain function makes the refusal land on the
+        call that caused it.
+        """
+        # Refused *before* starting the reader, not after: a call that is
+        # going to be rejected should not leave a thread running and a
+        # device being read as a side effect.
+        if self._default is None and self._subscribers:
+            raise DeviceError(
+                "This stream has explicit subscribers, so blocks() would add an "
+                "unnamed third consumer whose drops nothing would attribute. Call "
+                "subscribe() for this consumer as well."
+            )
         if self._thread is None:
             self.start()
-        while True:
-            with self._not_empty:
-                while not self._blocks and not self._finished:
-                    self._not_empty.wait(poll_s)
-                if self._blocks:
-                    block = self._blocks.popleft()
-                else:
-                    break
-            yield block
-        self._reraise()
+        if self._default_claimed:
+            raise DeviceError(
+                "blocks() has already been called on this stream. A second consumer "
+                "sharing one subscription would interleave -- each getting roughly "
+                "every other block, with both looking like they worked. Call "
+                "subscribe() once per consumer instead."
+            )
+        self._default_claimed = True
+        return self._default
+
+    def _ensure_started(self) -> None:
+        """Start the reader if it is not running. For :class:`IqSubscription`."""
+        if self._thread is None:
+            self.start()
 
     # ------------------------------------------------------------------
     # Context manager
@@ -538,13 +910,25 @@ class IqStream:
                 # touches the block: a lock wait here would be measured
                 # as device loss.
                 self._monitor.record(len(block))
+                # The wall clock comes second, so the loss accounting
+                # keeps the tighter of the two timestamps. This costs one
+                # more clock read per block -- tens of nanoseconds against
+                # a 64 ms block -- but the read path is a real-time path
+                # (Session 16), so it is worth saying why it is affordable
+                # rather than assuming nobody will ask.
+                timed = TimedBlock(
+                    data=block,
+                    read_at=self._now(),
+                    duration_s=len(block) / self._byte_rate,
+                )
                 with self._not_empty:
                     self._blocks_read += 1
                     self._bytes_read += len(block)
-                    if len(self._blocks) == self._queue_blocks:
-                        self._blocks_dropped += 1
-                    self._blocks.append(block)
-                    self._not_empty.notify()
+                    # The same immutable object goes to every consumer.
+                    # No copy, and no consumer can affect another's queue.
+                    for subscriber in self._subscribers:
+                        subscriber._offer(timed)
+                    self._not_empty.notify_all()
         except BaseException as exc:  # noqa: BLE001 - re-raised in the consumer
             self._error = exc
         finally:
@@ -553,8 +937,16 @@ class IqStream:
                 self._not_empty.notify_all()
 
     def _reraise(self) -> None:
-        """Re-raise whatever killed the reader thread, if anything did."""
+        """Re-raise whatever killed the reader thread, if anything did.
+
+        **The error is not cleared once raised**, unlike the
+        single-consumer version this replaced. With several consumers,
+        clearing it would mean whichever one drained first got the
+        exception and every other one saw its stream simply end — a
+        silent stop with the explanation already consumed by somebody
+        else. Every consumer is entitled to be told why the blocks
+        stopped.
+        """
         error = self._error
         if error is not None:
-            self._error = None
             raise error

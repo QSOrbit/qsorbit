@@ -64,6 +64,7 @@ function, and this module is the only thing here that holds state.
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Final
@@ -154,6 +155,20 @@ class DopplerTracker:
     :class:`~qsorbit.core.dsp.squelch.NoiseSquelch` is — it has to remember
     something between blocks.
 
+    **Thread-safe, which the other stateful objects here are not, because
+    this one genuinely spans two threads.** In the ``receive`` path the
+    tracking loop calls :meth:`update` from wherever it ticks, while the
+    demodulator calls :meth:`offset_at` per block from another thread.
+    Without a lock the reader can see a half-written sample list — the new
+    sample appended but the old one not yet dropped — and a wrong slope is
+    a wrong correction that raises nothing and sounds merely a bit worse.
+    The lock is held only around list and counter access, never around
+    anything that blocks, so the demodulator cannot stall the tracking
+    loop or the reverse. :class:`~qsorbit.core.dsp.squelch.NoiseSquelch`
+    deliberately does *not* get one: it lives entirely on the
+    demodulating thread, and a lock there would suggest a sharing that
+    does not happen.
+
     Usage, one tracker per pass::
 
         tracker = DopplerTracker(transmit_hz=145_950_000.0, center_hz=applied.center_hz)
@@ -200,6 +215,15 @@ class DopplerTracker:
         self._center_hz = center_hz
         self._max_extrapolation_s = max_extrapolation_s
 
+        # Guards everything below it. A plain Lock rather than an RLock:
+        # offset_at() needs frequency_at()'s arithmetic, so that
+        # arithmetic lives in an unlocked private method that both public
+        # entry points call while holding the lock. An RLock would have
+        # worked too, and would have hidden which method owns the
+        # counting -- and the counting is the part that has already been
+        # wrong once (see frequency_at).
+        self._lock = threading.Lock()
+
         # The two newest samples, oldest first, as (time, received_hz).
         self._samples: list[tuple[datetime, float]] = []
         self._updates = 0
@@ -222,7 +246,8 @@ class DopplerTracker:
     @property
     def has_samples(self) -> bool:
         """``True`` once at least one range rate has been supplied."""
-        return bool(self._samples)
+        with self._lock:
+            return bool(self._samples)
 
     def update(self, time: datetime, range_rate_km_s: float) -> None:
         """Supply one tracking-loop sample.
@@ -247,17 +272,24 @@ class DopplerTracker:
             raise ValueError(
                 "time must be timezone-aware; a naive datetime has no defined instant."
             )
-        if self._samples and time < self._samples[-1][0]:
-            raise ValueError(
-                f"time went backwards: {time.isoformat()} is earlier than the previous "
-                f"sample at {self._samples[-1][0].isoformat()}. Extrapolating across that "
-                f"would invert the slope and correct the wrong way."
-            )
-
+        # Computed outside the lock: it is pure arithmetic on arguments,
+        # and doing it inside would hold the lock across work the reader
+        # is waiting on for no reason.
         received_hz = downlink_receive_frequency(self._transmit_hz, range_rate_km_s)
-        self._samples.append((time, received_hz))
-        del self._samples[:-2]
-        self._updates += 1
+
+        with self._lock:
+            if self._samples and time < self._samples[-1][0]:
+                raise ValueError(
+                    f"time went backwards: {time.isoformat()} is earlier than the previous "
+                    f"sample at {self._samples[-1][0].isoformat()}. Extrapolating across that "
+                    f"would invert the slope and correct the wrong way."
+                )
+            # Append and trim under one lock. Separately, a reader could
+            # catch the list three entries long and take the wrong pair
+            # as its slope.
+            self._samples.append((time, received_hz))
+            del self._samples[:-2]
+            self._updates += 1
 
     def frequency_at(self, time: datetime) -> float:
         """The frequency the downlink is expected at, in Hz, at ``time``.
@@ -278,6 +310,11 @@ class DopplerTracker:
         Raises:
             DopplerError: If no sample has been supplied yet.
         """
+        with self._lock:
+            return self._frequency_at(time)
+
+    def _frequency_at(self, time: datetime) -> float:
+        """:meth:`frequency_at`'s arithmetic. **The lock must be held.**"""
         if not self._samples:
             raise DopplerError(
                 "No range rate has been supplied yet -- call update() with a tracking-loop "
@@ -331,15 +368,16 @@ class DopplerTracker:
         Raises:
             DopplerError: If no sample has been supplied yet.
         """
-        offset_hz = self.frequency_at(time) - self._center_hz
-        self._last_offset_hz = offset_hz
-        self._min_offset_hz = (
-            offset_hz if self._min_offset_hz is None else min(self._min_offset_hz, offset_hz)
-        )
-        self._max_offset_hz = (
-            offset_hz if self._max_offset_hz is None else max(self._max_offset_hz, offset_hz)
-        )
-        return offset_hz
+        with self._lock:
+            offset_hz = self._frequency_at(time) - self._center_hz
+            self._last_offset_hz = offset_hz
+            self._min_offset_hz = (
+                offset_hz if self._min_offset_hz is None else min(self._min_offset_hz, offset_hz)
+            )
+            self._max_offset_hz = (
+                offset_hz if self._max_offset_hz is None else max(self._max_offset_hz, offset_hz)
+            )
+            return offset_hz
 
     def is_stale_at(self, time: datetime) -> bool:
         """``True`` if ``time`` is further past the newest sample than allowed.
@@ -347,18 +385,24 @@ class DopplerTracker:
         Lets a caller notice a stalled tracking loop without waiting to
         read :attr:`stats` at the end of a pass.
         """
-        if not self._samples:
-            return True
-        return (time - self._samples[-1][0]).total_seconds() > self._max_extrapolation_s
+        with self._lock:
+            if not self._samples:
+                return True
+            return (time - self._samples[-1][0]).total_seconds() > self._max_extrapolation_s
 
     @property
     def stats(self) -> DopplerStats:
-        """The run's statistics so far."""
-        return DopplerStats(
-            updates=self._updates,
-            queries=self._queries,
-            stale_queries=self._stale_queries,
-            min_offset_hz=self._min_offset_hz,
-            max_offset_hz=self._max_offset_hz,
-            last_offset_hz=self._last_offset_hz,
-        )
+        """The run's statistics so far.
+
+        Taken under the lock, so the six numbers are a consistent
+        snapshot rather than six reads that could straddle an update.
+        """
+        with self._lock:
+            return DopplerStats(
+                updates=self._updates,
+                queries=self._queries,
+                stale_queries=self._stale_queries,
+                min_offset_hz=self._min_offset_hz,
+                max_offset_hz=self._max_offset_hz,
+                last_offset_hz=self._last_offset_hz,
+            )
