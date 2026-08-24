@@ -6,7 +6,9 @@ output. Chunk F adds the streaming half of the spectrum path — frames
 produced on a worker thread at a rate a display can use, with no Qt
 import anywhere in here. Chunk G adds narrowband FM — the mode the
 satellite downlinks actually use — and the optional noise squelch that
-makes a narrowband listen bearable. See the Phase 2 brief.
+makes a narrowband listen bearable, along with Doppler-corrected tuning
+— which is where the mode finally has a moving satellite to point it at.
+See the Phase 2 brief.
 """
 
 from qsorbit.core.dsp.audio import (
@@ -57,6 +59,12 @@ from qsorbit.core.dsp.squelch import (
     SquelchStats,
     quieting_db,
 )
+from qsorbit.core.dsp.tuning import (
+    DEFAULT_MAX_EXTRAPOLATION_S,
+    DopplerError,
+    DopplerStats,
+    DopplerTracker,
+)
 
 __all__ = [
     "AUDIO_CLIP_RANGE",
@@ -66,6 +74,7 @@ __all__ = [
     "DEFAULT_DEVIATION_HZ",
     "DEFAULT_FLOOR_DB",
     "DEFAULT_FRAME_RATE_HZ",
+    "DEFAULT_MAX_EXTRAPOLATION_S",
     "DEFAULT_NBFM_DEEMPHASIS_US",
     "DEFAULT_NBFM_DEVIATION_HZ",
     "DEFAULT_NBFM_IF_RATE_HZ",
@@ -81,6 +90,9 @@ __all__ = [
     "AudioError",
     "AudioOutput",
     "AudioStats",
+    "DopplerError",
+    "DopplerStats",
+    "DopplerTracker",
     "NbfmConfig",
     "NoiseSquelch",
     "SpectrumConfig",
