@@ -1,4 +1,4 @@
-"""Audio output: play demodulated audio through the system's default device.
+"""Audio output: play demodulated audio through an output device.
 
 Wraps ``sounddevice``'s ``OutputStream``, and mirrors
 :class:`~qsorbit.core.sdr.stream.IqStream`'s producer/consumer shape while
@@ -106,7 +106,9 @@ class AudioStats:
 
 
 class AudioOutput:
-    """Streams float32 mono audio to the system's default output device.
+    """Streams float32 mono audio to an output device.
+
+    The system default unless ``device`` says otherwise.
 
     Usage::
 
@@ -118,6 +120,14 @@ class AudioOutput:
     Args:
         sample_rate_hz: Output sample rate.
         queue_blocks: Buffer depth — see :data:`DEFAULT_QUEUE_BLOCKS`.
+        device: Which output device to open, in whatever form
+            ``sounddevice`` itself accepts for ``OutputStream(device=...)``
+            — a numeric index, a name substring, or ``None`` for
+            PortAudio's own configured system default. Read once, at
+            :meth:`start` — plugging in headphones mid-run does nothing,
+            the same way it already did nothing before this parameter
+            existed, since the stream is opened once and PortAudio does
+            not migrate a running stream to a new device.
         stream_factory: Builds the underlying PortAudio stream. Injected
             for tests, the same way :class:`~qsorbit.core.sdr.device.RtlSdr`
             takes an injected ``_lib`` — a fake here means no real audio
@@ -134,6 +144,7 @@ class AudioOutput:
         sample_rate_hz: float,
         *,
         queue_blocks: int = DEFAULT_QUEUE_BLOCKS,
+        device: int | str | None = None,
         stream_factory: StreamFactory | None = None,
     ) -> None:
         if sample_rate_hz <= 0.0:
@@ -142,6 +153,7 @@ class AudioOutput:
             raise ValueError(f"queue_blocks must be positive, got {queue_blocks!r}.")
 
         self._sample_rate_hz = sample_rate_hz
+        self._device = device
         self._stream_factory = stream_factory or _default_stream_factory
         self._stream: Any = None
 
@@ -171,9 +183,15 @@ class AudioOutput:
             channels=1,
             dtype="float32",
             callback=self._callback,
+            device=self._device,
         )
         stream.start()
         self._stream = stream
+
+    @property
+    def device(self) -> int | str | None:
+        """The device this output was configured with — see the class docs."""
+        return self._device
 
     def stop(self) -> AudioStats:
         """Close the stream, if open, and return the run's statistics."""
@@ -272,7 +290,12 @@ class AudioOutput:
 
 
 def _default_stream_factory(
-    *, samplerate: float, channels: int, dtype: str, callback: Callable[..., None]
+    *,
+    samplerate: float,
+    channels: int,
+    dtype: str,
+    callback: Callable[..., None],
+    device: int | str | None = None,
 ) -> Any:
     """Build a real ``sounddevice.OutputStream``.
 
@@ -282,5 +305,5 @@ def _default_stream_factory(
     import sounddevice
 
     return sounddevice.OutputStream(
-        samplerate=samplerate, channels=channels, dtype=dtype, callback=callback
+        samplerate=samplerate, channels=channels, dtype=dtype, callback=callback, device=device
     )
