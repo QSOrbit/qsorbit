@@ -18,10 +18,13 @@ from qsorbit import __version__
 from qsorbit.__main__ import (
     DEFAULT_TUNING_OFFSET_KHZ,
     _parse_audio_device,
+    _spectrum_factory,
     _squelch_status_line,
     build_parser,
     main,
 )
+from qsorbit.core.dsp.spectrum import SpectrumConfig
+from qsorbit.core.dsp.spectrum_stream import SpectrumStream
 from qsorbit.core.rotor import Arrival, HomingError, Position, Rotor, RotorErrorCode, RotorStatus
 from qsorbit.core.sdr import AppliedSettings, DeviceError, DeviceInfo, TunerType
 
@@ -949,6 +952,29 @@ class TestParseAudioDevice:
         # sounddevice uses negative indices for some default-device
         # sentinels of its own; this must not be mistaken for a name.
         assert _parse_audio_device("-1") == -1
+
+
+class TestSpectrumFactory:
+    """``_spectrum_factory`` in isolation - a pure helper, not the session."""
+
+    def a_spectrum_config(self) -> SpectrumConfig:
+        return SpectrumConfig(fft_size=2048, sample_rate_hz=2_048_000.0)
+
+    def test_no_window_means_no_factory_at_all(self):
+        # The whole point: ReceiveSession never even builds a
+        # SpectrumStream, rather than building one and starving it of a
+        # drain. Constructing a SpectrumStream starts no thread on its
+        # own (that happens in .start()), so "returns None" is the
+        # entire test - there is nothing further to spin up and tear
+        # down here.
+        assert _spectrum_factory(False, self.a_spectrum_config()) is None
+
+    def test_a_window_means_a_working_factory(self):
+        factory = _spectrum_factory(True, self.a_spectrum_config())
+
+        assert factory is not None
+        stream = factory([])
+        assert isinstance(stream, SpectrumStream)
 
 
 class TestReceiveParser:
