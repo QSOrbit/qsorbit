@@ -34,7 +34,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QGridLayout, QLabel, QWidget
 
 from qsorbit.core.pointing import TrackingLoop
-from qsorbit.ui.readout_formatting import UNCALIBRATED_NOTE, readout_text
+from qsorbit.ui.readout_formatting import alignment_note, readout_text
 
 #: How often the widget polls the loop, in milliseconds.
 #:
@@ -91,6 +91,9 @@ class ReadoutWidget(QWidget):
         super().__init__(parent)
         self._loop = loop
         self._target_name = loop.target.name
+        # Read once, not per tick: the loop's own offset does not
+        # change mid-run, and the note label is built once here too.
+        self._alignment_offset = loop.alignment_offset
 
         layout = QGridLayout(self)
         self._value_labels = {}
@@ -100,7 +103,7 @@ class ReadoutWidget(QWidget):
             layout.addWidget(value_label, row, 1)
             self._value_labels[caption] = value_label
 
-        note_label = QLabel(UNCALIBRATED_NOTE)
+        note_label = QLabel(alignment_note(self._alignment_offset))
         note_label.setWordWrap(True)
         layout.addWidget(note_label, len(_FIELDS), 0, 1, 2)
 
@@ -126,7 +129,9 @@ class ReadoutWidget(QWidget):
             self._value_labels["Last tick"].setText(f"stopped: {exc}")
             return
 
-        text = readout_text(sample, target_name=self._target_name)
+        text = readout_text(
+            sample, target_name=self._target_name, alignment_offset=self._alignment_offset
+        )
         self._value_labels["Time"].setText(text.time)
         self._value_labels["Sky target"].setText(text.sky_position)
         self._value_labels["Rotor axis"].setText(text.rotor_axis)

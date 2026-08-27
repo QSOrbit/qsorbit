@@ -60,6 +60,22 @@ def config_path(tmp_path):
 
 
 @pytest.fixture
+def aligned_config_path(tmp_path):
+    # CONFIG plus a real [rotor.alignment] - a station that has actually
+    # measured its offset, as distinct from every other fixture's
+    # default "nobody has calibrated this one" state. A distinct
+    # filename from config_path's, deliberately: a test using both
+    # fixtures at once (the differential offset check) needs two real,
+    # independent files, not one clobbering the other's write.
+    text = (
+        textwrap.dedent(CONFIG) + "\n[rotor.alignment]\nazimuth_deg = 5.0\nelevation_deg = -2.0\n"
+    )
+    path = tmp_path / "qsorbit_aligned.toml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+@pytest.fixture
 def tle_path(tmp_path):
     path = tmp_path / "example.tle"
     path.write_text(TEME_EXAMPLE_TLE, encoding="utf-8")
@@ -184,11 +200,52 @@ class TestPoint:
         assert factory.calls == []
 
     def test_says_no_calibration_is_applied(self, config_path, tle_path, factory, capsys):
-        # sky_to_rotor is an identity today. An interface that didn't say
-        # so would be implying an accuracy the software doesn't have.
+        # sky_to_rotor is identity when the station has no configured
+        # offset. An interface that didn't say so would be implying an
+        # accuracy the software doesn't have.
         run(["point", "--tle", str(tle_path), "--at", IN_WINDOW_TIME], config_path, factory)
 
         assert "No alignment calibration is applied" in capsys.readouterr().out
+
+    def test_a_configured_offset_is_applied_and_reported(
+        self, aligned_config_path, tle_path, factory, capsys
+    ):
+        # The other half: a station that HAS measured an offset must
+        # both get it applied to the commanded position and be told so,
+        # rather than reading the same "no calibration" note regardless.
+        run(["point", "--tle", str(tle_path), "--at", IN_WINDOW_TIME], aligned_config_path, factory)
+
+        out = capsys.readouterr().out
+        assert "No alignment calibration is applied" not in out
+        assert "Alignment offset applied" in out
+        assert "+5.0" in out
+        assert "-2.0" in out
+
+    def test_the_offset_actually_shifts_the_commanded_position(
+        self, config_path, aligned_config_path, tle_path, factory, capsys
+    ):
+        # Differential check against the same TLE and time with and
+        # without the offset, so this doesn't need to know the sky
+        # position in advance - only that the two runs must differ by
+        # exactly the configured offset.
+        run(["point", "--tle", str(tle_path), "--at", IN_WINDOW_TIME], config_path, factory)
+        plain_rotor_line = next(
+            line for line in capsys.readouterr().out.splitlines() if line.startswith("Rotor:")
+        )
+
+        run(["point", "--tle", str(tle_path), "--at", IN_WINDOW_TIME], aligned_config_path, factory)
+        aligned_rotor_line = next(
+            line for line in capsys.readouterr().out.splitlines() if line.startswith("Rotor:")
+        )
+
+        def axes(line):
+            parts = line.replace("Rotor:", "").split()
+            return float(parts[1]), float(parts[3])
+
+        plain_az, plain_el = axes(plain_rotor_line)
+        aligned_az, aligned_el = axes(aligned_rotor_line)
+        assert aligned_az == pytest.approx(plain_az + 5.0)
+        assert aligned_el == pytest.approx(plain_el - 2.0)
 
     def test_labels_the_rotor_line_as_an_axis_command(self, config_path, tle_path, factory, capsys):
         run(["point", "--tle", str(tle_path), "--at", IN_WINDOW_TIME], config_path, factory)
@@ -394,6 +451,21 @@ class TestStatus:
         assert "COM5" in out
         assert str(config_path) in out
         assert "Error:     none" in out
+
+    def test_reports_no_alignment_recorded_by_default(self, config_path, factory, capsys):
+        run(["status"], config_path, factory)
+
+        out = capsys.readouterr().out
+        assert "Alignment: none recorded" in out
+        assert "No alignment calibration is applied" in out
+
+    def test_reports_a_configured_alignment_offset(self, aligned_config_path, factory, capsys):
+        run(["status"], aligned_config_path, factory)
+
+        out = capsys.readouterr().out
+        assert "Alignment: AZ +5.0  EL -2.0" in out
+        assert "Alignment offset applied" in out
+        assert "No alignment calibration is applied" not in out
 
     def test_labels_position_as_an_axis_reading(self, config_path, factory, capsys):
         # The rotor reports -1.5 after homing. Printed without a label,

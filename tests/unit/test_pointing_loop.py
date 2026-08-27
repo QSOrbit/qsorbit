@@ -28,6 +28,7 @@ from qsorbit.core.geometry import AzEl
 from qsorbit.core.pointing import (
     DEFAULT_TICK_INTERVAL_S,
     FIRMWARE_DEADZONE_DEG,
+    AlignmentOffset,
     TickOutcome,
     TrackingLoop,
     TrackSample,
@@ -206,6 +207,16 @@ class TestConstruction:
         rotor.read_position.assert_not_called()
         rotor.move_to.assert_not_called()
 
+    def test_alignment_offset_defaults_to_identity(self):
+        loop, _, _ = make_loop([state(180.0, 45.0)])
+        assert loop.alignment_offset == AlignmentOffset()
+        assert loop.alignment_offset.is_identity
+
+    def test_alignment_offset_can_be_given(self):
+        offset = AlignmentOffset(azimuth_deg=3.0, elevation_deg=-1.0)
+        loop, _, _ = make_loop([state(180.0, 45.0)], alignment_offset=offset)
+        assert loop.alignment_offset == offset
+
 
 # ---------------------------------------------------------------------------
 # A single tick
@@ -221,6 +232,17 @@ class TestTick:
         assert sample.outcome is TickOutcome.COMMANDED
         assert sample.commanded
         assert commanded_positions(rotor) == [Position(180.0, 45.0)]
+
+    def test_alignment_offset_is_applied_to_the_commanded_position(self):
+        # rotor_target - and therefore what actually gets sent - runs
+        # through sky_to_rotor with the loop's own offset, not identity.
+        offset = AlignmentOffset(azimuth_deg=3.0, elevation_deg=-1.0)
+        loop, rotor, _ = make_loop([state(180.0, 45.0)], alignment_offset=offset)
+
+        sample = loop.tick()
+
+        assert sample.rotor_target == Position(183.0, 44.0)
+        assert commanded_positions(rotor) == [Position(183.0, 44.0)]
 
     def test_sample_carries_the_whole_seam(self):
         # time, sky position, range and range rate are what dsp and the
@@ -642,13 +664,27 @@ class TestRotorToSky:
     def test_an_in_range_reading_round_trips(self):
         assert rotor_to_sky(Position(123.4, 56.7)) == AzEl(123.4, 56.7)
 
-    def test_currently_applies_no_correction(self):
-        # Mirrors TestSkyToRotor.test_currently_applies_no_correction in
-        # test_pointing.py: DESIGNED TO FAIL when an alignment offset
-        # lands, so whoever adds one has to consciously touch this
-        # assertion rather than silently changing what every readout
-        # window displays.
+    def test_applies_no_correction_by_default(self):
+        # Mirrors TestSkyToRotor.test_applies_no_correction_by_default in
+        # test_pointing.py: DESIGNED TO FAIL if the default ever stops
+        # being identity, so whoever changes it has to consciously touch
+        # this assertion rather than silently changing what every
+        # readout window displays.
         assert rotor_to_sky(Position(90.0, 30.0)) == AzEl(90.0, 30.0)
+
+    def test_applies_the_offset_when_one_is_given(self):
+        # The inverse of TestSkyToRotor's equivalent case: subtraction,
+        # not addition, going the other direction.
+        offset = AlignmentOffset(azimuth_deg=5.0, elevation_deg=-2.0)
+        assert rotor_to_sky(Position(95.0, 28.0), offset) == AzEl(90.0, 30.0)
+
+    def test_offset_is_applied_before_wrap_and_clamp(self):
+        # A reading that only becomes out-of-range once the offset is
+        # removed still has to wrap/clamp correctly, not raise or
+        # silently skip the correction.
+        offset = AlignmentOffset(azimuth_deg=10.0, elevation_deg=0.0)
+        # 5.0 - 10.0 = -5.0, which wraps to 355.0.
+        assert rotor_to_sky(Position(5.0, 10.0), offset) == AzEl(355.0, 10.0)
 
     def test_a_freshly_homed_reading_wraps_to_a_compass_bearing(self):
         # The captured bytes from the first bring-up: AZ-1.5 EL2.0. A

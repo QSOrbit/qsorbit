@@ -16,7 +16,11 @@ import pytest
 from skyfield.api import load
 
 from qsorbit.core.geometry import AzEl
-from qsorbit.core.pointing import compute_pointing_command, sky_to_rotor
+from qsorbit.core.pointing import (
+    AlignmentOffset,
+    compute_pointing_command,
+    sky_to_rotor,
+)
 from qsorbit.core.rotor import Position, format_set_position
 from qsorbit.core.tracker import (
     ObserverLocation,
@@ -55,19 +59,39 @@ class TestSkyToRotor:
     def test_returns_a_rotor_position(self):
         assert isinstance(sky_to_rotor(AzEl(180.0, 45.0)), Position)
 
-    def test_currently_applies_no_correction(self):
-        # No calibration data, no travel limits, no pass plan yet, so the
-        # best command for a sky direction is that same direction.
+    def test_applies_no_correction_by_default(self):
+        # Alignment offset landed in Chunk I (AlignmentOffset), but no
+        # travel limits, flip mode, or pass plan yet - and the default
+        # offset is identity, so the best command for a sky direction
+        # with no offset given is still that same direction.
         #
-        # This test is DESIGNED TO FAIL when calibration, flip mode, or
-        # limit handling lands. That is deliberate: it forces whoever
-        # adds a correction to consciously update an assertion that says
-        # "this used to pass through untouched", rather than silently
+        # This test is DESIGNED TO FAIL if the default ever stops being
+        # identity. That is deliberate: it forces whoever changes it to
+        # consciously update an assertion that says "every existing
+        # caller gets an untouched command", rather than silently
         # changing where every rotor in the field points. If you are
         # here because this test broke, that is the system working.
         result = sky_to_rotor(AzEl(123.4, 56.7))
         assert result.azimuth == 123.4
         assert result.elevation == 56.7
+
+    def test_applies_the_offset_when_one_is_given(self):
+        # The other half of the same guarantee: a real offset is not
+        # silently ignored either. Signs matter here - see
+        # AlignmentOffset's own docstring for the convention - so this
+        # pins addition, not subtraction, for the sky-to-rotor direction.
+        offset = AlignmentOffset(azimuth_deg=5.0, elevation_deg=-2.0)
+        result = sky_to_rotor(AzEl(123.4, 56.7), offset)
+        assert result.azimuth == pytest.approx(128.4)
+        assert result.elevation == pytest.approx(54.7)
+
+    def test_zero_offset_is_identity(self):
+        # An explicit AlignmentOffset() should behave exactly like
+        # omitting the argument - this is what "identity" means for the
+        # default, pinned so the two paths can't quietly diverge.
+        with_default = sky_to_rotor(AzEl(10.0, 20.0))
+        with_explicit_zero = sky_to_rotor(AzEl(10.0, 20.0), AlignmentOffset())
+        assert with_default == with_explicit_zero
 
     def test_preserves_boundary_values(self):
         assert sky_to_rotor(AzEl(0.0, -90.0)) == Position(0.0, -90.0)
@@ -144,3 +168,29 @@ class TestComputePointingCommand:
         observer = ObserverLocation(latitude=0.0, longitude=0.0)
         with pytest.raises(PropagationError):
             compute_pointing_command(sat, observer, datetime(2013, 11, 9, tzinfo=UTC))
+
+    def test_threads_an_alignment_offset_through_to_sky_to_rotor(self):
+        # A stand-in target with a fixed sky position, same trick as
+        # test_accepts_any_target_not_just_satellite, isolates this to
+        # "did the offset reach sky_to_rotor" rather than depending on
+        # real orbital math to land on a convenient number.
+        class FixedTarget:
+            @property
+            def name(self) -> str:
+                return "TEST BEACON"
+
+            def topocentric_state(self, observer, time):
+                return TopocentricState(
+                    sky_position=AzEl(azimuth=90.0, elevation=30.0),
+                    range_km=1000.0,
+                    range_rate_km_s=0.0,
+                )
+
+        observer = ObserverLocation(latitude=0.0, longitude=0.0)
+        offset = AlignmentOffset(azimuth_deg=1.5, elevation_deg=-0.5)
+
+        command = compute_pointing_command(
+            FixedTarget(), observer, datetime(2026, 1, 1, tzinfo=UTC), offset
+        )
+
+        assert command == b"AZ91.5 EL29.5\n"

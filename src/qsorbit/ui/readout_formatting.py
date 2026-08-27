@@ -22,17 +22,41 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 
 from qsorbit.core.geometry import AzEl
-from qsorbit.core.pointing import TickOutcome, TrackSample, rotor_to_sky
+from qsorbit.core.pointing import (
+    IDENTITY_ALIGNMENT_OFFSET,
+    AlignmentOffset,
+    TickOutcome,
+    TrackSample,
+    rotor_to_sky,
+)
 from qsorbit.core.rotor import Position
 
-#: Shown at all times beneath the readout, matching UNCALIBRATED_NOTE in
-#: qsorbit.__main__ — the same honesty applies here: rotor_to_sky() and
-#: sky_to_rotor() are both still identity conversions.
+#: Shown beneath the readout when the tracking loop's alignment offset
+#: is identity - matching UNCALIBRATED_NOTE in qsorbit.__main__, and the
+#: same honesty: with no offset, rotor_to_sky() and sky_to_rotor() are
+#: still plain identity conversions.
 UNCALIBRATED_NOTE = (
     "No alignment calibration is applied. Sky position is astronomical truth; "
     "rotor axis position is a raw hardware reading, not a compass bearing - "
     "see rotor_to_sky() for what it means as a sky direction."
 )
+
+
+def alignment_note(offset: AlignmentOffset) -> str:
+    """Describe whether/what alignment correction the readout is showing.
+
+    Mirrors ``qsorbit.__main__``'s own ``_alignment_note`` - same
+    reasoning, same wording where the two overlap - kept as a separate
+    function rather than an import for the reason this module's own
+    docstring already gives: ``ui`` doesn't reach into ``__main__``.
+    """
+    if offset.is_identity:
+        return UNCALIBRATED_NOTE
+    return (
+        f"Alignment offset applied: AZ {offset.azimuth_deg:+.1f}  EL "
+        f"{offset.elevation_deg:+.1f} (from [rotor.alignment] in station config). "
+        "Flip mode and azimuth unwrapping are still not applied."
+    )
 
 
 @dataclass(frozen=True)
@@ -105,7 +129,9 @@ def format_axis_position(position: Position) -> str:
     return f"AZ {position.azimuth:.1f}  EL {position.elevation:.1f}  (axis reading)"
 
 
-def format_rotor_as_sky(position: Position) -> str:
+def format_rotor_as_sky(
+    position: Position, offset: AlignmentOffset = IDENTITY_ALIGNMENT_OFFSET
+) -> str:
     """Format a rotor axis reading as the sky direction it would mean.
 
     Runs the reading through
@@ -113,13 +139,26 @@ def format_rotor_as_sky(position: Position) -> str:
     ``AZ 380.3`` (past a full turn) or ``AZ -1.5`` (a fresh homing
     settle) shows up as the same compass bearing a person would get by
     doing that math themselves, directly comparable to
-    :func:`format_azel`'s output. Labelled ``(uncalibrated)`` rather
-    than ``(axis reading)``: this is a derived sky direction, not a
-    hardware measurement, and it carries no alignment correction - see
-    :func:`~qsorbit.core.pointing.rotor_to_sky`'s own docs.
+    :func:`format_azel`'s output.
+
+    Args:
+        position: The rotor's raw axis reading.
+        offset: The station's measured alignment correction, threaded
+            through to :func:`~qsorbit.core.pointing.rotor_to_sky`.
+            Defaults to identity, matching a station with no
+            ``[rotor.alignment]`` configured.
+
+    Labelled ``(uncalibrated)`` when ``offset`` is identity - this is a
+    derived sky direction, not a hardware measurement, and with no
+    offset it carries no alignment correction either, see
+    :func:`~qsorbit.core.pointing.rotor_to_sky`'s own docs. Labelled
+    ``(aligned)`` when a real offset was applied, so the two cases
+    can't be told apart by a glance is exactly the failure this label
+    exists to prevent.
     """
-    sky = rotor_to_sky(position)
-    return f"AZ {sky.azimuth:.1f}  EL {sky.elevation:.1f}  (uncalibrated)"
+    sky = rotor_to_sky(position, offset)
+    label = "uncalibrated" if offset.is_identity else "aligned"
+    return f"AZ {sky.azimuth:.1f}  EL {sky.elevation:.1f}  ({label})"
 
 
 def format_range(range_km: float, range_rate_km_s: float) -> str:
@@ -142,7 +181,12 @@ def format_outcome(outcome: TickOutcome) -> str:
     return outcome.value.replace("_", " ")
 
 
-def readout_text(sample: TrackSample, *, target_name: str) -> ReadoutText:
+def readout_text(
+    sample: TrackSample,
+    *,
+    target_name: str,
+    alignment_offset: AlignmentOffset = IDENTITY_ALIGNMENT_OFFSET,
+) -> ReadoutText:
     """Build every display string for one tick's sample.
 
     Args:
@@ -152,6 +196,11 @@ def readout_text(sample: TrackSample, *, target_name: str) -> ReadoutText:
             ``TrackSample`` itself — the loop tracks one target for its
             whole life, and the sample is the per-tick seam, so the name
             is threaded through here instead.
+        alignment_offset: The tracking loop's own correction - read from
+            :attr:`~qsorbit.core.pointing.TrackingLoop.alignment_offset`
+            so the readout's ``rotor_as_sky`` field runs the same
+            correction the loop itself used, rather than assuming
+            identity. Defaults to identity for a loop with none.
 
     Returns:
         Every field the window's labels bind to.
@@ -161,7 +210,7 @@ def readout_text(sample: TrackSample, *, target_name: str) -> ReadoutText:
         time=format_time(sample.time),
         sky_position=format_azel(sample.sky_position),
         rotor_axis=format_axis_position(sample.rotor_position),
-        rotor_as_sky=format_rotor_as_sky(sample.rotor_position),
+        rotor_as_sky=format_rotor_as_sky(sample.rotor_position, alignment_offset),
         range_and_rate=format_range(sample.range_km, sample.range_rate_km_s),
         outcome=format_outcome(sample.outcome),
     )

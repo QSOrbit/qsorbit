@@ -14,6 +14,7 @@ import pytest
 
 from qsorbit.core.rotor import AzimuthWrap
 from qsorbit.core.station import (
+    AlignmentSettings,
     ConfigError,
     SdrSettings,
     SerialSettings,
@@ -344,6 +345,12 @@ SDR_SECTION = """
     ppm = -3
 """
 
+ALIGNMENT_SECTION = """
+    [rotor.alignment]
+    azimuth_deg = 4.2
+    elevation_deg = -1.1
+"""
+
 
 class TestSdrSection:
     """The [sdr] table, which is optional in a way the others are not."""
@@ -457,3 +464,89 @@ class TestSdrSettings:
 
     def test_accepts_a_realistic_ppm(self):
         assert SdrSettings(ppm=-12).ppm == -12
+
+
+class TestAlignmentSection:
+    """The [rotor.alignment] table, optional the same way [sdr] is."""
+
+    def test_absent_section_gives_identity_defaults(self, tmp_path):
+        # Every config file written before Chunk I lacks this section,
+        # and "uncalibrated" is this feature's honest identity value -
+        # refusing to load one would break every existing station.
+        config = load_station_config(write_config(tmp_path))
+
+        assert config.alignment == AlignmentSettings()
+        assert config.alignment.azimuth_deg == 0.0
+        assert config.alignment.elevation_deg == 0.0
+
+    def test_reads_both_keys(self, tmp_path):
+        config = load_station_config(write_config(tmp_path, VALID_CONFIG + ALIGNMENT_SECTION))
+
+        assert config.alignment.azimuth_deg == 4.2
+        assert config.alignment.elevation_deg == -1.1
+
+    def test_an_empty_section_is_the_same_as_no_section(self, tmp_path):
+        config = load_station_config(write_config(tmp_path, VALID_CONFIG + "\n[rotor.alignment]\n"))
+
+        assert config.alignment == AlignmentSettings()
+
+    def test_each_key_may_be_omitted_on_its_own(self, tmp_path):
+        config = load_station_config(
+            write_config(tmp_path, VALID_CONFIG + "\n[rotor.alignment]\nazimuth_deg = 7.0\n")
+        )
+
+        assert config.alignment.azimuth_deg == 7.0
+        assert config.alignment.elevation_deg == 0.0
+
+    def test_negative_values_are_fine(self, tmp_path):
+        # Which side of true north the mast sits on is arbitrary - both
+        # signs are ordinary, not a sign of a mistake.
+        config = load_station_config(
+            write_config(
+                tmp_path,
+                VALID_CONFIG + "\n[rotor.alignment]\nazimuth_deg = -12.5\nelevation_deg = -0.3\n",
+            )
+        )
+
+        assert config.alignment.azimuth_deg == -12.5
+        assert config.alignment.elevation_deg == -0.3
+
+    def test_unknown_key_is_an_error(self, tmp_path):
+        path = write_config(tmp_path, VALID_CONFIG + "\n[rotor.alignment]\nazimuth = 1.0\n")
+
+        with pytest.raises(ConfigError, match="azimuth"):
+            load_station_config(path)
+
+    def test_unknown_key_names_the_nested_section(self, tmp_path):
+        # [rotor.alignment], not just [alignment] - the section as it
+        # actually appears in the file.
+        path = write_config(tmp_path, VALID_CONFIG + "\n[rotor.alignment]\nnope = 1\n")
+
+        with pytest.raises(ConfigError, match=r"\[rotor\.alignment\]"):
+            load_station_config(path)
+
+    def test_a_section_that_is_not_a_table_is_an_error(self, tmp_path):
+        # alignment as a plain key inside [rotor], not a [rotor.alignment]
+        # sub-table - a typo that looks like an omission unless caught.
+        text = VALID_CONFIG.replace(
+            '    port = "COM5"',
+            '    port = "COM5"\n    alignment = "somewhere"',
+        )
+        path = write_config(tmp_path, text)
+
+        with pytest.raises(ConfigError, match=r"\[rotor\.alignment\] in .* must be a table"):
+            load_station_config(path)
+
+
+class TestAlignmentSettings:
+    def test_defaults(self):
+        settings = AlignmentSettings()
+
+        assert settings.azimuth_deg == 0.0
+        assert settings.elevation_deg == 0.0
+
+    def test_accepts_realistic_offsets(self):
+        settings = AlignmentSettings(azimuth_deg=15.0, elevation_deg=-2.0)
+
+        assert settings.azimuth_deg == 15.0
+        assert settings.elevation_deg == -2.0

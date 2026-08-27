@@ -169,6 +169,32 @@ class SdrSettings:
 
 
 @dataclass(frozen=True)
+class AlignmentSettings:
+    """This station's measured alignment offset, if one has been recorded.
+
+    Storage only — see :class:`~qsorbit.core.pointing.AlignmentOffset`
+    for the arithmetic it feeds and the sign convention it uses. This
+    class exists separately, rather than reusing that one directly,
+    because this module's own rule (see the module docstring) is that
+    it depends on :mod:`qsorbit.core.rotor`, :mod:`qsorbit.core.sdr` and
+    :mod:`qsorbit.core.tracker` and never the other way round — so a
+    config value type lives here, and whoever needs the pointing-layer
+    type builds one from these two floats.
+
+    Args:
+        azimuth_deg: How far the rotor's home azimuth sits clockwise of
+            true north, in degrees. Defaults to 0.0 — no correction,
+            i.e. uncalibrated, which is the honest default for a
+            section most stations will not have measured yet.
+        elevation_deg: The equivalent constant for elevation. Defaults
+            to 0.0.
+    """
+
+    azimuth_deg: float = 0.0
+    elevation_deg: float = 0.0
+
+
+@dataclass(frozen=True)
 class StationConfig:
     """Everything QSOrbit needs to know about one ground station.
 
@@ -180,6 +206,12 @@ class StationConfig:
             :class:`SdrSettings`, so a config file with no ``[sdr]``
             section stays valid — every station that predates Phase 2
             has one, and an SDR is not required to point an antenna.
+        alignment: This station's measured alignment offset. Defaults
+            to a plain :class:`AlignmentSettings` (0.0, 0.0), so a
+            config file with no ``[rotor.alignment]`` section stays
+            valid — every station that predates Chunk I has one, and
+            "uncalibrated" is this offset's honest identity value, not
+            a placeholder standing in for a required measurement.
         source_path: The file this was loaded from, or ``None`` if it
             was constructed directly. Carried so error messages and
             ``status`` output can say which config is in force — with
@@ -191,6 +223,7 @@ class StationConfig:
     serial: SerialSettings
     capabilities: RotorCapabilities
     sdr: SdrSettings = field(default_factory=SdrSettings)
+    alignment: AlignmentSettings = field(default_factory=AlignmentSettings)
     source_path: Path | None = None
 
 
@@ -292,6 +325,10 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
     # before Phase 2 lacks this section.
     sdr_table = _optional_table(data, "sdr", path=resolved)
     capabilities_table = _require_table(rotor_table, "capabilities", path=resolved, parent="rotor")
+    # Optional, same reasoning as [sdr]: every config file written
+    # before Chunk I lacks this section, and "no offset recorded" is
+    # this feature's honest identity state, not an omission.
+    alignment_table = _optional_table(rotor_table, "alignment", path=resolved, parent="rotor")
 
     _reject_unknown_keys(
         observer_table,
@@ -301,8 +338,14 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
     )
     _reject_unknown_keys(
         rotor_table,
-        {"port", "baudrate", "timeout_s", "capabilities"},
+        {"port", "baudrate", "timeout_s", "capabilities", "alignment"},
         section="rotor",
+        path=resolved,
+    )
+    _reject_unknown_keys(
+        alignment_table,
+        {"azimuth_deg", "elevation_deg"},
+        section="rotor.alignment",
         path=resolved,
     )
     _reject_unknown_keys(
@@ -371,6 +414,14 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
             ),
             ppm=_optional_int(sdr_table, "ppm", "sdr", resolved, DEFAULT_PPM),
         )
+        alignment_settings = AlignmentSettings(
+            azimuth_deg=_optional_float(
+                alignment_table, "azimuth_deg", "rotor.alignment", resolved, 0.0
+            ),
+            elevation_deg=_optional_float(
+                alignment_table, "elevation_deg", "rotor.alignment", resolved, 0.0
+            ),
+        )
     except ValueError as exc:
         # The value objects do the real range checking; re-raised as a
         # ConfigError so the operator gets the file name alongside it.
@@ -381,6 +432,7 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
         serial=serial_settings,
         capabilities=capabilities,
         sdr=sdr_settings,
+        alignment=alignment_settings,
         source_path=resolved,
     )
 
@@ -415,19 +467,29 @@ def _require_table(
     return value
 
 
-def _optional_table(data: dict[str, Any], key: str, *, path: Path) -> dict[str, Any]:
+def _optional_table(
+    data: dict[str, Any], key: str, *, path: Path, parent: str | None = None
+) -> dict[str, Any]:
     """Return table ``key``, or an empty one if it is absent.
 
     An absent optional section and a present-but-empty one are the same
     thing here, so both come back as ``{}`` and every key inside falls
     to its default. A section that is present but is *not* a table is
     still an error — that is a typo, not an omission.
+
+    Args:
+        parent: For a nested section like ``[rotor.alignment]``, the
+            enclosing table's name, so the error message names the
+            section the way it appears in the file rather than just
+            its last component. Mirrors :func:`_require_table`'s own
+            parameter of the same name.
     """
+    section = f"{parent}.{key}" if parent else key
     if key not in data:
         return {}
     value = data[key]
     if not isinstance(value, dict):
-        raise ConfigError(f"[{key}] in {path} must be a table, got {type(value).__name__}.")
+        raise ConfigError(f"[{section}] in {path} must be a table, got {type(value).__name__}.")
     return value
 
 

@@ -10,10 +10,12 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta, timezone
 
 from qsorbit.core.geometry import AzEl
-from qsorbit.core.pointing import TickOutcome, TrackSample
+from qsorbit.core.pointing import AlignmentOffset, TickOutcome, TrackSample
 from qsorbit.core.rotor import Position
 from qsorbit.ui.readout_formatting import (
+    UNCALIBRATED_NOTE,
     ReadoutText,
+    alignment_note,
     format_axis_position,
     format_azel,
     format_outcome,
@@ -117,6 +119,40 @@ class TestFormatRotorAsSky:
     def test_clamps_elevation_past_vertical(self):
         assert format_rotor_as_sky(Position(10.0, 95.0)) == "AZ 10.0  EL 90.0  (uncalibrated)"
 
+    def test_applies_a_given_offset(self):
+        offset = AlignmentOffset(azimuth_deg=5.0, elevation_deg=-2.0)
+        assert format_rotor_as_sky(Position(95.0, 28.0), offset) == "AZ 90.0  EL 30.0  (aligned)"
+
+    def test_labels_a_real_offset_as_aligned_not_uncalibrated(self):
+        # The failure mode this guards against: showing a corrected
+        # direction under a label that says no correction happened.
+        offset = AlignmentOffset(azimuth_deg=5.0, elevation_deg=0.0)
+        result = format_rotor_as_sky(Position(185.0, 45.0), offset)
+        assert "(aligned)" in result
+        assert "(uncalibrated)" not in result
+
+    def test_identity_offset_still_reads_uncalibrated(self):
+        result = format_rotor_as_sky(Position(180.0, 45.0), AlignmentOffset())
+        assert "(uncalibrated)" in result
+
+
+class TestAlignmentNote:
+    def test_identity_offset_gives_the_uncalibrated_note(self):
+        assert alignment_note(AlignmentOffset()) == UNCALIBRATED_NOTE
+
+    def test_default_argument_gives_the_uncalibrated_note(self):
+        # AlignmentOffset() and the omitted-argument default must agree
+        # - both mean "nothing configured".
+        assert alignment_note(AlignmentOffset()) == UNCALIBRATED_NOTE
+
+    def test_a_real_offset_names_the_correction(self):
+        offset = AlignmentOffset(azimuth_deg=4.2, elevation_deg=-1.1)
+        note = alignment_note(offset)
+
+        assert "4.2" in note
+        assert "-1.1" in note
+        assert note != UNCALIBRATED_NOTE
+
 
 class TestFormatRange:
     def test_receding(self):
@@ -185,3 +221,19 @@ class TestReadoutText:
         )
         assert "178.5" in text.rotor_axis
         assert "180.0" not in text.rotor_axis
+
+    def test_threads_alignment_offset_into_rotor_as_sky(self):
+        offset = AlignmentOffset(azimuth_deg=5.0, elevation_deg=0.0)
+        one_sample = sample(rotor_position=Position(185.0, 45.0))
+
+        text = readout_text(one_sample, target_name="AO-91", alignment_offset=offset)
+
+        assert text.rotor_as_sky == format_rotor_as_sky(one_sample.rotor_position, offset)
+        assert "(aligned)" in text.rotor_as_sky
+
+    def test_default_alignment_offset_is_identity(self):
+        one_sample = sample(rotor_position=Position(185.0, 45.0))
+
+        text = readout_text(one_sample, target_name="AO-91")
+
+        assert "(uncalibrated)" in text.rotor_as_sky
