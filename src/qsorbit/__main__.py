@@ -1,8 +1,10 @@
 """Command-line entry point, run as ``uv run qsorbit`` (or ``python -m qsorbit``).
 
-Five subcommands: ``point``, ``status``, ``stop``, ``sdr`` (itself split
-into ``info`` and ``capture``), and ``receive`` — the whole vertical
-slice, tracking and receiving a pass together.
+Six subcommands: ``point``, ``goto``, ``status``, ``stop``, ``sdr``
+(itself split into ``info`` and ``capture``), and ``receive`` — the whole
+vertical slice, tracking and receiving a pass together. ``goto`` is
+``point``'s raw-axis sibling: it sends AZ/EL numbers you typed, rather
+than working them out from a TLE, which is what calibration needs.
 
 **Computing is the default; moving is opt-in.** ``point`` works out where
 the rotor would have to go and prints it, without opening the serial port
@@ -172,6 +174,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Actually move the rotor. Without this, nothing is transmitted.",
     )
     point.add_argument(
+        "--arrival-timeout",
+        type=float,
+        default=DEFAULT_ARRIVAL_TIMEOUT_S,
+        metavar="SECONDS",
+        help=f"How long to wait for the move to settle (default {DEFAULT_ARRIVAL_TIMEOUT_S:.0f}).",
+    )
+
+    goto = subcommands.add_parser(
+        "goto",
+        help="Send the rotor straight to an axis position - no TLE, no satellite.",
+        description=(
+            "Command the rotor directly to AZ/EL axis coordinates, the same "
+            "range-checked and --send-gated way 'point' commands a computed "
+            "one. For calibration and manual pointing, where the position "
+            "is typed rather than worked out from an orbit."
+        ),
+    )
+    goto.add_argument(
+        "--az",
+        type=float,
+        required=True,
+        metavar="DEGREES",
+        help="Azimuth axis position to send.",
+    )
+    goto.add_argument(
+        "--el",
+        type=float,
+        required=True,
+        metavar="DEGREES",
+        help="Elevation axis position to send.",
+    )
+    goto.add_argument(
+        "--send",
+        action="store_true",
+        help="Actually move the rotor. Without this, nothing is transmitted.",
+    )
+    goto.add_argument(
         "--arrival-timeout",
         type=float,
         default=DEFAULT_ARRIVAL_TIMEOUT_S,
@@ -470,6 +509,8 @@ def main(
         config = load_station_config(args.config)
         if args.command == "point":
             return _command_point(args, config, factory)
+        if args.command == "goto":
+            return _command_goto(args, config, factory)
         if args.command == "status":
             return _command_status(config, factory)
         if args.command == "sdr":
@@ -526,16 +567,57 @@ def _command_point(args: argparse.Namespace, config: StationConfig, factory: Rot
         print("\nNothing was sent. Re-run with --send to move the rotor.")
         return 0
 
+    return _send_and_wait(config, factory, target, args.arrival_timeout)
+
+
+def _command_goto(args: argparse.Namespace, config: StationConfig, factory: RotorFactory) -> int:
+    """``goto``: send the rotor straight to a typed AZ/EL, no TLE involved.
+
+    ``point``'s raw-axis sibling. Everything past "here is the target
+    position" is identical between the two - the range check, the
+    --send gate, connecting, moving, and reporting arrival - which is
+    why both call :func:`_send_and_wait` rather than each doing it
+    themselves. What differs is only where ``target`` comes from: a
+    TLE and a time there, typed numbers here.
+    """
+    target = Position(azimuth=args.az, elevation=args.el)
+
+    print(f"Rotor:     {_format_position(target)}  (axis command)")
+    print(f"Command:   {bytes(format_set_position(target)).decode('ascii').strip()}")
+
+    try:
+        config.capabilities.check_setpoint(target)
+    except PositionLimitError as exc:
+        print(f"\nOut of range: {exc}", file=sys.stderr)
+        return 1
+
+    if not args.send:
+        print("\nNothing was sent. Re-run with --send to move the rotor.")
+        return 0
+
+    return _send_and_wait(config, factory, target, args.arrival_timeout)
+
+
+def _send_and_wait(
+    config: StationConfig, factory: RotorFactory, target: Position, arrival_timeout_s: float
+) -> int:
+    """Connect, move to ``target``, wait for arrival, and report the outcome.
+
+    Shared by ``point --send`` and ``goto --send``: once a target
+    :class:`~qsorbit.core.rotor.Position` exists, sending it and
+    reporting arrival is identical whether that position came from a
+    TLE and a time, or was typed directly.
+    """
     with _Connected(config, factory) as rotor:
         print(f"\nConnected: {rotor.firmware_version}")
         rotor.move_to(target)
         print(f"Sent:      {_format_position(target)}")
-        arrival = rotor.wait_for_arrival(target, timeout_s=args.arrival_timeout)
+        arrival = rotor.wait_for_arrival(target, timeout_s=arrival_timeout_s)
         if arrival.arrived:
             print(f"Arrived:   {_format_position(arrival.position)} after {arrival.elapsed_s:.1f}s")
             return 0
         print(
-            f"Did not settle within {args.arrival_timeout:.0f}s. Last reading "
+            f"Did not settle within {arrival_timeout_s:.0f}s. Last reading "
             f"{_format_position(arrival.position)}, target {_format_position(target)}.",
             file=sys.stderr,
         )

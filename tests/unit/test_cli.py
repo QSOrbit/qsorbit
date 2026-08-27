@@ -138,6 +138,18 @@ class TestParser:
         # accident: computing is free, moving is opt-in.
         assert build_parser().parse_args(["point", "--tle", "x"]).send is False
 
+    def test_goto_requires_az_and_el(self):
+        with pytest.raises(SystemExit) as exit_info:
+            build_parser().parse_args(["goto", "--az", "10"])
+        assert exit_info.value.code == 2
+
+    def test_goto_send_defaults_to_off(self):
+        # Same safety-relevant default as point, and for the same
+        # reason: goto's whole job is a command that reaches the
+        # hardware, so it earns no looser a default than point's.
+        args = build_parser().parse_args(["goto", "--az", "10", "--el", "20"])
+        assert args.send is False
+
     def test_status_takes_no_arguments(self):
         assert build_parser().parse_args(["status"]).command == "status"
 
@@ -269,6 +281,99 @@ class TestPoint:
 
     def test_missing_tle_file(self, config_path, tmp_path, factory, capsys):
         code = run(["point", "--tle", str(tmp_path / "nope.tle")], config_path, factory)
+
+        assert code == 1
+        assert capsys.readouterr().err.startswith("Error:")
+
+
+# ---------------------------------------------------------------------------
+# goto
+# ---------------------------------------------------------------------------
+
+
+class TestGoto:
+    def test_prints_rotor_and_command(self, config_path, factory, capsys):
+        code = run(["goto", "--az", "151", "--el", "19"], config_path, factory)
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "Rotor:     AZ 151.0  EL 19.0  (axis command)" in out
+        assert "Command:   AZ151.0 EL19.0" in out
+
+    def test_says_nothing_was_sent(self, config_path, factory, capsys):
+        run(["goto", "--az", "151", "--el", "19"], config_path, factory)
+
+        assert "Nothing was sent" in capsys.readouterr().out
+
+    def test_does_not_even_build_a_rotor_without_send(self, config_path, factory):
+        # Same reasoning as point: computing must not touch the serial
+        # port, since merely connecting can trigger a re-home.
+        run(["goto", "--az", "151", "--el", "19"], config_path, factory)
+
+        assert factory.calls == []
+
+    def test_send_moves_and_reports_arrival(self, config_path, factory, capsys):
+        code = run(["goto", "--az", "151", "--el", "19", "--send"], config_path, factory)
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert factory.rotor.move_to.call_count == 1
+        sent = factory.rotor.move_to.call_args.args[0]
+        assert isinstance(sent, Position)
+        assert (sent.azimuth, sent.elevation) == (151.0, 19.0)
+        assert "Arrived:" in out
+
+    def test_send_closes_the_port(self, config_path, factory):
+        run(["goto", "--az", "151", "--el", "19", "--send"], config_path, factory)
+
+        assert factory.rotor.close.call_count == 1
+
+    def test_failure_to_settle_is_reported_and_non_zero(self, config_path, capsys):
+        rotor = make_rotor(arrived=False)
+        factory = lambda config, on_wait: rotor  # noqa: E731
+
+        code = main(
+            ["--config", str(config_path), "goto", "--az", "151", "--el", "19", "--send"],
+            rotor_factory=factory,
+        )
+
+        assert code == 1
+        assert "Did not settle" in capsys.readouterr().err
+
+    def test_out_of_range_target_is_refused_before_connecting(self, tmp_path, factory, capsys):
+        config = tmp_path / "narrow.toml"
+        config.write_text(
+            textwrap.dedent(CONFIG)
+            .replace("elevation_min_deg = 0.0", "elevation_min_deg = 91.0")
+            .replace("elevation_max_deg = 180.0", "elevation_max_deg = 92.0"),
+            encoding="utf-8",
+        )
+
+        code = main(
+            ["--config", str(config), "goto", "--az", "151", "--el", "19", "--send"],
+            rotor_factory=factory,
+        )
+
+        assert code == 1
+        assert "Out of range" in capsys.readouterr().err
+        assert factory.calls == []
+
+    def test_no_alignment_calibration_claim(self, config_path, factory, capsys):
+        # Unlike point, goto is a raw axis command - it is not built from
+        # a sky position at all, so there is nothing for
+        # UNCALIBRATED_NOTE to say here that the "(axis command)" label
+        # doesn't already say. Pinning the absence so a future change
+        # that starts running goto's target through sky_to_rotor (it
+        # shouldn't) gets caught by this test changing meaning.
+        run(["goto", "--az", "151", "--el", "19"], config_path, factory)
+
+        assert "No alignment calibration is applied" not in capsys.readouterr().out
+
+    def test_bad_position_is_rejected(self, config_path, factory, capsys):
+        # Position's own corruption filter, exercised through the CLI:
+        # a garbled or absurd axis number should read as an ordinary
+        # error, not a traceback.
+        code = run(["goto", "--az", "99999", "--el", "19"], config_path, factory)
 
         assert code == 1
         assert capsys.readouterr().err.startswith("Error:")
