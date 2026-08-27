@@ -1,9 +1,10 @@
 """The waterfall panel — the thin Qt remainder over a spectrum source.
 
 Everything worth arguing about lives in
-:mod:`qsorbit.ui.waterfall_render`, which imports no Qt. This module owns
-a timer, a ring of rendered rows, and a ``paintEvent``. That is the same
-division of labour :mod:`qsorbit.ui.readout_formatting` and
+:mod:`qsorbit.ui.waterfall_render` and :mod:`qsorbit.ui.spectrum_zoom`,
+neither of which imports Qt. This module owns a timer, a ring of
+rendered rows, and a ``paintEvent``. That is the same division of labour
+:mod:`qsorbit.ui.readout_formatting` and
 :class:`~qsorbit.ui.readout_widget.ReadoutWidget` already use.
 
 **This widget pulls; nothing pushes to it.** A ``QTimer`` drains
@@ -21,6 +22,26 @@ a constructor argument and never reaches for a device, a window, or a
 parent. That is the convention adopted in Session 19: a tab, a custom
 tab, a dock, a tear-off and a plain debug window then differ only in who
 the parent is.
+
+**Chunk I adds pan/zoom/lock, and with it a second buffer.** Before this,
+each arriving frame was rendered once, at ingest, straight into the
+history that stayed on screen forever — cheap, because the visible
+window never changed. A user-adjustable, lockable zoom breaks that: the
+window a row was rendered against can now change after the row is
+already on screen (most visibly while :attr:`~qsorbit.ui.zoom_controller.ZoomController.locked`
+is following a Doppler-shifting downlink, which recenters roughly once a
+tracking tick). Re-rendering *only the newest row* under a changed zoom
+would leave every older row on screen still cropped to whatever window
+was active when *it* arrived — a visible seam at the row where the zoom
+last changed, present almost continuously while locked. So this widget
+now keeps the raw ``power_db`` history as well as the rendered one:
+:attr:`~qsorbit.ui.zoom_controller.ZoomController.changed` triggers a
+full re-render of every row currently held, from the raw frames, under
+the new window. That is the same cost this module's own history-rows
+docstring already argued against paying on every frame — but it is only
+paid when the zoom actually changes, not per frame, so the steady-state
+cost while nothing is being zoomed or panned is exactly what it was
+before this feature existed.
 """
 
 from __future__ import annotations
@@ -30,18 +51,15 @@ from typing import Final, Protocol
 
 import numpy as np
 from PySide6.QtCore import QRect, Qt, QTimer
-from PySide6.QtGui import QImage, QPainter
+from PySide6.QtGui import QImage, QMouseEvent, QPainter, QWheelEvent
 from PySide6.QtWidgets import QWidget
 
 from qsorbit.core.dsp.spectrum import SpectrumConfig, frequency_axis_hz
 from qsorbit.core.dsp.spectrum_stream import SpectrumFrame
-from qsorbit.ui.waterfall_render import (
-    WaterfallScale,
-    blank_row,
-    frequency_ticks,
-    render_row,
-    tick_position,
-)
+from qsorbit.ui.spectrum_axis_paint import paint_frequency_axis
+from qsorbit.ui.spectrum_zoom import ZoomSpan, dc_spike_in_view, visible_slice
+from qsorbit.ui.waterfall_render import WaterfallScale, blank_row, render_row, tick_position
+from qsorbit.ui.zoom_controller import ZoomController
 
 #: How often the widget drains its source, in milliseconds.
 #:
@@ -72,10 +90,20 @@ DEFAULT_RENDER_WIDTH: Final = 1024
 #: Height reserved at the bottom for the frequency axis, in pixels.
 AXIS_HEIGHT_PX: Final = 22
 
-#: Roughly how many pixels each frequency label needs to itself. Used to
-#: scale the tick count with the widget, so a narrow window thins its
-#: labels out instead of overprinting them into a smear.
-_PIXELS_PER_LABEL: Final = 90
+#: A raw frame value read as silence, matching how
+#: :func:`~qsorbit.ui.waterfall_render.render_row` already treats
+#: anything at or below :attr:`~qsorbit.ui.waterfall_render.WaterfallScale.floor_db`
+#: — used only to pre-fill history before any real frame has arrived, so
+#: an early zoom change (rebuilding from history that is still all
+#: placeholders) paints exactly the same dark field
+#: :func:`~qsorbit.ui.waterfall_render.blank_row` already does.
+_SILENT_RAW_DB: Final = -1e6
+
+#: Multiplier applied to the visible span per mouse-wheel notch (120 units
+#: of ``QWheelEvent.angleDelta()``). Below 1 so scrolling forward/up — the
+#: conventional "zoom in" direction most spectrum tools and maps use —
+#: narrows the span; scrolling the other way is this value's reciprocal.
+WHEEL_ZOOM_FACTOR_PER_NOTCH: Final = 0.85
 
 
 class FrameSource(Protocol):
@@ -122,6 +150,16 @@ class WaterfallWidget(QWidget):
             :data:`DEFAULT_RENDER_WIDTH` for why this is not the widget's
             width.
         poll_interval_ms: How often to drain the source.
+        zoom: The shared pan/zoom/lock state — see
+            :class:`~qsorbit.ui.zoom_controller.ZoomController`. Pass the
+            same controller given to a
+            :class:`~qsorbit.ui.spectrum_line_widget.SpectrumLineWidget`
+            so a gesture on either panel moves both. When omitted, a
+            private controller is built spanning the full captured band
+            — the widget always has *some* zoom state (there is no
+            separate unzoomed code path to keep in sync with the zoomed
+            one), it simply is not shared with anything unless a caller
+            passes one in.
     """
 
     def __init__(
@@ -132,6 +170,7 @@ class WaterfallWidget(QWidget):
         history_rows: int = DEFAULT_HISTORY_ROWS,
         render_width: int = DEFAULT_RENDER_WIDTH,
         poll_interval_ms: int = DEFAULT_POLL_INTERVAL_MS,
+        zoom: ZoomController | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -143,24 +182,56 @@ class WaterfallWidget(QWidget):
         self._source = source
         self._scale = scale if scale is not None else WaterfallScale()
         self._render_width = render_width
-        # Pre-filled to full depth rather than grown from empty. A
-        # growing history gets stretched to fill the panel, so the time
-        # scale keeps moving until the buffer is full -- about 30 seconds
-        # at the default rate -- and a Doppler slope would appear to
-        # change angle while nothing about the signal had. Same objection
-        # this widget's dB scale already answers, on the other axis.
-        self._rows: deque[np.ndarray] = deque(
+
+        # Taken from the source's own config, once, so the labels cannot
+        # drift from the frames. fftshift order puts the lowest frequency
+        # first, which is also left-to-right on screen.
+        self._axis_hz = frequency_axis_hz(source.config)
+        band_start_hz = float(self._axis_hz[0])
+        band_stop_hz = float(self._axis_hz[-1])
+        # The tuner's own zero-IF centre spike — see dc_spike_in_view's
+        # own docstring for why this is always exactly the config's own
+        # center_freq_hz.
+        self._dc_hz = source.config.center_freq_hz
+
+        self._zoom_controller = (
+            zoom if zoom is not None else ZoomController(band_start_hz, band_stop_hz)
+        )
+        self._zoom_controller.changed.connect(self._on_zoom_changed)
+
+        # Two decks in lockstep, newest at index 0. _raw_frames is the
+        # source of truth; _rendered_rows is a cache of it under the
+        # *current* zoom, rebuilt in full only when the zoom changes —
+        # see this module's own docstring for why both exist. Pre-filled
+        # to full depth rather than grown from empty, for the same
+        # "the time scale must not appear to change as the buffer fills"
+        # reason the original single-deck version already documented.
+        self._raw_frames: deque[np.ndarray] = deque(
+            (
+                np.full(self._axis_hz.shape, _SILENT_RAW_DB, dtype=np.float32)
+                for _ in range(history_rows)
+            ),
+            maxlen=history_rows,
+        )
+        self._rendered_rows: deque[np.ndarray] = deque(
             (blank_row(render_width) for _ in range(history_rows)), maxlen=history_rows
         )
         self._frames_seen = 0
         self._error: str | None = None
 
-        # Taken from the source's own config, once, so the labels cannot
-        # drift from the frames. fftshift order puts the lowest frequency
-        # first, which is also left-to-right on screen.
-        axis = frequency_axis_hz(source.config)
-        self._start_hz = float(axis[0])
-        self._stop_hz = float(axis[-1])
+        # The *visible* edges, which move as the zoom changes — distinct
+        # from band_start_hz/band_stop_hz above, which are fixed for the
+        # source's whole life. Set from the zoom controller's own current
+        # window rather than assumed, so a caller-supplied controller
+        # that is not at the full band from the start (unusual, but nothing
+        # stops it) still starts the axis labelled correctly.
+        self._start_hz = band_start_hz
+        self._stop_hz = band_stop_hz
+        self._refresh_visible_edges()
+
+        # Drag-to-pan state. None whenever no drag is in progress.
+        self._drag_start_x: float | None = None
+        self._drag_start_zoom: ZoomSpan | None = None
 
         self.setMinimumSize(320, 120 + AXIS_HEIGHT_PX)
 
@@ -177,11 +248,49 @@ class WaterfallWidget(QWidget):
         pre-filled to full depth, so its length is a constant and would
         tell a caller nothing.
         """
-        return min(self._frames_seen, self._rows.maxlen or 0)
+        return min(self._frames_seen, self._rendered_rows.maxlen or 0)
+
+    @property
+    def zoom_controller(self) -> ZoomController:
+        """The pan/zoom/lock state this widget reads and draws under."""
+        return self._zoom_controller
 
     def stop(self) -> None:
-        """Stop draining the source. Does not stop the source itself."""
+        """Stop draining the source. Does not stop the source, or the
+        shared :attr:`zoom_controller` — which may still be in use by a
+        :class:`~qsorbit.ui.spectrum_line_widget.SpectrumLineWidget`
+        sharing it, and is not this widget's to own."""
         self._timer.stop()
+
+    def _refresh_visible_edges(self) -> None:
+        """Recompute :attr:`_start_hz`/:attr:`_stop_hz` from the current zoom.
+
+        The *actual* bin-edge frequencies, exactly as
+        :func:`~qsorbit.ui.spectrum_zoom.visible_slice` returns them —
+        not the requested window — which is what keeps the axis labels
+        honest about which bins are really on screen. Depends only on
+        the axis and the zoom, never on frame data, so the axis array
+        can stand in as its own dummy "power" argument here.
+        """
+        _, start_hz, stop_hz = visible_slice(
+            self._axis_hz, self._axis_hz, self._zoom_controller.zoom
+        )
+        self._start_hz = start_hz
+        self._stop_hz = stop_hz
+
+    def _render_visible_row(self, power_db: np.ndarray) -> np.ndarray:
+        sliced, _start_hz, _stop_hz = visible_slice(
+            power_db, self._axis_hz, self._zoom_controller.zoom
+        )
+        return render_row(sliced, self._render_width, self._scale)
+
+    def _on_zoom_changed(self) -> None:
+        self._refresh_visible_edges()
+        self._rendered_rows = deque(
+            (self._render_visible_row(raw) for raw in self._raw_frames),
+            maxlen=self._rendered_rows.maxlen,
+        )
+        self.update()
 
     def _on_timer(self) -> None:
         try:
@@ -198,7 +307,8 @@ class WaterfallWidget(QWidget):
             return
 
         for frame in frames:
-            self._rows.appendleft(render_row(frame.power_db, self._render_width, self._scale))
+            self._raw_frames.appendleft(frame.power_db)
+            self._rendered_rows.appendleft(self._render_visible_row(frame.power_db))
         self._frames_seen += len(frames)
         self.update()
 
@@ -210,7 +320,7 @@ class WaterfallWidget(QWidget):
             return
         full = self.rect()
         image_rect = QRect(full.x(), full.y(), full.width(), max(1, full.height() - AXIS_HEIGHT_PX))
-        buffer = np.ascontiguousarray(np.stack(tuple(self._rows)))
+        buffer = np.ascontiguousarray(np.stack(tuple(self._rendered_rows)))
         height = buffer.shape[0]
         # .copy() forces QImage to own its pixels. Without it the image
         # borrows the buffer, which is a local about to go out of scope --
@@ -231,35 +341,78 @@ class WaterfallWidget(QWidget):
             painter.drawText(
                 image_rect, Qt.AlignmentFlag.AlignCenter, "waiting for spectrum frames..."
             )
-        self._paint_axis(painter, image_rect)
 
-    def _paint_axis(self, painter: QPainter, image_rect: QRect) -> None:
-        """Draw frequency ticks and labels below the waterfall.
+        marker_hz = dc_spike_in_view(self._dc_hz, self._start_hz, self._stop_hz)
+        if marker_hz is not None:
+            self._paint_dc_marker(painter, image_rect, marker_hz)
 
-        Without this the panel can only say *something is there*, never
-        *our signal is at our frequency* — which is the distinction
-        Session 14's bring-up was built around, and the one that makes a
-        Doppler slope readable as a rate rather than a smear.
-        """
-        painter.setPen(self.palette().windowText().color())
-        top = image_rect.bottom() + 1
-        max_ticks = max(2, min(9, image_rect.width() // _PIXELS_PER_LABEL))
-
-        for frequency_hz, label in frequency_ticks(self._start_hz, self._stop_hz, max_ticks):
-            x = int(
-                round(
-                    tick_position(frequency_hz, self._start_hz, self._stop_hz, image_rect.width())
-                )
-            )
-            painter.drawLine(x, top, x, top + 4)
-            painter.drawText(
-                QRect(x - 45, top + 5, 90, AXIS_HEIGHT_PX - 5),
-                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-                label,
-            )
-
-        painter.drawText(
-            QRect(image_rect.right() - 40, top + 5, 38, AXIS_HEIGHT_PX - 5),
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
-            "MHz",
+        paint_frequency_axis(
+            painter,
+            image_rect,
+            self._start_hz,
+            self._stop_hz,
+            AXIS_HEIGHT_PX,
+            self.palette().windowText().color(),
         )
+
+    def _paint_dc_marker(self, painter: QPainter, image_rect: QRect, marker_hz: float) -> None:
+        """Mark the tuner's own zero-IF spike, per the "visual marker only"
+        decision — see :func:`~qsorbit.ui.spectrum_zoom.dc_spike_in_view`'s
+        own docstring for why this project does not remove the spike from
+        the data itself."""
+        x = int(round(tick_position(marker_hz, self._start_hz, self._stop_hz, image_rect.width())))
+        painter.setPen(Qt.GlobalColor.yellow)
+        painter.drawLine(x, image_rect.top(), x, image_rect.bottom())
+        painter.drawText(
+            QRect(x + 3, image_rect.top() + 2, 24, 14), Qt.AlignmentFlag.AlignLeft, "DC"
+        )
+
+    # ------------------------------------------------------------------
+    # Mouse: scroll-to-zoom, drag-to-pan
+    # ------------------------------------------------------------------
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt's spelling
+        """Zoom in or out, anchored on the frequency under the cursor."""
+        notches = event.angleDelta().y() / 120.0
+        if notches == 0.0 or self.width() <= 0:
+            event.ignore()
+            return
+        factor = WHEEL_ZOOM_FACTOR_PER_NOTCH**notches
+        anchor_hz = self._hz_at_x(event.position().x())
+        self._zoom_controller.zoom_by(factor, anchor_hz=anchor_hz)
+        event.accept()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt's spelling
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        self._drag_start_x = event.position().x()
+        self._drag_start_zoom = self._zoom_controller.zoom
+        event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt's spelling
+        if self._drag_start_x is None or self._drag_start_zoom is None or self.width() <= 0:
+            super().mouseMoveEvent(event)
+            return
+        dx = event.position().x() - self._drag_start_x
+        # Content follows the cursor, the usual "grab and drag" feel: the
+        # frequency under the pointer when the drag started stays under
+        # the pointer as it moves, which is why the center moves opposite
+        # the drag direction.
+        new_center_hz = (
+            self._drag_start_zoom.center_hz - (dx / self.width()) * self._drag_start_zoom.span_hz
+        )
+        self._zoom_controller.pan_to(new_center_hz)
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt's spelling
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mouseReleaseEvent(event)
+            return
+        self._drag_start_x = None
+        self._drag_start_zoom = None
+        event.accept()
+
+    def _hz_at_x(self, x: float) -> float:
+        """The frequency under pixel column ``x`` of the plot, at the current zoom."""
+        return self._start_hz + (x / self.width()) * (self._stop_hz - self._start_hz)

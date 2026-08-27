@@ -700,3 +700,82 @@ class TestLiveQuieting:
         assert session.live_quieting_db is not None
         assert session.live_squelch_open is False
         assert np.abs(audio.blocks[0]).max() > 0.0
+
+
+class TestLiveTrackedFrequency:
+    """Chunk I: :attr:`ReceiveSession.live_tracked_frequency_hz`.
+
+    ``TestDopplerFollowsThePass`` already proves the offset arithmetic
+    itself follows a changing range rate. What is untested until now is
+    that this property actually combines the tuner's fixed centre with
+    that live offset -- the same two numbers :meth:`_demod_loop` uses to
+    build the demodulator's own ``channel_offset_hz`` -- rather than
+    reporting something that has quietly drifted from what the user is
+    actually hearing.
+    """
+
+    def test_no_reading_before_the_session_starts(self):
+        # start() is what primes the Doppler tracker with its first
+        # sample; before that there is no honest frequency to report,
+        # exactly as live_quieting_db has nothing to report before a
+        # squelch has run at all.
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ])
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        session, _audio = a_session(device, source)
+
+        assert session.live_tracked_frequency_hz is None
+
+    def test_a_stationary_range_rate_reports_the_nominal_downlink(self):
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ])
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        session, audio = a_session(device, source)
+
+        session.start()
+        try:
+            device.step()
+            assert audio.wait_for(1), "the block was never demodulated"
+        finally:
+            device.finish()
+            assert session.wait(5.0), "the demodulating thread never noticed the stream ending"
+            with pytest.raises(DeviceError, match="exhausted"):
+                session.stop()
+
+        # Zero range rate means no Doppler shift at all: the tracked
+        # frequency lands exactly on the nominal downlink -- the
+        # tuner's own centre plus the fixed offset it was primed with,
+        # nothing else in the mix.
+        assert session.live_tracked_frequency_hz == pytest.approx(DOWNLINK_HZ)
+
+    def test_it_tracks_center_plus_the_most_recent_offset_as_it_moves(self):
+        # Same two-block shape as TestDopplerFollowsThePass.run_a_turnover:
+        # the manual _doppler.update() only appends a sample, it does not
+        # itself recompute last_offset_hz -- that only happens the next
+        # time offset_at() runs, inside _demod_loop for a real block. A
+        # single-block test would silently keep asserting the priming
+        # sample's offset no matter what update() was called with.
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ] * 2)
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        session, audio = a_session(device, source, clock=BlockClock(step_s=1.0))
+
+        session.start()
+        try:
+            device.step()
+            assert audio.wait_for(1), "the first block was never demodulated"
+
+            # Force a specific, non-trivial offset.
+            session._doppler.update(AN_INSTANT + timedelta(seconds=1.0), -6.0)
+            device.step()
+            assert audio.wait_for(2), "the second block was never demodulated"
+        finally:
+            device.finish()
+            assert session.wait(5.0), "the demodulating thread never noticed the stream ending"
+            with pytest.raises(DeviceError, match="exhausted"):
+                session.stop()
+
+        offset_hz = session.stats.doppler.last_offset_hz
+        assert offset_hz is not None
+        assert session.live_tracked_frequency_hz == pytest.approx(CENTER_HZ + offset_hz)
+        # Approaching (negative range rate) pushes the downlink above
+        # its nominal tuning offset -- the same sign
+        # TestDopplerFollowsThePass pins for the raw offset.
+        assert session.live_tracked_frequency_hz > DOWNLINK_HZ
