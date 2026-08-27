@@ -481,7 +481,7 @@ class NbfmConfig:
 
 
 def demodulate_nbfm(
-    iq: np.ndarray, config: NbfmConfig, *, squelch: NoiseSquelch | None = None
+    iq: np.ndarray, config: NbfmConfig, *, squelch: NoiseSquelch | None = None, mute: bool = True
 ) -> np.ndarray:
     """Demodulate one narrowband FM channel to mono audio.
 
@@ -495,11 +495,24 @@ def demodulate_nbfm(
             it is **stateful and must be reused across blocks**, or its
             hysteresis has nothing to remember; construct one per listening
             session, not one per block.
+        mute: Whether a closed gate actually silences the returned audio.
+            Ignored when ``squelch`` is ``None``. Defaults to ``True``,
+            matching this function's behaviour before this parameter
+            existed. Chunk I decoupled *measuring* quieting from *muting*
+            on it (see :mod:`qsorbit.core.dsp.squelch`'s module
+            docstring, "always measure and optionally mute") - passing a
+            squelch with ``mute=False`` gets every measurement and every
+            open/close decision exactly as if muting were on, with the
+            gate's decision never actually applied to the audio. This is
+            what lets a live quieting readout exist for a run that never
+            passes ``--squelch``: :meth:`NoiseSquelch.update` still runs
+            every block regardless of this flag.
 
     Returns:
         Recovered audio as float32, at ``config.audio_rate_hz``, clipped
         to :data:`AUDIO_CLIP_RANGE` — or an equal-length run of zeros if
-        ``squelch`` is given and closed for this block.
+        ``squelch`` is given, closed for this block, and ``mute`` is
+        ``True``.
 
     Raises:
         ValueError: If ``iq`` is not one-dimensional, or is shorter than
@@ -547,7 +560,15 @@ def demodulate_nbfm(
     decimated = decimate(audio, config.audio_decimation_factor)
     result = np.clip(decimated, *AUDIO_CLIP_RANGE).astype(np.float32)
 
-    return result if squelch is None else squelch.apply(result)
+    if squelch is None:
+        return result
+    # apply() always runs, muting decision and all: its bookkeeping
+    # (blocks_open, samples_passed/muted) is what makes "how much WOULD
+    # this have muted" a real, measured answer rather than a guess, for
+    # a run where mute=False means the gate's decision is deliberately
+    # never allowed to reach the speaker.
+    gated = squelch.apply(result)
+    return gated if mute else result
 
 
 def _apply_deemphasis(

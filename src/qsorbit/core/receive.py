@@ -321,6 +321,17 @@ class ReceiveSession:
         squelch: Optional noise gate, off by default — see
             :mod:`qsorbit.core.dsp.squelch` for why a mute enabled by
             default is a liability. One per session; it is stateful.
+            Passing one always turns on *measurement*, whether or not
+            ``mute_squelch`` also turns on muting - see that argument.
+        mute_squelch: Whether a closed gate actually silences audio.
+            Ignored when ``squelch`` is ``None``. Defaults to ``True``,
+            matching this class's behaviour before this parameter
+            existed. ``False`` measures and reports quieting exactly as
+            if muting were on (:attr:`live_quieting_db`, and
+            :class:`~qsorbit.core.dsp.squelch.SquelchStats` in the final
+            report), without ever letting the gate's decision reach the
+            speaker - see :func:`~qsorbit.core.dsp.demod.demodulate_nbfm`
+            for the mechanics this threads through to.
         spectrum: Optional. When given it is started with the
             ``"waterfall"`` subscription and stopped with the session.
         tracking_interval_s: Seconds between range-rate samples.
@@ -339,6 +350,7 @@ class ReceiveSession:
         audio: AudioOutput,
         range_rate: RangeRateSource,
         squelch: NoiseSquelch | None = None,
+        mute_squelch: bool = True,
         spectrum_factory: Callable[[Iterable[bytes]], SpectrumStream] | None = None,
         tracking_interval_s: float = DEFAULT_TRACKING_INTERVAL_S,
         join_timeout_s: float = DEFAULT_JOIN_TIMEOUT_S,
@@ -353,6 +365,7 @@ class ReceiveSession:
         self._audio = audio
         self._range_rate = range_rate
         self._squelch = squelch
+        self._mute_squelch = mute_squelch
         self._tracking_interval_s = tracking_interval_s
         self._join_timeout_s = join_timeout_s
         self._sleep = sleep
@@ -502,6 +515,49 @@ class ReceiveSession:
             self._spectrum.stats if self._spectrum is not None else None,
         )
 
+    @property
+    def live_quieting_db(self) -> float | None:
+        """The squelch's most recent quieting measurement, for a live display.
+
+        ``None`` when no squelch was given at all - there is nothing to
+        show. Otherwise this is the number a live "quieting" readout
+        polls, updating every block regardless of ``mute_squelch``: see
+        that argument's docstring for why a run with muting off still
+        has a real, moving number here.
+
+        Unlike :attr:`stats` (**not** safe to call this "live" - its own
+        docstring says it is stable only once :meth:`stop` has
+        returned), this property is meant to be polled *while the
+        session is running*, from a different thread than the one
+        updating the squelch. It is deliberately not guarded by
+        :attr:`_lock`: the value it reads is a single float, reassigned
+        as a whole on every block by
+        :meth:`~qsorbit.core.dsp.squelch.NoiseSquelch.update`, so a
+        concurrent read can only ever see the value from just before or
+        just after an update, never a torn one - the CPython GIL makes a
+        single attribute assignment atomic. A live gauge redrawn several
+        times a second tolerates being one block stale; :attr:`_lock`
+        exists for the counters that end up in a report and have to add
+        up exactly, which this number does not.
+        """
+        if self._squelch is None:
+            return None
+        return self._squelch.stats.last_quieting_db
+
+    @property
+    def live_squelch_open(self) -> bool | None:
+        """Whether the gate is open right now, or ``None`` if there is no squelch.
+
+        The gate's *decision*, exactly as :attr:`live_quieting_db` is its
+        *measurement* - both real even when ``mute_squelch=False`` never
+        lets that decision reach the speaker. Same polling contract as
+        :attr:`live_quieting_db`: a single attribute read, safe enough
+        for a live display, not for a report that has to add up.
+        """
+        if self._squelch is None:
+            return None
+        return self._squelch.is_open
+
     # ------------------------------------------------------------------
     # Context manager
     # ------------------------------------------------------------------
@@ -540,7 +596,12 @@ class ReceiveSession:
                 # computes it so no caller can get the sign wrong.
                 offset_hz = self._doppler.offset_at(block.midpoint)
                 config = replace(self._nbfm, channel_offset_hz=offset_hz)
-                audio = demodulate_nbfm(unpack_uint8_iq(block.data), config, squelch=self._squelch)
+                audio = demodulate_nbfm(
+                    unpack_uint8_iq(block.data),
+                    config,
+                    squelch=self._squelch,
+                    mute=self._mute_squelch,
+                )
                 self._audio.write(audio)
                 with self._lock:
                     self._blocks_demodulated += 1
