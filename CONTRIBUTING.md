@@ -23,10 +23,36 @@ If you have write access (maintainers), clone the repo directly. Otherwise, fork
 1. Clone: `git clone https://github.com/QSOrbit/qsorbit.git` (or your fork)
 2. `cd qsorbit`
 3. Install dependencies: `uv sync` — this creates a virtual environment and installs everything from `pyproject.toml`.
-4. Run the app: `uv run python -m qsorbit`
+4. Run the app: `uv run qsorbit` (or `uv run python -m qsorbit` — both work)
 5. Run the tests: `uv run pytest`
 
 If you don't have `uv` installed, see [astral.sh/uv](https://docs.astral.sh/uv/).
+
+### Bench and probe scripts
+
+Standalone scripts used for hardware bring-up and bench measurements (`rotor-track.py`,
+`pass-scan.py`, `wbfm-listen.py`, and similar) live outside this repo, in Phil's project
+notes folder — they import the real `qsorbit` package (e.g. `from qsorbit.core.tracker
+import Satellite`) rather than re-implementing anything, so the code under test is the
+code that ships.
+
+Because they live outside the repo, `uv run` needs to be told where the project is —
+it resolves the virtual environment from the **current working directory**, not from
+the script's own location. Two ways to run one:
+
+```
+cd path/to/qsorbit && uv run python path/to/notes-folder/rotor-track.py --help
+```
+
+or, from anywhere, point `uv run` at the repo explicitly:
+
+```
+uv run --project path/to/qsorbit python path/to/notes-folder/rotor-track.py --help
+```
+
+Running a bench script from the notes folder itself (or any other directory) without
+one of these fails with `ModuleNotFoundError: No module named 'qsorbit'` — `uv` never
+finds `pyproject.toml`, so `qsorbit` was never on the path to begin with.
 
 ## Branch naming
 

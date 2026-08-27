@@ -1,4 +1,4 @@
-"""Command-line entry point for ``python -m qsorbit``.
+"""Command-line entry point, run as ``uv run qsorbit`` (or ``python -m qsorbit``).
 
 Five subcommands: ``point``, ``status``, ``stop``, ``sdr`` (itself split
 into ``info`` and ``capture``), and ``receive`` — the whole vertical
