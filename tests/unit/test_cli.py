@@ -9,6 +9,7 @@ assert that no rotor is built at all.
 """
 
 import json
+import signal
 import textwrap
 from unittest.mock import MagicMock
 
@@ -18,6 +19,7 @@ from qsorbit import __version__
 from qsorbit.__main__ import (
     DEFAULT_TUNING_OFFSET_KHZ,
     _parse_audio_device,
+    _quit_on_sigint,
     _spectrum_factory,
     _squelch_status_line,
     build_parser,
@@ -975,6 +977,69 @@ class TestSpectrumFactory:
         assert factory is not None
         stream = factory([])
         assert isinstance(stream, SpectrumStream)
+
+
+class FakeQuittableApp:
+    """Stands in for QApplication - only the one method _quit_on_sigint uses."""
+
+    def __init__(self):
+        self.quit_calls = 0
+
+    def quit(self):
+        self.quit_calls += 1
+
+
+class TestQuitOnSigint:
+    """``_quit_on_sigint`` in isolation, with no real Qt or signal delivery.
+
+    Signal handlers installed via ``signal.signal`` are plain callables -
+    invoking the installed handler directly is the standard, safe way to
+    test one without raising a real ``SIGINT`` at the test process (which
+    would risk killing the test runner itself if anything went wrong).
+    """
+
+    def test_the_installed_handler_quits_the_app(self):
+        app = FakeQuittableApp()
+
+        with _quit_on_sigint(app):
+            handler = signal.getsignal(signal.SIGINT)
+            handler(signal.SIGINT, None)
+
+        assert app.quit_calls == 1
+
+    def test_the_previous_handler_is_restored_on_the_way_out(self):
+        app = FakeQuittableApp()
+        sentinel = signal.getsignal(signal.SIGINT)
+
+        with _quit_on_sigint(app):
+            assert signal.getsignal(signal.SIGINT) is not sentinel
+
+        assert signal.getsignal(signal.SIGINT) is sentinel
+
+    def test_the_previous_handler_is_restored_even_if_the_body_raises(self):
+        app = FakeQuittableApp()
+        sentinel = signal.getsignal(signal.SIGINT)
+
+        with pytest.raises(RuntimeError):
+            with _quit_on_sigint(app):
+                raise RuntimeError("the body failed, not the handler's business")
+
+        assert signal.getsignal(signal.SIGINT) is sentinel
+
+    def test_only_the_installed_handler_is_active_inside_the_block(self):
+        # Two nested installs, restored in the right order - guards
+        # against a bug where the "previous" captured is always the
+        # original rather than whichever one was actually active.
+        app = FakeQuittableApp()
+        sentinel = signal.getsignal(signal.SIGINT)
+
+        with _quit_on_sigint(app):
+            first = signal.getsignal(signal.SIGINT)
+            with _quit_on_sigint(app):
+                assert signal.getsignal(signal.SIGINT) is not first
+            assert signal.getsignal(signal.SIGINT) is first
+
+        assert signal.getsignal(signal.SIGINT) is sentinel
 
 
 class TestReceiveParser:
