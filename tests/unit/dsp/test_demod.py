@@ -648,6 +648,81 @@ class TestNbfmWithSquelch:
         assert squelch.stats.blocks_open == 2
 
 
+class TestNbfmMuteDecoupledFromMeasurement:
+    """Chunk I: `mute=False` measures and decides without muting anything."""
+
+    def test_mute_false_still_measures_an_empty_channel(self):
+        sample_rate_hz = 1_024_000.0
+        rng = np.random.default_rng(3)
+        n = int(sample_rate_hz * 0.2)
+        noise = (rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.complex64)
+        config = NbfmConfig(sample_rate_hz=sample_rate_hz)
+        squelch = NoiseSquelch()
+
+        demodulate_nbfm(noise, config, squelch=squelch, mute=False)
+
+        assert squelch.stats.blocks_evaluated == 1
+        assert squelch.stats.last_quieting_db is not None
+
+    def test_mute_false_does_not_silence_an_empty_channel(self):
+        # The whole point: this is the same synthetic noise that
+        # test_a_squelch_mutes_an_empty_channel silences when mute=True
+        # (the default). Here it must come through unmuted.
+        sample_rate_hz = 1_024_000.0
+        rng = np.random.default_rng(3)
+        n = int(sample_rate_hz * 0.2)
+        noise = (rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.complex64)
+        config = NbfmConfig(sample_rate_hz=sample_rate_hz)
+        squelch = NoiseSquelch()
+
+        audio = demodulate_nbfm(noise, config, squelch=squelch, mute=False)
+
+        assert squelch.is_open is False
+        assert np.abs(audio).max() > 0.0
+
+    def test_mute_false_still_decides_open_or_closed(self):
+        # The gate's open/close decision - and therefore its bookkeeping
+        # of what WOULD have been muted - runs exactly as it would with
+        # mute=True. Only whether that decision reaches the audio differs.
+        sample_rate_hz = 1_024_000.0
+        iq = synthetic_nbfm(1_000.0, sample_rate_hz, int(sample_rate_hz * 0.2))
+        config = NbfmConfig(sample_rate_hz=sample_rate_hz)
+        squelch = NoiseSquelch()
+
+        demodulate_nbfm(iq, config, squelch=squelch, mute=False)
+
+        assert squelch.is_open is True
+
+    def test_default_mute_is_true(self):
+        # Pinned so a future change to the default can't silently start
+        # passing muted audio through to every existing caller.
+        sample_rate_hz = 1_024_000.0
+        rng = np.random.default_rng(3)
+        n = int(sample_rate_hz * 0.2)
+        noise = (rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.complex64)
+        config = NbfmConfig(sample_rate_hz=sample_rate_hz)
+        squelch = NoiseSquelch()
+
+        audio = demodulate_nbfm(noise, config, squelch=squelch)
+
+        assert not audio.any()
+
+    def test_mute_is_ignored_with_no_squelch(self):
+        # mute has nothing to decouple from when there is no squelch at
+        # all - both True and False must behave exactly like today's
+        # squelch=None path.
+        sample_rate_hz = 1_024_000.0
+        rng = np.random.default_rng(3)
+        n = int(sample_rate_hz * 0.2)
+        noise = (rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.complex64)
+        config = NbfmConfig(sample_rate_hz=sample_rate_hz)
+
+        with_true = demodulate_nbfm(noise, config, mute=True)
+        with_false = demodulate_nbfm(noise, config, mute=False)
+
+        np.testing.assert_array_equal(with_true, with_false)
+
+
 class TestDemodulateNbfmAgainstRealCapture:
     """Uses the real NOAA weather-radio fixtures from Chunk C's bring-up
     (see tests/fixtures/iq/README.md). Skips cleanly if absent.

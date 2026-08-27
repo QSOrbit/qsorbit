@@ -33,12 +33,14 @@ than one it waits for.
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pytest
 
 from qsorbit.core.dsp.demod import NbfmConfig
+from qsorbit.core.dsp.squelch import NoiseSquelch
 from qsorbit.core.dsp.tuning import DopplerTracker
 from qsorbit.core.geometry import AzEl
 from qsorbit.core.receive import (
@@ -133,21 +135,41 @@ def carrier_block(offset_hz: float, index: int) -> bytes:
     return interleaved.tobytes()
 
 
+def noise_block(index: int, *, seed: int = 7) -> bytes:
+    """One block of uint8 IQ holding broadband noise, no carrier at all.
+
+    Where :func:`carrier_block` is a clean tone -- deliberately, so it
+    reliably opens a squelch on the first block -- this is its opposite:
+    a channel with nothing in it, for tests that need the gate to stay
+    *closed*. ``index`` seeds the generator so consecutive blocks differ
+    (a repeating block would not be noise), while staying reproducible
+    run to run.
+    """
+    rng = np.random.default_rng(seed + index)
+    return rng.integers(0, 256, size=BLOCK_SAMPLES * 2, dtype=np.uint8).tobytes()
+
+
 class SteppedFakeDevice:
     """A device the test advances one block at a time.
 
     Each block carries a carrier at whatever offset the test asks for, so
     a sequence of steps can walk a signal across the passband the way a
-    real Doppler shift does.
+    real Doppler shift does. ``block_fn``, when given, overrides *what*
+    each block contains (its content, not its timing) -- used by the
+    squelch tests below, which need a block that stays a closed channel
+    rather than a carrier that would open the gate on the first read.
     """
 
-    def __init__(self, offsets_hz: list[float]) -> None:
+    def __init__(
+        self, offsets_hz: list[float], *, block_fn: Callable[[int], bytes] | None = None
+    ) -> None:
         self.index = 0
         self.is_open = True
         self.applied = applied_settings()
         self.reads = 0
         self.done = False
         self._offsets = offsets_hz
+        self._block_fn = block_fn
         self.allow = threading.Event()
         self.ready = threading.Event()
 
@@ -157,7 +179,10 @@ class SteppedFakeDevice:
         self.allow.clear()
         if self.done or self.reads >= len(self._offsets):
             raise DeviceError("stepped fake device exhausted")
-        block = carrier_block(self._offsets[self.reads], self.reads)
+        if self._block_fn is not None:
+            block = self._block_fn(self.reads)
+        else:
+            block = carrier_block(self._offsets[self.reads], self.reads)
         self.reads += 1
         return block
 
@@ -571,3 +596,107 @@ class TestStatsPresentation:
         assert "--- doppler ---" in text
         assert "squelch: off" in text
         assert "no waterfall was attached" in text
+
+
+class TestLiveQuieting:
+    """Chunk I: :attr:`ReceiveSession.live_quieting_db` and
+    :attr:`live_squelch_open`, and the ``mute_squelch`` wiring they sit
+    beside.
+
+    ``test_demod.py`` already proves the decoupling arithmetic --
+    ``mute=False`` still measures and decides, it just does not silence.
+    What is untested until now is that :class:`ReceiveSession` actually
+    threads its ``mute_squelch`` constructor argument down to that call,
+    and that the two live properties read the real squelch rather than a
+    stale or mismatched copy of it. So these tests are about the wiring,
+    exactly as the rest of this module states its own scope.
+    """
+
+    def test_no_squelch_means_no_live_reading_at_all(self):
+        # "No squelch" and "a squelch that has not opened yet" have to
+        # read differently, or a caller cannot tell them apart.
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ])
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        session, audio = a_session(device, source)
+
+        assert session.live_quieting_db is None
+        assert session.live_squelch_open is None
+
+        session.start()
+        try:
+            device.step()
+            assert audio.wait_for(1), "the block was never demodulated"
+        finally:
+            device.finish()
+            assert session.wait(5.0), "the demodulating thread never noticed the stream ending"
+            with pytest.raises(DeviceError, match="exhausted"):
+                session.stop()
+
+        assert session.live_quieting_db is None
+        assert session.live_squelch_open is None
+
+    def test_a_strong_signal_opens_the_gate_and_reports_a_live_measurement(self):
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ])
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        squelch = NoiseSquelch()
+        session, audio = a_session(device, source, squelch=squelch)
+
+        session.start()
+        try:
+            device.step()
+            assert audio.wait_for(1), "the block was never demodulated"
+        finally:
+            device.finish()
+            assert session.wait(5.0), "the demodulating thread never noticed the stream ending"
+            with pytest.raises(DeviceError, match="exhausted"):
+                session.stop()
+
+        assert session.live_quieting_db is not None
+        assert session.live_squelch_open is True
+        # mute_squelch defaults to True, but the gate opened on this very
+        # block -- apply() runs after update() inside the same call, so an
+        # opening block is never muted against itself.
+        assert np.abs(audio.blocks[0]).max() > 0.0
+
+    def test_an_empty_channel_stays_closed_and_mutes_by_default(self):
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ], block_fn=noise_block)
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        squelch = NoiseSquelch()
+        session, audio = a_session(device, source, squelch=squelch)
+
+        session.start()
+        try:
+            device.step()
+            assert audio.wait_for(1), "the block was never demodulated"
+        finally:
+            device.finish()
+            assert session.wait(5.0), "the demodulating thread never noticed the stream ending"
+            with pytest.raises(DeviceError, match="exhausted"):
+                session.stop()
+
+        assert session.live_quieting_db is not None
+        assert session.live_squelch_open is False
+        assert not audio.blocks[0].any()
+
+    def test_mute_squelch_false_still_reports_the_closed_decision_but_lets_audio_through(self):
+        # The point of the whole item: the live readout has to be honest
+        # about a gate that WOULD have muted, even on a run where
+        # mute_squelch=False means nothing actually gets silenced.
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ], block_fn=noise_block)
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        squelch = NoiseSquelch()
+        session, audio = a_session(device, source, squelch=squelch, mute_squelch=False)
+
+        session.start()
+        try:
+            device.step()
+            assert audio.wait_for(1), "the block was never demodulated"
+        finally:
+            device.finish()
+            assert session.wait(5.0), "the demodulating thread never noticed the stream ending"
+            with pytest.raises(DeviceError, match="exhausted"):
+                session.stop()
+
+        assert session.live_quieting_db is not None
+        assert session.live_squelch_open is False
+        assert np.abs(audio.blocks[0]).max() > 0.0

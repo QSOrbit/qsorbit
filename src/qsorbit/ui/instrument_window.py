@@ -28,19 +28,23 @@ from __future__ import annotations
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QLabel, QMainWindow, QVBoxLayout, QWidget
 
+from qsorbit.ui.quieting_widget import QuietingWidget
 from qsorbit.ui.readout_widget import ReadoutWidget
 from qsorbit.ui.waterfall_widget import WaterfallWidget
 
 #: Shown when a window is opened with no panels at all.
-_EMPTY_NOTE = "No instruments attached. Pass a readout, a waterfall, or both."
+_EMPTY_NOTE = (
+    "No instruments attached. Pass a readout, a waterfall, a quieting panel, or any combination."
+)
 
 
 class InstrumentWindow(QMainWindow):
-    """Hosts a readout, a waterfall, either, or neither.
+    """Hosts a readout, a waterfall, a quieting panel, or any combination.
 
     Args:
         readout: The rotor/sky readout panel, or ``None``.
         waterfall: The spectrum waterfall panel, or ``None``.
+        quieting: The live squelch-quieting panel, or ``None``.
         title: Window title. Defaults to naming whatever is being
             tracked when a readout is present, matching Chunk B's
             "QSOrbit - tracking SUN", and to a plain product name
@@ -48,7 +52,7 @@ class InstrumentWindow(QMainWindow):
             a title claiming it was would be the sort of small dishonesty
             this project's readouts go out of their way to avoid.
 
-    Closing the window stops both panels polling. It does not stop the
+    Closing the window stops every panel polling. It does not stop the
     rotor, the SDR, or the streaming worker behind them: whoever
     constructed those owns their lifetime, the same policy every layer
     below here already follows.
@@ -59,11 +63,13 @@ class InstrumentWindow(QMainWindow):
         *,
         readout: ReadoutWidget | None = None,
         waterfall: WaterfallWidget | None = None,
+        quieting: QuietingWidget | None = None,
         title: str | None = None,
     ) -> None:
         super().__init__()
         self._readout = readout
         self._waterfall = waterfall
+        self._quieting = quieting
 
         if title is None:
             title = (
@@ -77,18 +83,26 @@ class InstrumentWindow(QMainWindow):
         layout = QVBoxLayout(central)
         if readout is not None:
             layout.addWidget(readout)
+        if quieting is not None:
+            # Placed with the readout rather than the spectrum panels: it
+            # is a fixed-height row of text and a bar, the same shape as
+            # the readout's own rows, and Session 22 asked for it beside
+            # the squelch's effect on what's audible, not beside the
+            # spectrum.
+            layout.addWidget(quieting)
         if waterfall is not None:
             # Stretch factor 1: the waterfall takes the slack when the
-            # window is resized. The readout is a fixed handful of text
-            # rows and gaining height would only pad it.
+            # window is resized. The readout and quieting panel above
+            # are a fixed handful of rows and gaining height would only
+            # pad them.
             layout.addWidget(waterfall, 1)
-        if readout is None and waterfall is None:
+        if readout is None and waterfall is None and quieting is None:
             layout.addWidget(QLabel(_EMPTY_NOTE))
         self.setCentralWidget(central)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt's spelling
-        """Stop both panels polling. Does not stop the hardware."""
-        for panel in (self._readout, self._waterfall):
+        """Stop every panel polling. Does not stop the hardware."""
+        for panel in (self._readout, self._waterfall, self._quieting):
             if panel is not None:
                 panel.stop()
         super().closeEvent(event)

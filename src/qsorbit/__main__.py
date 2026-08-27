@@ -159,6 +159,23 @@ def _alignment_note(offset: AlignmentOffset) -> str:
     )
 
 
+def _squelch_status_line(*, mute: bool, open_above_db: float, close_below_db: float) -> str:
+    """Describe the squelch's live configuration, for the startup banner.
+
+    A NoiseSquelch is now built unconditionally (Chunk I: "always
+    measure, optionally mute" - see demodulate_nbfm's own ``mute``
+    argument and ReceiveSession's ``mute_squelch``) so the live quieting
+    readout has something to show even on a run where ``--squelch`` was
+    never given. This line is what tells an operator which of those two
+    things is actually true here: the gate is always deciding, and
+    ``--squelch`` is what lets that decision reach the speaker.
+    """
+    thresholds = f"open at/above {open_above_db:.1f} dB, close at/below {close_below_db:.1f} dB"
+    if mute:
+        return f"Squelch:   muting enabled, {thresholds}"
+    return f"Squelch:   muting off - always measuring for the live quieting readout, {thresholds}"
+
+
 RotorFactory = Callable[[StationConfig, Callable[[float], None]], Rotor]
 SdrFactory = Callable[[StationConfig], RtlSdr]
 
@@ -387,14 +404,19 @@ def _add_receive_command(subcommands: argparse._SubParsersAction) -> None:
     receive.add_argument(
         "--window",
         action="store_true",
-        help="Open the instrument window - waterfall, plus the readout when --send is given.",
+        help=(
+            "Open the instrument window - waterfall and live quieting, plus the "
+            "readout when --send is given."
+        ),
     )
     receive.add_argument(
         "--squelch",
         action="store_true",
         help=(
-            "Enable the noise squelch. Off by default: a mute set slightly too "
-            "tight makes a working receiver indistinguishable from a broken one."
+            "Mute the noise squelch's closed gate. Off by default: a mute set "
+            "slightly too tight makes a working receiver indistinguishable from "
+            "a broken one. The gate is always measured and shown live either way "
+            "- see --window - this only controls whether it silences audio."
         ),
     )
     receive.add_argument(
@@ -844,16 +866,16 @@ def _command_receive(
         # the requested frequency is wrong by exactly the amount nobody
         # thinks to check.
         doppler = DopplerTracker(downlink_hz, applied.center_hz)
-        squelch = (
-            NoiseSquelch(open_above_db=args.squelch_open, close_below_db=args.squelch_close)
-            if args.squelch
-            else None
-        )
+        # Built unconditionally now - see _squelch_status_line's own
+        # docstring for why. --squelch only decides whether its decision
+        # reaches the speaker (ReceiveSession's mute_squelch below).
+        squelch = NoiseSquelch(open_above_db=args.squelch_open, close_below_db=args.squelch_close)
         print(
-            f"Squelch:   open at/above {args.squelch_open:.1f} dB, "
-            f"close at/below {args.squelch_close:.1f} dB"
-            if squelch is not None
-            else "Squelch:   off - expect full-scale hiss whenever the downlink is idle."
+            _squelch_status_line(
+                mute=args.squelch,
+                open_above_db=args.squelch_open,
+                close_below_db=args.squelch_close,
+            )
         )
 
         if not args.send:
@@ -884,7 +906,7 @@ def _run_receive(
     applied: AppliedSettings,
     nbfm: NbfmConfig,
     doppler: DopplerTracker,
-    squelch: NoiseSquelch | None,
+    squelch: NoiseSquelch,
     sdr: RtlSdr,
     *,
     loop: TrackingLoop | None = None,
@@ -911,6 +933,10 @@ def _run_receive(
             else TargetRangeRate(satellite, config.observer)
         ),
         squelch=squelch,
+        # args.squelch is "let the gate's decision reach the speaker" -
+        # the gate itself is always deciding now, see
+        # _squelch_status_line.
+        mute_squelch=args.squelch,
         spectrum_factory=lambda blocks: SpectrumStream(blocks, spectrum_config),
         tracking_interval_s=args.interval,
     )
@@ -965,6 +991,7 @@ def _show_instruments(
     from PySide6.QtWidgets import QApplication
 
     from qsorbit.ui.instrument_window import InstrumentWindow
+    from qsorbit.ui.quieting_widget import QuietingWidget
     from qsorbit.ui.readout_widget import ReadoutWidget
     from qsorbit.ui.waterfall_widget import WaterfallWidget
 
@@ -975,6 +1002,10 @@ def _show_instruments(
             if loop is not None
             else None
         ),
+        # Always attached, regardless of --squelch: the session's squelch
+        # is now unconditional (see _squelch_status_line), so there is
+        # always a live reading to show, muted or not.
+        quieting=QuietingWidget(session),
         waterfall=WaterfallWidget(session.spectrum),
         title=f"QSOrbit - receiving {satellite.name}",
     )

@@ -15,7 +15,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from qsorbit import __version__
-from qsorbit.__main__ import DEFAULT_TUNING_OFFSET_KHZ, build_parser, main
+from qsorbit.__main__ import (
+    DEFAULT_TUNING_OFFSET_KHZ,
+    _squelch_status_line,
+    build_parser,
+    main,
+)
 from qsorbit.core.rotor import Arrival, HomingError, Position, Rotor, RotorErrorCode, RotorStatus
 from qsorbit.core.sdr import AppliedSettings, DeviceError, DeviceInfo, TunerType
 
@@ -889,6 +894,34 @@ class TestSdrCapture:
 
         assert code == 1
         assert "sample_rate_hz" in capsys.readouterr().err
+
+
+class TestSquelchStatusLine:
+    """``_squelch_status_line`` in isolation - a pure helper, not the session."""
+
+    def test_muting_enabled_says_so(self):
+        line = _squelch_status_line(mute=True, open_above_db=3.0, close_below_db=1.5)
+        assert line == "Squelch:   muting enabled, open at/above 3.0 dB, close at/below 1.5 dB"
+
+    def test_muting_off_still_names_the_thresholds(self):
+        # The whole point of Chunk I's "always measure, optionally mute":
+        # the gate is still configured and running even when nothing it
+        # decides reaches the speaker, and the banner should say so
+        # rather than reading like the squelch does not exist.
+        line = _squelch_status_line(mute=False, open_above_db=3.0, close_below_db=1.5)
+        assert "open at/above 3.0 dB" in line
+        assert "close at/below 1.5 dB" in line
+        assert "muting off" in line
+
+    def test_muting_on_and_off_read_differently(self):
+        on = _squelch_status_line(mute=True, open_above_db=3.0, close_below_db=1.5)
+        off = _squelch_status_line(mute=False, open_above_db=3.0, close_below_db=1.5)
+        assert on != off
+
+    def test_thresholds_are_formatted_to_one_decimal(self):
+        line = _squelch_status_line(mute=True, open_above_db=2.75, close_below_db=1.05)
+        assert "2.8 dB" in line
+        assert "1.1 dB" in line
 
 
 # ---------------------------------------------------------------------------
