@@ -39,9 +39,12 @@ code page someone is actually using.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import signal
 import sys
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from datetime import UTC, datetime
+from typing import Protocol
 
 from qsorbit import __version__
 from qsorbit.core.dsp import (
@@ -195,6 +198,50 @@ def _parse_audio_device(value: str | None) -> int | str | None:
         return int(value)
     except ValueError:
         return value
+
+
+class _Quittable(Protocol):
+    """Anything with a ``quit()`` method - declared structurally so a test
+    double stands in for a real ``QApplication`` without importing Qt.
+    """
+
+    def quit(self) -> None: ...
+
+
+@contextlib.contextmanager
+def _quit_on_sigint(app: _Quittable) -> Iterator[None]:
+    """Make Ctrl-C during ``app.exec()`` call ``app.quit()`` instead of raising.
+
+    Qt's ``exec()`` is a C++ loop that does not return to Python bytecode
+    between events, so the interpreter's default SIGINT handler - which
+    only runs *at* a bytecode boundary - cannot fire until whichever Qt
+    callback happens to be executing next. Before this existed that was
+    :meth:`~qsorbit.ui.waterfall_widget.WaterfallWidget._on_timer`, its
+    50 ms poll being the shortest-period timer always running under
+    ``_show_instruments``, and the ``KeyboardInterrupt`` raised inside it
+    propagated out through Qt's C++ dispatch as an unhandled exception -
+    PySide6's own exception hook printed a traceback, cosmetic since
+    ``app.exec()`` still returned and the run still completed, but a real
+    ugliness on every single Ctrl-C.
+
+    Installing a plain SIGINT handler sidesteps that path entirely: it
+    still only runs at the next bytecode boundary, exactly the same
+    timing an exception would have had, but it is an ordinary function
+    call (``app.quit()``) rather than an exception unwinding through a
+    callback that was never written to expect one. The previous handler
+    is restored on the way out, in case something else in this process
+    wants Ctrl-C's default behaviour afterward.
+    """
+
+    def handle_sigint(*_args: object) -> None:
+        print()  # the ^C the terminal echoed deserves its own line
+        app.quit()
+
+    previous_handler = signal.signal(signal.SIGINT, handle_sigint)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
 
 
 def _spectrum_factory(
@@ -1038,6 +1085,10 @@ def _show_instruments(
     it is present **it owns the tick** — which is why the session was
     built with ``drive=False`` in that case. Two things ticking one loop
     would double the rotor's serial traffic.
+
+    **Ctrl-C is handled explicitly** via :func:`_quit_on_sigint` wrapping
+    ``app.exec()`` below — see that function's own docstring for why
+    Qt's event loop needs this rather than Python's default handling.
     """
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
@@ -1068,7 +1119,9 @@ def _show_instruments(
         # disagreement between a flag and its behaviour this project
         # keeps finding the hard way.
         QTimer.singleShot(int(args.seconds * 1000), app.quit)
-    app.exec()
+
+    with _quit_on_sigint(app):
+        app.exec()
 
 
 def _command_stop(config: StationConfig, factory: RotorFactory) -> int:
