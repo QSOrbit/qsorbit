@@ -19,11 +19,14 @@ slew is measured in cable and gearbox rather than in a retry.
 Two things this interface has to be honest about, because both are easy
 to misread:
 
-* **No alignment calibration is applied.** The rotor is commanded to the
-  raw computed sky position, so any mechanical misalignment of the mast
-  shows up directly as pointing error. On a portable rig that is re-aimed
-  by hand at every setup, that error is whatever this setup's offset from
-  north happens to be.
+* **Alignment calibration is applied only if your config has one.**
+  ``[rotor.alignment]`` defaults to no correction, in which case the
+  rotor is commanded to the raw computed sky position and any
+  mechanical misalignment of the mast shows up directly as pointing
+  error - true of every config file written before Chunk I. On a
+  portable rig re-aimed by hand at every setup, that offset needs
+  re-measuring and re-entering each time; there is still no
+  auto-calibration routine to do the measuring for you.
 * **Positions read back from the rotor are axis readings**, measured from
   wherever it homed — not compass bearings, and not sky elevation. They
   are labelled as such wherever they appear.
@@ -54,7 +57,7 @@ from qsorbit.core.dsp import (
     SpectrumConfig,
     SpectrumStream,
 )
-from qsorbit.core.pointing import TrackingLoop, sky_to_rotor
+from qsorbit.core.pointing import AlignmentOffset, TrackingLoop, sky_to_rotor
 from qsorbit.core.receive import (
     DEFAULT_TRACKING_INTERVAL_S,
     LoopRangeRate,
@@ -110,14 +113,51 @@ NON_CONTIGUOUS_WARNING = (
     "fixture. See the sidecar for the count."
 )
 
-#: Printed wherever a commanded position is shown. The pointing layer's
-#: sky-to-rotor conversion is an identity today, and an interface that
-#: didn't say so would imply a calibration that doesn't exist.
+#: Printed wherever a commanded position is shown and the station's
+#: config carries no alignment offset - which is every config file
+#: written before Chunk I, and the honest default after it too, since
+#: "uncalibrated" is what [rotor.alignment]'s identity value means.
 UNCALIBRATED_NOTE = (
     "No alignment calibration is applied: the rotor is commanded to the raw "
     "computed sky position, so any mechanical misalignment shows up directly "
     "as pointing error."
 )
+
+
+def _alignment_offset(config: StationConfig) -> AlignmentOffset:
+    """Build the pointing layer's :class:`AlignmentOffset` from station config.
+
+    A one-line adapter, not a coincidence of naming: :mod:`core.station`
+    deliberately does not import :mod:`core.pointing` (see that module's
+    own dependency-direction rule), so nothing lower than this entry
+    point can build the type :func:`~qsorbit.core.pointing.sky_to_rotor`
+    actually wants. Every caller that needs one calls this rather than
+    reaching into ``config.alignment`` themselves.
+    """
+    return AlignmentOffset(
+        azimuth_deg=config.alignment.azimuth_deg,
+        elevation_deg=config.alignment.elevation_deg,
+    )
+
+
+def _alignment_note(offset: AlignmentOffset) -> str:
+    """Describe whether alignment correction is in effect, and what it is.
+
+    :data:`UNCALIBRATED_NOTE` when ``offset`` corrects nothing - the
+    default, and every config file written before Chunk I. Otherwise
+    names the correction that was actually applied, so an operator who
+    measured one sees it confirmed rather than told it doesn't exist -
+    the same "say what's actually true" rule ``UNCALIBRATED_NOTE``
+    itself exists to follow.
+    """
+    if offset.is_identity:
+        return UNCALIBRATED_NOTE
+    return (
+        f"Alignment offset applied: AZ {offset.azimuth_deg:+.1f}  EL "
+        f"{offset.elevation_deg:+.1f} (from [rotor.alignment] in station config). "
+        "Flip mode and azimuth unwrapping are still not applied."
+    )
+
 
 RotorFactory = Callable[[StationConfig, Callable[[float], None]], Rotor]
 SdrFactory = Callable[[StationConfig], RtlSdr]
@@ -540,7 +580,8 @@ def _command_point(args: argparse.Namespace, config: StationConfig, factory: Rot
     satellite = Satellite.from_file(args.tle)
     state = satellite.topocentric_state(config.observer, when)
     sky = state.sky_position
-    target = sky_to_rotor(sky)
+    offset = _alignment_offset(config)
+    target = sky_to_rotor(sky, offset)
 
     print(f"Target:    {satellite.name}")
     print(f"Time:      {when.isoformat()}")
@@ -549,7 +590,7 @@ def _command_point(args: argparse.Namespace, config: StationConfig, factory: Rot
     print(f"Rotor:     {_format_position(target)}  (axis command)")
     print(f"Command:   {bytes(format_set_position(target)).decode('ascii').strip()}")
     print()
-    print(UNCALIBRATED_NOTE)
+    print(_alignment_note(offset))
 
     if sky.elevation < 0.0:
         print(
@@ -656,8 +697,16 @@ def _command_status(config: StationConfig, factory: RotorFactory) -> int:
         )
         print(f"Wrap:      {capabilities.azimuth_wrap.value}")
         print(f"Window:    {capabilities.acceptance_window_deg:.1f} degrees acceptance")
+        offset = _alignment_offset(config)
+        if offset.is_identity:
+            print("Alignment: none recorded (see [rotor.alignment] in config.example.toml)")
+        else:
+            print(
+                f"Alignment: AZ {offset.azimuth_deg:+.1f}  EL {offset.elevation_deg:+.1f}  "
+                "(from [rotor.alignment])"
+            )
         print()
-        print(UNCALIBRATED_NOTE)
+        print(_alignment_note(offset))
         return 0 if status.healthy else 1
 
 
@@ -816,7 +865,13 @@ def _command_receive(
 
         with _Connected(config, rotor_factory) as rotor:
             print(f"Rotor:     connected, {rotor.firmware_version}")
-            loop = TrackingLoop(satellite, config.observer, rotor, interval_s=args.interval)
+            loop = TrackingLoop(
+                satellite,
+                config.observer,
+                rotor,
+                interval_s=args.interval,
+                alignment_offset=_alignment_offset(config),
+            )
             return _run_receive(
                 args, config, satellite, applied, nbfm, doppler, squelch, sdr, loop=loop
             )

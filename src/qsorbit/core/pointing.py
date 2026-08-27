@@ -16,8 +16,6 @@ Doppler correction will read range rate off the same sample.
 
 What is still expected to land here:
 
-* **Alignment calibration offset** — the correction measured by the
-  auto-calibration routine, applied to every commanded position.
 * **Flip-mode selection** — for a pass crossing near zenith, commanding
   ``azimuth + 180`` and ``180 - elevation`` instead of whipping the
   azimuth axis 180° through the top. Only available on rotors whose
@@ -33,8 +31,18 @@ single instant: they depend on the shape of the whole pass, and on where
 the rotor already is. So this module is expected to grow a stateful
 planner that runs once before a pass begins and a cheap per-sample
 converter that follows the resulting plan. Both of those need pass
-prediction (AOS/LOS), which is deferred, so today only the seam exists —
-:func:`sky_to_rotor` is deliberately an identity conversion.
+prediction (AOS/LOS), which is deferred, so today only the seam exists
+for them.
+
+**Alignment offset has landed** (:class:`AlignmentOffset`,
+Chunk I): :func:`sky_to_rotor` and :func:`rotor_to_sky` both default to
+:data:`IDENTITY_ALIGNMENT_OFFSET`, so every existing caller that passes
+no offset gets exactly today's identity conversion. A caller that has
+one — read from :attr:`~qsorbit.core.station.StationConfig.alignment`,
+today typed by hand into station config — passes it explicitly. What
+has *not* landed is the auto-calibration routine that would measure one
+by pointing at the sun: this is the storage and the arithmetic it
+needs, not the measurement.
 """
 
 from __future__ import annotations
@@ -148,18 +156,67 @@ class TrackSample:
         return self.outcome is TickOutcome.COMMANDED
 
 
-def sky_to_rotor(sky: AzEl) -> Position:
+@dataclass(frozen=True)
+class AlignmentOffset:
+    """The measured difference between a rotor's home position and true sky.
+
+    A portable rig re-aimed by hand at every setup has no persistent
+    reference between "rotor 0 degrees" and true north — see
+    ``qsorbit-rotor-integration.md`` section 4, "Alignment is the big
+    one for this rig." This value object is where that measurement
+    lives once it exists, however it was obtained: typed in from a
+    compass bearing today, from the sun-shadow auto-calibration routine
+    described in the project notes later. Either way it is one pair of
+    numbers, applied the same way.
+
+    The sign convention matches how it is meant to be measured: point
+    the boom at a target whose true sky azimuth you know, read the
+    rotor's own axis reading for that same moment, and subtract —
+    ``offset = axis_reading - sky_azimuth``. :func:`sky_to_rotor` undoes
+    that subtraction (adds the offset back) to turn a sky position into
+    the axis command that will actually reach it; :func:`rotor_to_sky`
+    applies the original subtraction to turn an axis reading back into
+    the sky direction it means.
+
+    Args:
+        azimuth_deg: How far the rotor's home azimuth sits clockwise of
+            true north, in degrees.
+        elevation_deg: The equivalent constant for elevation — usually
+            zero unless the mast itself sits off level.
+    """
+
+    azimuth_deg: float = 0.0
+    elevation_deg: float = 0.0
+
+    @property
+    def is_identity(self) -> bool:
+        """``True`` if this offset corrects nothing — the uncalibrated case."""
+        return self.azimuth_deg == 0.0 and self.elevation_deg == 0.0
+
+
+#: The "nothing measured yet" offset — every existing caller that omits
+#: ``offset`` gets exactly this, so :func:`sky_to_rotor` and
+#: :func:`rotor_to_sky` stay identity conversions by default.
+IDENTITY_ALIGNMENT_OFFSET = AlignmentOffset()
+
+
+def sky_to_rotor(sky: AzEl, offset: AlignmentOffset = IDENTITY_ALIGNMENT_OFFSET) -> Position:
     """Convert a sky direction into a rotor command position.
 
     .. note::
 
-       **No correction is currently applied.** This is a straight
-       one-to-one conversion, so the rotor is commanded to the raw
-       computed sky position. Any mechanical misalignment of your mast
-       shows up directly as pointing error, and a pass crossing near
-       zenith will swing the azimuth axis through the top rather than
-       flipping. Interfaces that expose pointing to an operator should
-       say so rather than implying the output is calibrated.
+       **Only alignment is corrected, and only if you pass one.** With
+       the default :data:`IDENTITY_ALIGNMENT_OFFSET` this is still a
+       straight one-to-one conversion — the rotor is commanded to the
+       raw computed sky position, and any mechanical misalignment of
+       your mast shows up directly as pointing error. Passing a real
+       :class:`AlignmentOffset` corrects exactly that mechanical
+       misalignment; it does nothing for the two things still
+       unhandled here: a pass crossing near zenith still swings the
+       azimuth axis through the top rather than flipping, and there is
+       still no azimuth unwrapping. Interfaces that expose pointing to
+       an operator should say which of these apply rather than
+       implying the output is fully calibrated.
 
     It is a named function rather than an inline construction so that
     there is exactly one place for alignment offsets, flip mode,
@@ -169,6 +226,8 @@ def sky_to_rotor(sky: AzEl) -> Position:
 
     Args:
         sky: Where the target actually is, as seen from the observer.
+        offset: The station's measured alignment correction. Defaults
+            to :data:`IDENTITY_ALIGNMENT_OFFSET`, i.e. no correction.
 
     Returns:
         The position to command the rotor to.
@@ -177,20 +236,25 @@ def sky_to_rotor(sky: AzEl) -> Position:
         ValueError: If the resulting position is outside what a
             :class:`~qsorbit.core.rotor.Position` permits.
     """
-    return Position(azimuth=sky.azimuth, elevation=sky.elevation)
+    return Position(
+        azimuth=sky.azimuth + offset.azimuth_deg,
+        elevation=sky.elevation + offset.elevation_deg,
+    )
 
 
-def rotor_to_sky(position: Position) -> AzEl:
+def rotor_to_sky(position: Position, offset: AlignmentOffset = IDENTITY_ALIGNMENT_OFFSET) -> AzEl:
     """Convert a rotor axis reading into the sky direction it would mean.
 
     .. note::
 
-       **No correction is currently applied**, exactly as in
-       :func:`sky_to_rotor` — this is that conversion's inverse, and
-       carries the same honesty. It says where an aligned, non-flipped
-       installation would be pointing for this axis reading; it does
-       not know this rig's actual alignment offset, because none is
-       measured yet.
+       **Only alignment is corrected, and only if you pass one**,
+       exactly as in :func:`sky_to_rotor` — this is that conversion's
+       inverse, and carries the same honesty. With the default
+       :data:`IDENTITY_ALIGNMENT_OFFSET` it says where an aligned,
+       non-flipped installation would be pointing for this axis
+       reading; passing this station's actual :class:`AlignmentOffset`
+       corrects for a known mechanical misalignment, but flip mode and
+       azimuth unwrapping are still not accounted for.
 
     A :class:`~qsorbit.core.rotor.Position` is a mechanical axis
     reading, and its domain is wider than :class:`AzEl`'s: multi-turn
@@ -228,18 +292,28 @@ def rotor_to_sky(position: Position) -> AzEl:
     Args:
         position: An axis reading, e.g. from
             :meth:`~qsorbit.core.rotor.Rotor.read_position`.
+        offset: The station's measured alignment correction. Defaults
+            to :data:`IDENTITY_ALIGNMENT_OFFSET`, i.e. no correction --
+            "aligned" in the "aligned, non-flipped installation" below
+            then means exactly what it says.
 
     Returns:
-        The sky direction this reading would correspond to in an
-        aligned, non-flipped installation.
+        The sky direction this reading would correspond to, corrected
+        for ``offset`` (identity by default), in a non-flipped
+        installation.
     """
     return AzEl(
-        azimuth=position.azimuth % 360.0,
-        elevation=max(-90.0, min(90.0, position.elevation)),
+        azimuth=(position.azimuth - offset.azimuth_deg) % 360.0,
+        elevation=max(-90.0, min(90.0, position.elevation - offset.elevation_deg)),
     )
 
 
-def compute_pointing_command(target: Target, observer: ObserverLocation, time: datetime) -> bytes:
+def compute_pointing_command(
+    target: Target,
+    observer: ObserverLocation,
+    time: datetime,
+    offset: AlignmentOffset = IDENTITY_ALIGNMENT_OFFSET,
+) -> bytes:
     """Compute the rotor command that would point at ``target``.
 
     Args:
@@ -248,6 +322,8 @@ def compute_pointing_command(target: Target, observer: ObserverLocation, time: d
             :class:`~qsorbit.core.tracker.Satellite`.
         observer: The ground station's location.
         time: The instant to compute for, as a timezone-aware datetime.
+        offset: The station's measured alignment correction. Defaults
+            to :data:`IDENTITY_ALIGNMENT_OFFSET`, i.e. no correction.
 
     .. warning::
 
@@ -269,7 +345,7 @@ def compute_pointing_command(target: Target, observer: ObserverLocation, time: d
             ``time``.
     """
     state = target.topocentric_state(observer, time)
-    return bytes(format_set_position(sky_to_rotor(state.sky_position)))
+    return bytes(format_set_position(sky_to_rotor(state.sky_position, offset)))
 
 
 def _utc_now() -> datetime:
@@ -347,6 +423,11 @@ class TrackingLoop:
             new position is sent. Defaults to the rotor's declared
             acceptance window. Values below
             :data:`FIRMWARE_DEADZONE_DEG` are accepted but pointless.
+        alignment_offset: The station's measured alignment correction,
+            applied to every :func:`sky_to_rotor` conversion this loop
+            makes. Defaults to :data:`IDENTITY_ALIGNMENT_OFFSET`, i.e.
+            no correction — today's behaviour for a station whose
+            config carries none.
         now: Returns the current instant, timezone-aware. Injected for
             testing.
         sleep: Injected for testing; defaults to :func:`time.sleep`.
@@ -366,6 +447,7 @@ class TrackingLoop:
         *,
         interval_s: float = DEFAULT_TICK_INTERVAL_S,
         deadband_deg: float | None = None,
+        alignment_offset: AlignmentOffset = IDENTITY_ALIGNMENT_OFFSET,
         now: Callable[[], datetime] = _utc_now,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
@@ -382,6 +464,7 @@ class TrackingLoop:
         self._rotor = rotor
         self._interval_s = interval_s
         self._deadband_deg = deadband_deg
+        self._alignment_offset = alignment_offset
         self._now = now
         self._sleep = sleep
         self._monotonic = monotonic
@@ -401,6 +484,16 @@ class TrackingLoop:
     def deadband_deg(self) -> float:
         """How far the target must move before a new command is sent."""
         return self._deadband_deg
+
+    @property
+    def alignment_offset(self) -> AlignmentOffset:
+        """The correction applied to every :func:`sky_to_rotor` conversion.
+
+        Exposed read-only so a display (:mod:`qsorbit.ui.readout_widget`)
+        can run the same correction over a reading it converts itself,
+        via :func:`rotor_to_sky`, instead of assuming identity.
+        """
+        return self._alignment_offset
 
     @property
     def latest_sample(self) -> TrackSample | None:
@@ -450,7 +543,7 @@ class TrackingLoop:
         rotor_position = self._rotor.read_position()
         self._guard_reported_position(rotor_position)
 
-        rotor_target = sky_to_rotor(state.sky_position)
+        rotor_target = sky_to_rotor(state.sky_position, self._alignment_offset)
         outcome = self._decide(state.sky_position, rotor_target)
         if outcome is TickOutcome.COMMANDED:
             self._rotor.move_to(rotor_target)

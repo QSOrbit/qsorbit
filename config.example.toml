@@ -134,6 +134,41 @@ firmware_version = "SatNOGS-v2.2.1"
 
 
 # ---------------------------------------------------------------------
+# Alignment offset
+# ---------------------------------------------------------------------
+#
+# This whole section is optional. Every config file written before
+# Chunk I lacks it, and no measurement is exactly this feature's
+# identity value: azimuth_deg = 0.0, elevation_deg = 0.0 means "no
+# correction applied", which is an honest description of a station
+# nobody has calibrated yet - not a placeholder standing in for a
+# required measurement.
+#
+# The rotor's axis reading is measured from wherever it homed, not from
+# true north - see [rotor.capabilities] above and
+# qsorbit-rotor-integration.md section 4. This offset is the difference
+# between the two, so QSOrbit can convert one into the other. Measure
+# it by pointing the boom at something whose true sky azimuth you know
+# (a landmark, the sun with a peep sight, a known star), reading the
+# rotor's own axis position for that same moment, and subtracting:
+#
+#     azimuth_deg = axis_reading_azimuth - true_sky_azimuth
+#
+# and the equivalent for elevation, usually 0 unless the mast itself
+# sits off level. There is no auto-calibration routine yet - that is
+# planned future work - so today this number is typed in by hand.
+#
+# On a permanently mounted station this is a station constant: measure
+# it once, leave it here. On a portable rig re-aimed by hand at every
+# setup - the case this was written for - there is no persistent
+# reference between setups, so this needs re-measuring and re-entering
+# each time, the same way you would re-level a tripod.
+#[rotor.alignment]
+#azimuth_deg = 0.0
+#elevation_deg = 0.0
+
+
+# ---------------------------------------------------------------------
 # How to reach your SDR
 # ---------------------------------------------------------------------
 #
