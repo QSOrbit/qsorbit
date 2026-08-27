@@ -176,6 +176,27 @@ def _squelch_status_line(*, mute: bool, open_above_db: float, close_below_db: fl
     return f"Squelch:   muting off - always measuring for the live quieting readout, {thresholds}"
 
 
+def _parse_audio_device(value: str | None) -> int | str | None:
+    """Interpret ``--audio-device`` into what ``AudioOutput`` wants.
+
+    ``sounddevice`` itself accepts either a numeric index or a name
+    substring for ``OutputStream(device=...)`` - see ``query_devices()``
+    for what a string resolves against. The flag is always typed as
+    ``str`` by argparse (a name like ``"2"`` and an index ``2`` need to
+    stay distinguishable from each other only in *this* function, not in
+    two different argparse types), so this is where that split actually
+    happens: a purely numeric value becomes an ``int`` index, anything
+    else is passed through as a name substring, and an unset flag stays
+    ``None`` - PortAudio's own "system default" sentinel.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
 RotorFactory = Callable[[StationConfig, Callable[[float], None]], Rotor]
 SdrFactory = Callable[[StationConfig], RtlSdr]
 
@@ -417,6 +438,18 @@ def _add_receive_command(subcommands: argparse._SubParsersAction) -> None:
             "slightly too tight makes a working receiver indistinguishable from "
             "a broken one. The gate is always measured and shown live either way "
             "- see --window - this only controls whether it silences audio."
+        ),
+    )
+    receive.add_argument(
+        "--audio-device",
+        type=str,
+        default=None,
+        metavar="DEVICE",
+        help=(
+            "Output device: a numeric index or a name substring, matching "
+            "sounddevice's own OutputStream(device=...). Defaults to the system's "
+            "configured default. To see what's available, run "
+            "'python -c \"import sounddevice as sd; print(sd.query_devices())\"'."
         ),
     )
     receive.add_argument(
@@ -923,7 +956,7 @@ def _run_receive(
         stream=stream,
         nbfm=nbfm,
         doppler=doppler,
-        audio=AudioOutput(nbfm.audio_rate_hz),
+        audio=AudioOutput(nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)),
         range_rate=(
             # With a window, ReadoutWidget ticks the loop on the GUI
             # thread as Chunk F proved; the session follows. Headless,

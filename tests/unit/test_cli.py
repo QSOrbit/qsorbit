@@ -17,6 +17,7 @@ import pytest
 from qsorbit import __version__
 from qsorbit.__main__ import (
     DEFAULT_TUNING_OFFSET_KHZ,
+    _parse_audio_device,
     _squelch_status_line,
     build_parser,
     main,
@@ -896,6 +897,11 @@ class TestSdrCapture:
         assert "sample_rate_hz" in capsys.readouterr().err
 
 
+# ---------------------------------------------------------------------------
+# receive
+# ---------------------------------------------------------------------------
+
+
 class TestSquelchStatusLine:
     """``_squelch_status_line`` in isolation - a pure helper, not the session."""
 
@@ -924,9 +930,25 @@ class TestSquelchStatusLine:
         assert "1.1 dB" in line
 
 
-# ---------------------------------------------------------------------------
-# receive
-# ---------------------------------------------------------------------------
+class TestParseAudioDevice:
+    """``_parse_audio_device`` in isolation."""
+
+    def test_unset_stays_none(self):
+        # None is sounddevice's own "system default" sentinel - the
+        # pre-existing behaviour with no --audio-device given at all.
+        assert _parse_audio_device(None) is None
+
+    def test_a_numeric_string_becomes_an_int_index(self):
+        assert _parse_audio_device("2") == 2
+        assert isinstance(_parse_audio_device("2"), int)
+
+    def test_a_name_substring_stays_a_string(self):
+        assert _parse_audio_device("USB Audio") == "USB Audio"
+
+    def test_a_negative_numeric_string_becomes_a_negative_int(self):
+        # sounddevice uses negative indices for some default-device
+        # sentinels of its own; this must not be mistaken for a name.
+        assert _parse_audio_device("-1") == -1
 
 
 class TestReceiveParser:
@@ -974,6 +996,28 @@ class TestReceiveParser:
         )
         assert args.window is False
         assert args.squelch is False
+
+    def test_the_audio_device_defaults_to_unset(self):
+        args = build_parser().parse_args(
+            ["receive", "--tle", "x", "--downlink", "145.95", "--gain", "40"]
+        )
+        assert args.audio_device is None
+
+    def test_the_audio_device_accepts_a_name_or_an_index(self):
+        args = build_parser().parse_args(
+            [
+                "receive",
+                "--tle",
+                "x",
+                "--downlink",
+                "145.95",
+                "--gain",
+                "40",
+                "--audio-device",
+                "USB Audio",
+            ]
+        )
+        assert args.audio_device == "USB Audio"
 
     def test_the_tuning_offset_defaults_to_the_project_convention(self):
         args = build_parser().parse_args(

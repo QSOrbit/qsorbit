@@ -108,6 +108,32 @@ class TestLifecycle:
         with pytest.raises(ValueError, match="queue_blocks"):
             AudioOutput(32_000.0, queue_blocks=0, stream_factory=fake_stream_factory)
 
+    def test_device_defaults_to_none(self):
+        # None is sounddevice's own "system default" sentinel - the
+        # pre-existing behaviour, which this parameter must not change
+        # for every caller that doesn't pass it.
+        output = AudioOutput(32_000.0, stream_factory=fake_stream_factory)
+        assert output.device is None
+
+    def test_device_is_forwarded_to_the_stream_factory(self):
+        output = AudioOutput(32_000.0, device=3, stream_factory=fake_stream_factory)
+
+        output.start()
+
+        assert output.device == 3
+        assert output._stream.kwargs["device"] == 3
+
+    def test_device_accepts_a_name_substring(self):
+        # sounddevice resolves a string device against query_devices() by
+        # substring match - this is the CLI's --audio-device path, and
+        # AudioOutput must pass the string through unchanged rather than
+        # assuming an integer index.
+        output = AudioOutput(32_000.0, device="USB Audio", stream_factory=fake_stream_factory)
+
+        output.start()
+
+        assert output._stream.kwargs["device"] == "USB Audio"
+
 
 class TestWriteAndPlayback:
     def test_a_written_block_is_played_back_exactly(self):
