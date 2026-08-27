@@ -558,6 +558,33 @@ class ReceiveSession:
             return None
         return self._squelch.is_open
 
+    @property
+    def live_tracked_frequency_hz(self) -> float | None:
+        """The tracked downlink's true RF frequency right now, or ``None``.
+
+        ``None`` until the tracking loop has supplied the Doppler
+        tracker its first sample - :attr:`~qsorbit.core.dsp.tuning.DopplerTracker.stats`
+        reports that as ``last_offset_hz is None``, and there is no
+        honest frequency to report before then. Once a sample has
+        landed, this is the tuner's own centre
+        (:attr:`~qsorbit.core.dsp.tuning.DopplerTracker.center_hz`, fixed
+        for the run) plus the most recent Doppler offset - the same two
+        numbers :meth:`_demod_loop` combines every block to pick the
+        demod's own ``channel_offset_hz``, so this property always
+        matches where the audio the user is hearing actually sits, not
+        a separately recomputed estimate.
+
+        Same live-polling contract as :attr:`live_quieting_db`: meant to
+        be read from a different thread than the one updating it, while
+        the session runs. :attr:`~qsorbit.core.dsp.tuning.DopplerTracker.stats`
+        already takes its own lock to hand back a consistent snapshot,
+        so no additional locking is needed here.
+        """
+        offset_hz = self._doppler.stats.last_offset_hz
+        if offset_hz is None:
+            return None
+        return self._doppler.center_hz + offset_hz
+
     # ------------------------------------------------------------------
     # Context manager
     # ------------------------------------------------------------------

@@ -1093,12 +1093,33 @@ def _show_instruments(
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
 
+    from qsorbit.core.dsp.spectrum import frequency_axis_hz
     from qsorbit.ui.instrument_window import InstrumentWindow
     from qsorbit.ui.quieting_widget import QuietingWidget
     from qsorbit.ui.readout_widget import ReadoutWidget
+    from qsorbit.ui.spectrum_line_widget import SpectrumLineWidget
+    from qsorbit.ui.waterfall_render import WaterfallScale
     from qsorbit.ui.waterfall_widget import WaterfallWidget
+    from qsorbit.ui.zoom_controller import ZoomController
+    from qsorbit.ui.zoom_controls_widget import ZoomControlsWidget
 
     app = QApplication.instance() or QApplication([])
+
+    # One ZoomController shared by the line-spectrum panel and the
+    # waterfall, so a mouse or spinbox gesture on either moves both -
+    # see that class's own docstring. `session` itself satisfies
+    # TrackedFrequencySource (its live_tracked_frequency_hz property),
+    # so the controller can poll it and drive the lock without either
+    # spectrum widget needing to know tracking exists.
+    axis = frequency_axis_hz(session.spectrum.config)
+    zoom_controller = ZoomController(
+        float(axis[0]), float(axis[-1]), tracked_frequency_source=session
+    )
+    # Shared too, so the line trace and the waterfall's colour ramp agree
+    # on what "loud" means - defaults are the same numbers either way,
+    # but a caller who ever customizes one should get both for free.
+    scale = WaterfallScale()
+
     window = InstrumentWindow(
         readout=(
             ReadoutWidget(loop, poll_interval_ms=int(args.interval * 1000))
@@ -1109,7 +1130,10 @@ def _show_instruments(
         # is now unconditional (see _squelch_status_line), so there is
         # always a live reading to show, muted or not.
         quieting=QuietingWidget(session),
-        waterfall=WaterfallWidget(session.spectrum),
+        zoom_controls=ZoomControlsWidget(zoom_controller),
+        spectrum_line=SpectrumLineWidget(session.spectrum, zoom=zoom_controller, scale=scale),
+        waterfall=WaterfallWidget(session.spectrum, zoom=zoom_controller, scale=scale),
+        zoom_controller=zoom_controller,
         title=f"QSOrbit - receiving {satellite.name}",
     )
     window.show()
