@@ -1,0 +1,16 @@
+# RS95S (QMR-KWT-2) -- Robot36 SSTV, also an FM repeater in testing.
+# NORAD id verified against AMSAT's TLE catalog and n2yo, 2026-08-28.
+norad_id = 67291
+name = "RS95S"
+also_known_as = ["QMR-KWT-2"]
+
+[alive]
+status = "active"
+as_of = 2026-08-25
+source = "bench-targets.md, checked against AMSAT Live OSCAR Satellite Status (https://www.amsat.org/status/)"
+
+[[transmitters]]
+downlink_hz = 436950000.0
+mode = "sstv"
+reliability = "scheduled"
+notes = "Robot36 SSTV; also an FM repeater in testing as of the last check -- if that graduates to routine service it likely wants its own transmitter entry with reliability = dependent."

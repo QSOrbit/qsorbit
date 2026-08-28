@@ -49,6 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The receiver runs without a rotor connected, and moves one only when asked. Following the Doppler needs the satellite's orbit and your location, not the antenna position, so a rotor that will not connect costs you the antenna pointing and nothing else.
 - Audio and the waterfall can now be watched at the same time, from one radio, which is what makes a pass diagnosable while it happens: a downlink is visible as a sloping trace even during the seconds when it is too weak to hear.
 - One radio's spectrum can now feed several panels at once, each with its own buffer. A display that falls behind drops its own frames and leaves every other one untouched, which is the same arrangement the raw sample stream has had since the receiver was built.
+- `qsorbit plan`, a new command that answers "what's worth pointing at tonight": it checks every TLE you have against a curated catalogue of satellite profiles, filters out anything that never clears your own horizon, and prints what each pass would actually sound like — frequency, mode, and how reliably that transmitter tends to run.
+- A curated catalogue of thirteen satellite profiles, shipped with the app: NORAD catalog number, transmitters (frequency, mode, and whether each is an unconditional beacon, a scheduled event, or dependent on another operator being active), and a current alive/inactive status with its source.
+- Pass prediction: acquisition of signal, time of closest approach, loss of signal, and the azimuth track between them, for a satellite over a given search window.
+- An optional horizon mask in station config (`[[horizon]]`) describing what your own site actually blocks, as a handful of measured azimuth/elevation points. Pass prediction filters out anything that never clears it. A station with no mask sees the plain geometric horizon, same as before this existed.
+- A per-pass naked-eye visibility flag, from a closed-form check of whether the satellite is sunlit and the sky is dark enough at the observer to see it.
 
 ### Changed
 

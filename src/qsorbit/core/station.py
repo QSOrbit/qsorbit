@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from qsorbit.core.horizon import HorizonMask, HorizonPoint
 from qsorbit.core.rotor import AzimuthWrap, RotorCapabilities
 from qsorbit.core.sdr import MAX_PPM
 from qsorbit.core.tracker import ObserverLocation
@@ -212,6 +213,12 @@ class StationConfig:
             valid — every station that predates Chunk I has one, and
             "uncalibrated" is this offset's honest identity value, not
             a placeholder standing in for a required measurement.
+        horizon: What this station's own site blocks. Defaults to an
+            empty :class:`~qsorbit.core.horizon.HorizonMask` (no
+            obstruction anywhere), so a config file with no
+            ``[[horizon]]`` entries — every station that predates
+            Chunk B — stays valid, and "nobody has measured this yet"
+            is the honest identity state rather than an omission.
         source_path: The file this was loaded from, or ``None`` if it
             was constructed directly. Carried so error messages and
             ``status`` output can say which config is in force — with
@@ -224,6 +231,7 @@ class StationConfig:
     capabilities: RotorCapabilities
     sdr: SdrSettings = field(default_factory=SdrSettings)
     alignment: AlignmentSettings = field(default_factory=AlignmentSettings)
+    horizon: HorizonMask = field(default_factory=HorizonMask)
     source_path: Path | None = None
 
 
@@ -316,7 +324,9 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
     except OSError as exc:
         raise ConfigError(f"Could not read {resolved}: {exc}") from exc
 
-    _reject_unknown_keys(data, {"observer", "rotor", "sdr"}, section="top level", path=resolved)
+    _reject_unknown_keys(
+        data, {"observer", "rotor", "sdr", "horizon"}, section="top level", path=resolved
+    )
 
     observer_table = _require_table(data, "observer", path=resolved)
     rotor_table = _require_table(data, "rotor", path=resolved)
@@ -369,6 +379,7 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
         section="sdr",
         path=resolved,
     )
+    horizon_points = _require_horizon_points(data, resolved)
 
     try:
         observer = ObserverLocation(
@@ -422,6 +433,7 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
                 alignment_table, "elevation_deg", "rotor.alignment", resolved, 0.0
             ),
         )
+        horizon = HorizonMask(points=horizon_points)
     except ValueError as exc:
         # The value objects do the real range checking; re-raised as a
         # ConfigError so the operator gets the file name alongside it.
@@ -433,6 +445,7 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
         capabilities=capabilities,
         sdr=sdr_settings,
         alignment=alignment_settings,
+        horizon=horizon,
         source_path=resolved,
     )
 
@@ -554,3 +567,36 @@ def _require_azimuth_wrap(table: dict[str, Any], path: Path) -> AzimuthWrap:
             "commanding 380 degrees means a full extra rotation against the cable, "
             "while on one with extended travel it means 20 degrees more travel."
         ) from exc
+
+
+def _require_horizon_points(data: dict[str, Any], path: Path) -> tuple[HorizonPoint, ...]:
+    """Parse the top-level ``[[horizon]]`` array of tables, if present.
+
+    Not a table-keyed section like the rest of this file's helpers
+    handle -- ``[[horizon]]`` is TOML's array-of-tables syntax, one
+    entry per measured point, so this walks ``data["horizon"]``
+    directly rather than going through :func:`_optional_table`.
+    """
+    raw = data.get("horizon", [])
+    if not isinstance(raw, list):
+        raise ConfigError(
+            f"'horizon' in {path} must be an array of tables ('[[horizon]]' entries), "
+            f"got {type(raw).__name__}."
+        )
+    points = []
+    for index, entry in enumerate(raw):
+        section = f"horizon[{index}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{section} in {path} must be a table, got {type(entry).__name__}.")
+        _reject_unknown_keys(
+            entry, {"azimuth_deg", "min_elevation_deg"}, section=section, path=path
+        )
+        azimuth_deg = _require_float(entry, "azimuth_deg", section, path)
+        min_elevation_deg = _require_float(entry, "min_elevation_deg", section, path)
+        try:
+            points.append(
+                HorizonPoint(azimuth_deg=azimuth_deg, min_elevation_deg=min_elevation_deg)
+            )
+        except ValueError as exc:
+            raise ConfigError(f"Invalid value in {section} of {path}: {exc}") from exc
+    return tuple(points)

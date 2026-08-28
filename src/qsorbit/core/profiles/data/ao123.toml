@@ -1,0 +1,18 @@
+# AO-123 (Fox-1E / RadFxSat-2, AMSAT-OSCAR 109) -- NORAD id verified
+# directly against n2yo/AMSAT-UK after an initial lookup returned the
+# wrong number; 47311 is the confirmed one, 2026-08-28.
+norad_id = 47311
+name = "AO-123"
+also_known_as = ["Fox-1E", "RadFxSat-2", "AMSAT-OSCAR 109"]
+
+[alive]
+status = "active"
+as_of = 2026-08-25
+source = "bench-targets.md: 'Reported active this month', checked against AMSAT Live OSCAR Satellite Status (https://www.amsat.org/status/)"
+
+[[transmitters]]
+downlink_hz = 435400000.0
+uplink_hz = 145850000.0
+mode = "fm"
+reliability = "dependent"
+notes = "FM voice repeater, 67 Hz access tone."

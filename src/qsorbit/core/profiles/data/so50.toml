@@ -1,0 +1,19 @@
+# SO-50 (SaudiSat-1C) -- FM voice repeater that needs arming with a
+# tone burst before it will repeat anything; QSOrbit is receive-only
+# and cannot arm it. NORAD id verified against AMSAT's own TLE
+# catalog, 2026-08-28.
+norad_id = 27607
+name = "SO-50"
+also_known_as = ["SaudiSat-1C", "Saudi-OSCAR 50"]
+
+[alive]
+status = "active"
+as_of = 2026-08-25
+source = "bench-targets.md, checked against AMSAT Live OSCAR Satellite Status (https://www.amsat.org/status/)"
+
+[[transmitters]]
+downlink_hz = 436795000.0
+uplink_hz = 145850000.0
+mode = "fm"
+reliability = "dependent"
+notes = "FM voice repeater, 74.4 Hz tone burst arms a 10-minute timer on the uplink. QSOrbit is receive-only and cannot arm it -- a pass with nobody else arming and working it is genuinely, correctly silent."

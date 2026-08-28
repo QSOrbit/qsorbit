@@ -217,3 +217,57 @@ device_index = 0
 # dongle is out by single or low double digits. Leave it at 0 until you
 # have measured yours against a known-accurate signal.
 ppm = 0
+
+
+# ---------------------------------------------------------------------
+# What your own site blocks
+# ---------------------------------------------------------------------
+#
+# This whole section is optional. No [[horizon]] entries at all means
+# no obstruction anywhere -- an honest description of a station that
+# hasn't measured its horizon yet, not a placeholder standing in for a
+# required survey. Every config file written before Chunk B lacks it.
+#
+# Each [[horizon]] entry is one measured point: a compass bearing and
+# the lowest elevation usable there. Pass prediction (`qsorbit plan`)
+# reads this to filter out passes that never clear your treeline, and
+# live pointing can use it to say "we're blocked right now" -- the same
+# data, read by two different layers, which is why it lives here rather
+# than belonging to either one.
+#
+# Between two points the mask interpolates linearly, and past the last
+# point it wraps back around to the first, since azimuth is circular.
+# That means a real obstruction needs to be bracketed by 0.0 points on
+# both sides, or the interpolation draws a false slope across open sky
+# between it and the next real point. The two obstructions below are
+# real measurements from this project's own station (Session 22) --
+# replace them with your own survey, or delete the section entirely
+# until you have one.
+#
+#[[horizon]]
+#azimuth_deg = 105.0
+#min_elevation_deg = 0.0
+#
+#[[horizon]]
+#azimuth_deg = 111.0
+#min_elevation_deg = 18.0
+#
+#[[horizon]]
+#azimuth_deg = 117.0
+#min_elevation_deg = 0.0
+#
+#[[horizon]]
+#azimuth_deg = 188.0
+#min_elevation_deg = 0.0
+#
+#[[horizon]]
+#azimuth_deg = 193.0
+#min_elevation_deg = 20.0
+#
+#[[horizon]]
+#azimuth_deg = 199.0
+#min_elevation_deg = 23.0
+#
+#[[horizon]]
+#azimuth_deg = 204.0
+#min_elevation_deg = 0.0

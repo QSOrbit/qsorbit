@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from qsorbit.core.horizon import HorizonMask, HorizonPoint
 from qsorbit.core.rotor import AzimuthWrap
 from qsorbit.core.station import (
     AlignmentSettings,
@@ -550,3 +551,101 @@ class TestAlignmentSettings:
 
         assert settings.azimuth_deg == 15.0
         assert settings.elevation_deg == -2.0
+
+
+class TestHorizonSection:
+    """The top-level [[horizon]] array of tables, optional like [sdr]."""
+
+    def test_absent_section_gives_an_empty_mask(self, tmp_path):
+        # Every config file written before Chunk B lacks this section,
+        # and an empty mask (no obstruction anywhere) is the honest
+        # identity value - refusing to load one would break every
+        # existing station, the same reasoning as [rotor.alignment].
+        config = load_station_config(write_config(tmp_path))
+
+        assert config.horizon == HorizonMask()
+        assert config.horizon.min_elevation_at(0.0) == 0.0
+
+    def test_reads_points_in_order(self, tmp_path):
+        text = (
+            VALID_CONFIG
+            + "\n[[horizon]]\nazimuth_deg = 105.0\nmin_elevation_deg = 0.0\n"
+            + "\n[[horizon]]\nazimuth_deg = 111.0\nmin_elevation_deg = 18.0\n"
+            + "\n[[horizon]]\nazimuth_deg = 117.0\nmin_elevation_deg = 0.0\n"
+        )
+        config = load_station_config(write_config(tmp_path, text))
+
+        assert config.horizon == HorizonMask(
+            points=(
+                HorizonPoint(105.0, 0.0),
+                HorizonPoint(111.0, 18.0),
+                HorizonPoint(117.0, 0.0),
+            )
+        )
+        assert config.horizon.min_elevation_at(111.0) == 18.0
+
+    def test_no_horizon_entries_at_all_is_the_same_as_absent(self, tmp_path):
+        config = load_station_config(write_config(tmp_path, VALID_CONFIG))
+
+        assert config.horizon == HorizonMask()
+
+    def test_unknown_key_is_an_error(self, tmp_path):
+        text = VALID_CONFIG + "\n[[horizon]]\nazimuth_deg = 1.0\nmin_elevation = 2.0\n"
+        path = write_config(tmp_path, text)
+
+        with pytest.raises(ConfigError, match="min_elevation"):
+            load_station_config(path)
+
+    def test_unknown_key_names_the_indexed_section(self, tmp_path):
+        text = VALID_CONFIG + "\n[[horizon]]\nazimuth_deg = 1.0\nnope = 2.0\n"
+        path = write_config(tmp_path, text)
+
+        with pytest.raises(ConfigError, match=r"horizon\[0\]"):
+            load_station_config(path)
+
+    def test_missing_key_is_an_error(self, tmp_path):
+        text = VALID_CONFIG + "\n[[horizon]]\nazimuth_deg = 1.0\n"
+        path = write_config(tmp_path, text)
+
+        with pytest.raises(ConfigError, match="min_elevation_deg"):
+            load_station_config(path)
+
+    def test_out_of_range_value_is_an_error(self, tmp_path):
+        # HorizonPoint's own validation, surfaced as a ConfigError with
+        # the file name attached - same pattern as every other value
+        # object this loader builds.
+        text = VALID_CONFIG + "\n[[horizon]]\nazimuth_deg = 400.0\nmin_elevation_deg = 0.0\n"
+        path = write_config(tmp_path, text)
+
+        with pytest.raises(ConfigError, match="azimuth_deg"):
+            load_station_config(path)
+
+    def test_unsorted_points_are_an_error(self, tmp_path):
+        # HorizonMask itself rejects an unsorted list rather than
+        # silently sorting it - see its own docstring for why.
+        text = (
+            VALID_CONFIG
+            + "\n[[horizon]]\nazimuth_deg = 200.0\nmin_elevation_deg = 10.0\n"
+            + "\n[[horizon]]\nazimuth_deg = 100.0\nmin_elevation_deg = 5.0\n"
+        )
+        path = write_config(tmp_path, text)
+
+        with pytest.raises(ConfigError, match="sorted"):
+            load_station_config(path)
+
+    def test_horizon_entry_that_is_not_a_table_is_an_error(self, tmp_path):
+        # A bare top-level key has to precede every [section] header in
+        # TOML, so this - like test_horizon_that_is_not_an_array_is_an_error
+        # below - prepends rather than appends.
+        text = 'horizon = ["not", "tables"]\n' + VALID_CONFIG
+        path = write_config(tmp_path, text)
+
+        with pytest.raises(ConfigError, match=r"horizon\[0\] in .* must be a table"):
+            load_station_config(path)
+
+    def test_horizon_that_is_not_an_array_is_an_error(self, tmp_path):
+        text = "[horizon]\nazimuth_deg = 1.0\n" + VALID_CONFIG
+        path = write_config(tmp_path, text)
+
+        with pytest.raises(ConfigError, match=r"'horizon' in .* must be an array"):
+            load_station_config(path)

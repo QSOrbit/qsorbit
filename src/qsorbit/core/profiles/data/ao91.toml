@@ -1,0 +1,20 @@
+# AO-91 (Fox-1B / RadFxSat) -- note the direction, confirmed against
+# AMSAT directly rather than a third-party page after Session 22's
+# warning about inverted third-party frequency listings: UHF up, VHF
+# down. NORAD id verified against AMSAT's own TLE catalog and n2yo,
+# 2026-08-28.
+norad_id = 43017
+name = "AO-91"
+also_known_as = ["Fox-1B", "RadFxSat"]
+
+[alive]
+status = "active"
+as_of = 2026-08-25
+source = "bench-targets.md, checked against AMSAT Live OSCAR Satellite Status (https://www.amsat.org/status/)"
+
+[[transmitters]]
+downlink_hz = 145960000.0
+uplink_hz = 435250000.0
+mode = "fm"
+reliability = "dependent"
+notes = "FM voice repeater. Direction is UHF up / VHF down -- the opposite of most repeaters in this catalogue, and a third-party page Session 22 found had exactly this satellite's frequencies inverted. Do not attempt while in eclipse (battery)."

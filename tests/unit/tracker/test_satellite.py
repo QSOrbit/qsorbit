@@ -118,6 +118,18 @@ class TestEpoch:
         assert sat.epoch.tzinfo is not None
 
 
+class TestNoradId:
+    def test_matches_the_catalog_number_in_the_tle_lines(self):
+        # "1 00005U ..." / "2 00005 ..." -- catalog number 00005, the
+        # same TEME EXAMPLE satellite used throughout this file.
+        sat = Satellite.from_tle(_TEME_EXAMPLE_TLE)
+        assert sat.norad_id == 5
+
+    def test_is_an_int_not_a_zero_padded_string(self):
+        sat = Satellite.from_tle(_TEME_EXAMPLE_TLE)
+        assert isinstance(sat.norad_id, int)
+
+
 # ---------------------------------------------------------------------------
 # Propagation correctness — checked against external truth
 # ---------------------------------------------------------------------------

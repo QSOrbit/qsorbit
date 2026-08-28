@@ -103,6 +103,19 @@ class Satellite:
         return self._sat.name
 
     @property
+    def norad_id(self) -> int:
+        """The satellite's NORAD catalog number, taken from the TLE's line 1/2.
+
+        The stable key for matching a loaded TLE against other data
+        that identifies satellites the same way -- curated profiles
+        (:mod:`qsorbit.core.profiles`) chief among them. Unlike
+        :attr:`name`, which is free text and can differ between TLE
+        sources, the catalog number is assigned once by Space-Track and
+        never reused.
+        """
+        return self._sat.model.satnum
+
+    @property
     def epoch(self) -> datetime:
         """The TLE's epoch — the moment its elements are most accurate — as UTC.
 

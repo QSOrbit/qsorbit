@@ -1,0 +1,34 @@
+# ISS (ZARYA) -- three very different transmitters on the same
+# station: a packet digipeater that's busy most of the day, a voice
+# repeater whose availability varies with crew/ARISS priorities, and
+# an SSTV payload that only runs for announced events. NORAD id is
+# common knowledge, additionally verified against AMSAT's own TLE
+# catalog, 2026-08-28.
+norad_id = 25544
+name = "ISS"
+also_known_as = ["ZARYA", "International Space Station"]
+
+[alive]
+status = "active"
+as_of = 2026-08-25
+source = "bench-targets.md; the ISS is crewed and its amateur radio payloads are in routine use"
+
+[[transmitters]]
+downlink_hz = 145825000.0
+mode = "afsk1200"
+baud = 1200.0
+reliability = "dependent"
+notes = "Packet digipeater. The best FM bet in this catalogue: 50-100 stations a day use it, so traffic does not depend on a single voice QSO landing inside a ten-minute pass. Sounds like classic 1200-baud AFSK bursts."
+
+[[transmitters]]
+downlink_hz = 437800000.0
+uplink_hz = 145990000.0
+mode = "fm"
+reliability = "dependent"
+notes = "FM voice repeater, 67 Hz access tone on the uplink. Busiest voice repeater there is when it's enabled -- but availability varies, and ARISS events and other operations take priority over general use."
+
+[[transmitters]]
+downlink_hz = 145800000.0
+mode = "sstv"
+reliability = "scheduled"
+notes = "SSTV payload, PD120. Announced events only -- check for a scheduled activity before expecting anything here."
