@@ -1043,12 +1043,11 @@ def _run_receive(
         doppler=doppler,
         audio=AudioOutput(nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)),
         range_rate=(
-            # With a window, ReadoutWidget ticks the loop on the GUI
-            # thread as Chunk F proved; the session follows. Headless,
-            # nobody else is ticking, so the session drives.
-            LoopRangeRate(loop, drive=not args.window)
-            if loop is not None
-            else TargetRangeRate(satellite, config.observer)
+            # The session's tracking thread ticks the loop in every
+            # configuration now. It used to hand the tick to
+            # ReadoutWidget whenever a window was open, which put a
+            # blocking serial read on the GUI thread once a second.
+            LoopRangeRate(loop) if loop is not None else TargetRangeRate(satellite, config.observer)
         ),
         squelch=squelch,
         # args.squelch is "let the gate's decision reach the speaker" -
@@ -1165,10 +1164,11 @@ def _show_instruments(
     ``CDLL()`` — a dependency that can fail merely by being imported
     belongs inside the function that actually needs it.
 
-    The readout is present only when there is a loop to drive, and when
-    it is present **it owns the tick** — which is why the session was
-    built with ``drive=False`` in that case. Two things ticking one loop
-    would double the rotor's serial traffic.
+    The readout is present only when there is a loop to show. It
+    **follows** that loop rather than ticking it: the session's tracking
+    thread owns the tick, and the readout is handed
+    ``session.tracking_error`` so a rotor fault reaches the screen
+    instead of freezing the last good numbers there.
 
     **Ctrl-C is handled explicitly** via :func:`_quit_on_sigint` wrapping
     ``app.exec()`` below — see that function's own docstring for why
@@ -1213,7 +1213,11 @@ def _show_instruments(
 
     window = InstrumentWindow(
         readout=(
-            ReadoutWidget(loop, poll_interval_ms=int(args.interval * 1000))
+            ReadoutWidget(
+                loop,
+                fault=session.tracking_error,
+                poll_interval_ms=int(args.interval * 1000),
+            )
             if loop is not None
             else None
         ),

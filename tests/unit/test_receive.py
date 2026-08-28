@@ -33,6 +33,7 @@ than one it waits for.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
@@ -45,6 +46,7 @@ from qsorbit.core.dsp.spectrum_stream import SpectrumStream
 from qsorbit.core.dsp.squelch import NoiseSquelch
 from qsorbit.core.dsp.tuning import DopplerTracker
 from qsorbit.core.geometry import AzEl
+from qsorbit.core.pointing import TravelGuardError
 from qsorbit.core.receive import (
     AUDIO_SUBSCRIBER,
     WATERFALL_SUBSCRIBER,
@@ -372,50 +374,104 @@ def _sample_at(when: datetime, range_rate_km_s: float):
 
 
 class TestLoopRangeRate:
-    def test_driving_ticks_the_loop(self):
+    def test_it_ticks_the_loop_on_every_sample(self):
         loop = FakeLoop()
-        source = LoopRangeRate(loop, drive=True)
+        source = LoopRangeRate(loop)
 
         source.sample()
         source.sample()
 
         assert loop.ticks == 2
 
-    def test_following_never_ticks_the_loop(self):
-        # Two things ticking one loop would double the rotor's serial
-        # traffic and interleave two streams of commands. With a window
-        # open, ReadoutWidget owns the tick.
-        loop = FakeLoop()
-        source = LoopRangeRate(loop, drive=False)
-        source.prime()
-        loop.publish(AN_INSTANT + timedelta(seconds=5), -2.0)
+    def test_it_ticks_in_every_configuration_now(self):
+        """The following mode is gone, and its absence is the fix.
 
-        source.sample()
-        source.sample()
+        A windowed run used to build this with ``drive=False`` and let
+        ReadoutWidget tick from a QTimer instead, which put a serial
+        write, an RS-485 turnaround sleep and a blocking read on the GUI
+        thread once a second. There is no longer a way to construct this
+        class that does not tick.
+        """
+        import inspect
 
-        assert loop.ticks == 1  # the priming tick, and only that
+        parameters = inspect.signature(LoopRangeRate).parameters
 
-    def test_following_reports_a_sample_once_and_then_nothing_until_it_moves(self):
-        loop = FakeLoop()
-        source = LoopRangeRate(loop, drive=False)
-        source.prime()
-        loop.publish(AN_INSTANT + timedelta(seconds=5), -2.0)
+        assert "drive" not in parameters
 
-        first = source.sample()
-        second = source.sample()
-
-        assert first == (AN_INSTANT + timedelta(seconds=5), -2.0)
-        assert second is None
-
-    def test_priming_ticks_even_when_following(self):
-        # Priming has to produce a sample and, before the window is up,
-        # there is nobody else to produce one. The alternative is
-        # starting a pass with no correction for the first second.
+    def test_priming_ticks_once_so_a_pass_starts_corrected(self):
+        # Priming has to produce a sample: the alternative is starting
+        # the radio with no correction at all for the first second.
         loop = FakeLoop()
 
-        LoopRangeRate(loop, drive=False).prime()
+        LoopRangeRate(loop).prime()
 
         assert loop.ticks == 1
+
+
+class TestTrackingError:
+    def test_it_is_none_until_something_goes_wrong(self):
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ])
+        source = ScriptedRangeRate([(AN_INSTANT, -3.0)])
+        session, _ = a_session(device, source)
+
+        assert session.tracking_error() is None
+
+    def test_a_tracking_fault_is_recorded_where_a_readout_can_find_it(self):
+        """The readout follows the tracking thread, so it must be told.
+
+        Before Chunk A PR2 a failing tick raised on the GUI thread and
+        the readout caught it directly. Now it happens on the tracking
+        thread, and without this the panel would keep showing the last
+        plausible-looking numbers with a dead rotor underneath -- which
+        is worse than showing nothing, because it looks fine.
+        """
+
+        class ExplodingRangeRate:
+            def prime(self):
+                return AN_INSTANT, -3.0
+
+            def sample(self):
+                raise TravelGuardError("elevation axis reads -8.2 degrees")
+
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ])
+        session, _ = a_session(
+            device, ExplodingRangeRate(), tracking_interval_s=0.01, join_timeout_s=2.0
+        )
+        session.start()
+        deadline = time.monotonic() + 2.0
+        while session.tracking_error() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        error = session.tracking_error()
+        # stop() still re-raises it as well: the fault is recorded twice
+        # on purpose, so a run cannot end silently *and* the panel can
+        # say what happened while the run is still going.
+        with pytest.raises(TravelGuardError):
+            session.stop()
+
+        assert isinstance(error, TravelGuardError)
+        assert "elevation axis" in str(error)
+
+    def test_a_demodulation_fault_is_not_reported_as_a_tracking_fault(self):
+        """Different faults, different consequences, different readers.
+
+        A dead demodulator stops the audio and says so through stop().
+        It says nothing whatever about the rotor, and a readout that
+        greyed itself out on one would be lying about the antenna.
+        """
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ])
+        source = ScriptedRangeRate([(AN_INSTANT, -3.0)])
+        session, _ = a_session(device, source, join_timeout_s=2.0)
+        session.start()
+        # Kill the radio, leave the rotor alone.
+        device.done = True
+        device.allow.set()
+        session.wait(2.0)
+
+        with pytest.raises(DeviceError):
+            session.stop()
+
+        assert session.tracking_error() is None
 
 
 class TestSessionWiring:
