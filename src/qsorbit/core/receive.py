@@ -308,8 +308,11 @@ class ReceiveSession:
     Args:
         stream: An :class:`~qsorbit.core.sdr.stream.IqStream` over a
             configured device. **Must not have been started or
-            subscribed to** — this session subscribes twice, and
-            subscriptions have to exist before the reader does.
+            subscribed to** — this session subscribes once or
+            twice, and subscriptions have to exist before the reader
+            does. The spectrum consumer is subscribed only when a
+            ``spectrum_factory`` is given, so a headless run never offers
+            blocks to a consumer that will not drain them.
         nbfm: Demodulation settings. ``channel_offset_hz`` is replaced
             per block with the Doppler-corrected offset, so whatever it
             holds here is ignored; everything else is used as given.
@@ -374,12 +377,20 @@ class ReceiveSession:
         # must exist before the reader thread does and a caller is
         # entitled to hold the waterfall subscription before starting.
         self._audio_blocks = stream.subscribe(AUDIO_SUBSCRIBER)
-        self._waterfall_blocks = stream.subscribe(WATERFALL_SUBSCRIBER)
-        self._spectrum = (
-            spectrum_factory(self._waterfall_blocks.blocks())
-            if spectrum_factory is not None
-            else None
-        )
+        # The waterfall subscription is made only when something will
+        # actually drain it. It used to be unconditional, so a headless
+        # run offered every block to a consumer that did not exist and
+        # the bounded deque evicted them in turn: a 60-second headless
+        # `receive` reported "453 block(s) dropped (118,751,232 bytes)"
+        # with nothing whatever wrong (Session 24). Harmless, and it
+        # reads as catastrophic data loss -- and this project's own rule
+        # is that "off" and "broken" must never look the same.
+        if spectrum_factory is None:
+            self._waterfall_blocks = None
+            self._spectrum = None
+        else:
+            self._waterfall_blocks = stream.subscribe(WATERFALL_SUBSCRIBER)
+            self._spectrum = spectrum_factory(self._waterfall_blocks.blocks())
 
         self._stop = threading.Event()
         self._demod_thread: threading.Thread | None = None

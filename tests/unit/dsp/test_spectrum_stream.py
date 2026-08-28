@@ -15,9 +15,10 @@ from datetime import UTC, datetime, timedelta
 import numpy as np
 import pytest
 
-from qsorbit.core.dsp.iq import IQ_ZERO_OFFSET
-from qsorbit.core.dsp.spectrum import SpectrumConfig, frequency_axis_hz
+from qsorbit.core.dsp.iq import IQ_ZERO_OFFSET, unpack_uint8_iq
+from qsorbit.core.dsp.spectrum import SpectrumConfig, frequency_axis_hz, power_spectrum_db
 from qsorbit.core.dsp.spectrum_stream import (
+    BYTES_PER_SAMPLE,
     DEFAULT_FRAME_RATE_HZ,
     SpectrumFrame,
     SpectrumStream,
@@ -204,7 +205,9 @@ def test_low_frame_rate_does_not_grow_the_carry_buffer():
     stream = SpectrumStream([silent_block(100)] * 20, config, frame_rate_hz=100.0)
     assert stream.hop == 640  # much longer than a 100-sample block
     drain(stream)
-    assert stream._carry.size < 640
+    # Counted in bytes now that the carry is raw rather than unpacked --
+    # the point of the assertion is unchanged, only its units.
+    assert len(stream._carry) // BYTES_PER_SAMPLE < 640
 
 
 # ----------------------------------------------------------------------
@@ -359,7 +362,17 @@ def test_frames_from_before_a_failure_are_not_discarded():
         stream.latest()
 
 
-def test_the_error_is_raised_once_and_not_replayed():
+def test_the_error_keeps_being_raised_rather_than_clearing():
+    """Changed contract, and deliberately: the fan-out made it necessary.
+
+    The single-consumer version cleared the error once raised, so a
+    second drain saw an empty list. With several consumers that means
+    whichever one drains first gets the exception and every other one
+    watches its frames simply stop -- a silent freeze with the
+    explanation already consumed by somebody else. ``IqStream`` made
+    exactly this change when it grew its own fan-out in Chunk H.
+    """
+
     def exploding_source():
         raise OSError("boom")
         yield  # pragma: no cover - unreachable, makes this a generator
@@ -369,7 +382,203 @@ def test_the_error_is_raised_once_and_not_replayed():
     stream._thread.join(5.0)
     with pytest.raises(OSError):
         stream.latest()
-    assert stream.latest() == []
+    with pytest.raises(OSError):
+        stream.latest()
+
+
+def test_every_consumer_is_told_why_the_frames_stopped():
+    """The reason the error is no longer cleared, asserted directly."""
+
+    def exploding_source():
+        raise OSError("device went away")
+        yield  # pragma: no cover - unreachable, makes this a generator
+
+    stream = SpectrumStream(exploding_source(), make_config())
+    waterfall = stream.subscribe("waterfall")
+    trace = stream.subscribe("spectrum-line")
+    stream.start()
+    stream._thread.join(5.0)
+    with pytest.raises(OSError, match="device went away"):
+        waterfall.latest()
+    with pytest.raises(OSError, match="device went away"):
+        trace.latest()
+
+
+# ----------------------------------------------------------------------
+# Fan-out
+# ----------------------------------------------------------------------
+
+
+def run_to_completion(stream: SpectrumStream, *, timeout_s: float = 5.0) -> None:
+    """Start a stream over a finite source and wait for the worker to end."""
+    stream.start()
+    thread = stream._thread
+    assert thread is not None
+    thread.join(timeout_s)
+    assert not thread.is_alive(), "worker did not finish within the timeout"
+
+
+def test_two_consumers_each_receive_every_frame():
+    """Bench verification #11, as a test that would have caught it.
+
+    Two spectrum panels alternated on real hardware because both drained
+    one shared buffer and whichever timer fired first took the batch.
+    Neither widget was wrong, so no widget test could have found it --
+    only one asserting that two consumers of one stream both get
+    everything.
+    """
+    config = make_config()
+    stream = SpectrumStream([silent_block(FFT_SIZE)] * 5, config, frame_rate_hz=1_000.0)
+    waterfall = stream.subscribe("waterfall")
+    trace = stream.subscribe("spectrum-line")
+    run_to_completion(stream)
+
+    from_waterfall = waterfall.latest()
+    from_trace = trace.latest()
+    assert len(from_waterfall) == 5
+    assert len(from_trace) == 5
+    # The same frame objects, not copies: one immutable frame is offered
+    # to every consumer, so a five-panel Custom tab costs one FFT.
+    assert [id(f) for f in from_waterfall] == [id(f) for f in from_trace]
+
+
+def test_a_slow_consumer_drops_only_its_own_frames():
+    """The whole point of per-consumer buffers, stated as an assertion."""
+    config = make_config()
+    stream = SpectrumStream([silent_block(FFT_SIZE)] * 10, config, frame_rate_hz=1_000.0)
+    healthy = stream.subscribe("healthy")
+    stalled = stream.subscribe("stalled")
+    # The stalled one never drains; give it a buffer far too small.
+    stalled._queue_frames = 2
+    stalled._frames = type(stalled._frames)(maxlen=2)
+    run_to_completion(stream)
+
+    assert len(healthy.latest()) == 10
+    assert healthy.stats.frames_dropped == 0
+    assert stalled.stats.frames_dropped == 8
+
+
+def test_a_late_subscriber_joins_without_disturbing_anyone():
+    """Allowed here, unlike IqStream, because a display feed has no gap."""
+    config = make_config()
+    stream = SpectrumStream([silent_block(FFT_SIZE)] * 3, config, frame_rate_hz=1_000.0)
+    early = stream.subscribe("early")
+    run_to_completion(stream)
+    late = stream.subscribe("late")
+
+    assert len(early.latest()) == 3
+    # Nothing was produced after it joined, and that is reported as
+    # having been offered nothing -- not as loss.
+    assert late.latest() == []
+    assert late.stats.frames_offered == 0
+    assert late.stats.frames_dropped == 0
+
+
+def test_latest_refuses_once_something_has_subscribed_explicitly():
+    """The #11 mistake, made loud instead of silent."""
+    stream = SpectrumStream([silent_block(FFT_SIZE)], make_config())
+    stream.subscribe("waterfall")
+    with pytest.raises(RuntimeError, match="subscribe"):
+        stream.latest()
+
+
+def test_a_subscription_needs_a_name_and_a_unique_one():
+    stream = SpectrumStream([], make_config())
+    with pytest.raises(ValueError, match="needs a name"):
+        stream.subscribe("")
+    stream.subscribe("waterfall")
+    with pytest.raises(ValueError, match="already exists"):
+        stream.subscribe("waterfall")
+
+
+def test_a_subscription_reports_the_streams_framing():
+    """It satisfies the widgets' FrameSource protocol on its own."""
+    config = make_config()
+    stream = SpectrumStream([], config)
+    assert stream.subscribe("waterfall").config is config
+
+
+def test_stats_name_each_consumer_and_report_the_worst_drop():
+    config = make_config()
+    stream = SpectrumStream([silent_block(FFT_SIZE)] * 10, config, frame_rate_hz=1_000.0)
+    healthy = stream.subscribe("healthy")
+    stalled = stream.subscribe("stalled")
+    stalled._queue_frames = 2
+    stalled._frames = type(stalled._frames)(maxlen=2)
+    run_to_completion(stream)
+    healthy.latest()
+    stats = stream.stop()
+
+    assert [s.name for s in stats.subscribers] == ["healthy", "stalled"]
+    # The worst consumer, not the sum: summing would report the stream as
+    # twice as lossy as either consumer actually experienced.
+    assert stats.frames_dropped == 8
+    text = stats.describe()
+    assert "consumer healthy:" in text
+    assert "consumer stalled:" in text
+
+
+def test_one_consumer_is_not_listed_separately():
+    """A report that says the same number twice invites a wrong hunt."""
+    config = make_config()
+    stream = SpectrumStream([silent_block(FFT_SIZE)] * 2, config, frame_rate_hz=1_000.0)
+    run_to_completion(stream)
+    # Matched with the colon: the buffer line above already ends in the
+    # words "consumer behind", which a bare substring would catch.
+    assert "consumer default:" not in stream.stop().describe()
+
+
+def test_the_source_label_distinguishes_two_streams():
+    """Idle until Chunk E, when a second dongle means a second stream."""
+    config = make_config()
+    assert SpectrumStream([], config).source == "sdr"
+    branch_b = SpectrumStream([], config, source="sdr1")
+    assert branch_b.source == "sdr1"
+    assert "sdr1" in branch_b.stats.describe()
+
+
+# ----------------------------------------------------------------------
+# Unpacking only what a frame needs
+# ----------------------------------------------------------------------
+
+
+def test_byte_range_unpacking_gives_the_same_frames_as_whole_block():
+    """The optimisation must not move a single dB.
+
+    Session 19 measured whole-block unpacking at 2.24% of a core against
+    the FFTs' 0.24%, and the fix is to convert only the bytes each frame
+    needs. That is a hot-path rewrite of index arithmetic, so the thing
+    worth asserting is not that it is faster but that it is identical:
+    computed here against the old whole-block path, done by hand.
+    """
+    config = make_config()
+    block = tone_block(FFT_SIZE * 4, freq_hz=8_000.0)
+    stream = SpectrumStream([block], config, frame_rate_hz=1_000.0)
+    frames = drain(stream)
+
+    whole = unpack_uint8_iq(block)
+    hop = stream.hop
+    expected = [
+        power_spectrum_db(whole[start : start + FFT_SIZE], config)
+        for start in range(0, len(whole) - FFT_SIZE + 1, hop)
+    ]
+    assert len(frames) == len(expected)
+    for frame, want in zip(frames, expected, strict=True):
+        np.testing.assert_array_equal(frame.power_db, want)
+
+
+def test_a_truncated_iq_pair_is_still_refused():
+    """The whole-block unpack used to catch this for free.
+
+    Slicing byte ranges would floor an odd length and quietly frame
+    whatever came next, so the guarantee is kept explicitly rather than
+    lost inside an optimisation.
+    """
+    stream = SpectrumStream([silent_block(FFT_SIZE)[:-1]], make_config())
+    stream.start()
+    stream._thread.join(5.0)
+    with pytest.raises(ValueError, match="odd length"):
+        stream.latest()
 
 
 # ----------------------------------------------------------------------

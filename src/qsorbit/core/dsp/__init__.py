@@ -48,6 +48,8 @@ from qsorbit.core.dsp.spectrum_stream import (
     SpectrumFrame,
     SpectrumStream,
     SpectrumStreamStats,
+    SpectrumSubscriberStats,
+    SpectrumSubscription,
     hop_for_frame_rate,
 )
 from qsorbit.core.dsp.squelch import (
@@ -99,6 +101,8 @@ __all__ = [
     "SpectrumFrame",
     "SpectrumStream",
     "SpectrumStreamStats",
+    "SpectrumSubscriberStats",
+    "SpectrumSubscription",
     "SquelchStats",
     "WbfmConfig",
     "decimate",

@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Doppler correction now follows a live pass rather than a recording. The frequency the downlink is expected at is recomputed for every block of samples from the satellite's motion, so a signal that drifts by several kilohertz over a ten-minute pass stays centred in the receiver instead of sliding out of the channel.
 - The receiver runs without a rotor connected, and moves one only when asked. Following the Doppler needs the satellite's orbit and your location, not the antenna position, so a rotor that will not connect costs you the antenna pointing and nothing else.
 - Audio and the waterfall can now be watched at the same time, from one radio, which is what makes a pass diagnosable while it happens: a downlink is visible as a sloping trace even during the seconds when it is too weak to hear.
+- One radio's spectrum can now feed several panels at once, each with its own buffer. A display that falls behind drops its own frames and leaves every other one untouched, which is the same arrangement the raw sample stream has had since the receiver was built.
 
 ### Changed
 
@@ -59,6 +60,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Asking a stream for its blocks twice is now refused rather than quietly answered. It used to appear to work, with each caller receiving roughly every other block and neither having any way to notice.
 - Buffer drops are now reported per consumer as well as for the stream as a whole, so a stalled waterfall can be told apart from a stalled audio path instead of both being one number.
 - Doppler correction is now safe to share between the part of the application that tracks the satellite and the part that demodulates it, which are no longer the same thread.
+- The spectrum pipeline converts only the samples each frame actually needs, rather than converting a whole block of them and discarding about 98% of the result. It was costing roughly 2.3% of a processor core to feed work that costs 0.2%, and that conversion sits on the same path the radio is read on, where time spent turns directly into samples lost.
+
+### Fixed
+
+- The waterfall and the spectrum line trace no longer take frames from each other. With both panels open, one would update while the other sat frozen, and they alternated: each was emptying a buffer they shared, so whichever asked first got everything that had arrived. Each panel now has its own feed and both show every frame.
+- Receiving without a window no longer reports a large number of dropped blocks. Nothing was being lost — the spectrum consumer was created whether or not anything would ever look at it, and blocks queued for it were discarded unread — but a 60-second run announcing 453 dropped blocks and 118 MB reads as catastrophic data loss. Off and broken should never look the same.
 
 <!--
 When adding entries, group them under these headings as needed:

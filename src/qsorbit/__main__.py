@@ -59,6 +59,7 @@ from qsorbit.core.dsp import (
     NoiseSquelch,
     SpectrumConfig,
     SpectrumStream,
+    SpectrumSubscription,
 )
 from qsorbit.core.pointing import AlignmentOffset, TrackingLoop, sky_to_rotor
 from qsorbit.core.receive import (
@@ -99,6 +100,14 @@ DEFAULT_SAMPLE_RATE_HZ = 2_048_000
 #: runs used, so a trace on screen during a pass is directly comparable
 #: with the broadcast-FM runs the display was verified against.
 RECEIVE_FFT_SIZE = 2048
+
+#: Subscription names for the two spectrum panels. Distinct from
+#: :data:`~qsorbit.core.receive.WATERFALL_SUBSCRIBER`, which names an
+#: ``IqStream`` consumer one layer down -- these two consume the frames
+#: that one's blocks are turned into, and they appear under these names
+#: in the spectrum section of a run's report.
+WATERFALL_FEED = "waterfall"
+SPECTRUM_LINE_FEED = "spectrum-line"
 
 #: How far below the signal of interest ``sdr capture`` tunes by default,
 #: in kHz. Not a stylistic choice: the RTL-SDR has a permanent DC-offset
@@ -1046,10 +1055,29 @@ def _run_receive(
         else f"Receiving for {args.seconds:.0f}s."
     )
 
+    # Subscribed before the worker starts, so neither panel misses a
+    # frame and no implicit default is ever made. Two independent feeds:
+    # before this, both panels drained one shared buffer and whichever
+    # timer fired first took the batch, which is why they alternated on
+    # the bench (verification #11, Session 24).
+    #
+    # The wiring lives here rather than in ReceiveSession because this is
+    # where the widgets are built. The session stays ignorant of which
+    # panels exist, and Chunk C's feed hub replaces these four lines
+    # without touching either widget.
+    feeds = (
+        (
+            session.spectrum.subscribe(WATERFALL_FEED),
+            session.spectrum.subscribe(SPECTRUM_LINE_FEED),
+        )
+        if session.spectrum is not None
+        else None
+    )
+
     session.start()
     try:
         if args.window:
-            _show_instruments(args, satellite, session, loop)
+            _show_instruments(args, satellite, session, loop, feeds)
         elif session.wait(args.seconds):
             # The demodulating thread ended before the clock did, which
             # means the blocks stopped arriving. Sleeping out the rest of
@@ -1071,6 +1099,7 @@ def _show_instruments(
     satellite: Satellite,
     session: ReceiveSession,
     loop: TrackingLoop | None,
+    feeds: tuple[SpectrumSubscription, SpectrumSubscription] | None = None,
 ) -> None:
     """Open the instrument window and run Qt's event loop until it closes.
 
@@ -1105,13 +1134,20 @@ def _show_instruments(
 
     app = QApplication.instance() or QApplication([])
 
+    if feeds is None:  # pragma: no cover - guarded by args.window at the call site
+        raise RuntimeError("The instrument window needs spectrum feeds to draw from.")
+    waterfall_feed, line_feed = feeds
+
     # One ZoomController shared by the line-spectrum panel and the
     # waterfall, so a mouse or spinbox gesture on either moves both -
     # see that class's own docstring. `session` itself satisfies
     # TrackedFrequencySource (its live_tracked_frequency_hz property),
     # so the controller can poll it and drive the lock without either
     # spectrum widget needing to know tracking exists.
-    axis = frequency_axis_hz(session.spectrum.config)
+    # From a feed rather than from the stream: a subscription reports
+    # the framing it is handing over, so the axis and the frames cannot
+    # come from two objects that quietly disagree.
+    axis = frequency_axis_hz(line_feed.config)
     zoom_controller = ZoomController(
         float(axis[0]), float(axis[-1]), tracked_frequency_source=session
     )
@@ -1131,8 +1167,8 @@ def _show_instruments(
         # always a live reading to show, muted or not.
         quieting=QuietingWidget(session),
         zoom_controls=ZoomControlsWidget(zoom_controller),
-        spectrum_line=SpectrumLineWidget(session.spectrum, zoom=zoom_controller, scale=scale),
-        waterfall=WaterfallWidget(session.spectrum, zoom=zoom_controller, scale=scale),
+        spectrum_line=SpectrumLineWidget(line_feed, zoom=zoom_controller, scale=scale),
+        waterfall=WaterfallWidget(waterfall_feed, zoom=zoom_controller, scale=scale),
         zoom_controller=zoom_controller,
         title=f"QSOrbit - receiving {satellite.name}",
     )
