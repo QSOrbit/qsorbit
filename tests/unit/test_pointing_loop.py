@@ -518,6 +518,85 @@ class TestTravelGuard:
 
         assert loop.tick().rotor_position == Position(179.0, 44.0)
 
+    def test_a_healthy_reading_costs_only_one_read(self):
+        """The re-read is on the suspicious path, not on every tick."""
+        loop, rotor, _ = make_loop([state(180.0, 45.0)], reported=Position(179.0, 44.0))
+
+        loop.tick()
+
+        assert rotor.read_position.call_count == 1
+
+
+class TestGuardRereads:
+    """One corrupted reply must not cost a pass. Session 24, run C."""
+
+    def test_one_impossible_reading_is_re_read_rather_than_fatal(self):
+        # Exactly run C: an elevation of -8.2 that three later reads,
+        # sixty seconds apart with nothing commanded in between, all
+        # reported as 3.8. The first reading was false.
+        loop, _, _ = make_loop(
+            [state(180.0, 45.0)],
+            reported=[Position(0.0, -8.2), Position(0.0, 3.8)],
+        )
+
+        sample = loop.tick()
+
+        assert sample.rotor_position == Position(0.0, 3.8)
+
+    def test_the_confirming_read_is_the_one_trusted(self):
+        """The second reading is the sample's, not the discredited first."""
+        loop, _, _ = make_loop(
+            [state(180.0, 45.0)],
+            reported=[Position(0.0, -8.2), Position(0.0, 3.8)],
+        )
+
+        assert loop.tick().rotor_position.elevation == 3.8
+
+    def test_a_confirmed_divergence_still_aborts(self):
+        """Aborting stays the default: driving through one is unsafe."""
+        loop, rotor, _ = make_loop(
+            [state(180.0, 45.0)],
+            reported=[Position(0.0, -8.2), Position(0.0, -8.4)],
+        )
+
+        with pytest.raises(TravelGuardError, match="agreed"):
+            loop.tick()
+
+        rotor.move_to.assert_not_called()
+
+    def test_the_abort_message_reports_both_readings(self):
+        """Two numbers is what tells a transient from a real divergence."""
+        loop, _, _ = make_loop(
+            [state(180.0, 45.0)],
+            reported=[Position(0.0, -8.2), Position(0.0, -8.4)],
+        )
+
+        with pytest.raises(TravelGuardError, match=r"first read said.*-8\.2"):
+            loop.tick()
+
+    def test_rereads_are_counted_even_when_the_run_survives(self):
+        """The corruption rate is worth more than the completed run.
+
+        Session 24 saw one corrupted reply and could not say whether that
+        was a link falling apart or a once-an-evening event. Two in two
+        attempts describes a very different link from two in twenty, and
+        nothing was counting.
+        """
+        loop, _, _ = make_loop(
+            [state(180.0, 45.0), state(181.0, 45.0)],
+            reported=[
+                Position(0.0, -8.2),
+                Position(0.0, 3.8),
+                Position(0.0, 3.9),
+            ],
+        )
+
+        assert loop.guard_rereads == 0
+        loop.tick()
+        assert loop.guard_rereads == 1
+        loop.tick()
+        assert loop.guard_rereads == 1
+
     def test_a_freshly_homed_rotor_does_not_trip_the_guard(self):
         # The captured bytes from the first bring-up: a homed rotator
         # reports AZ-1.5 EL2.0, which is outside a declared 0-360 azimuth

@@ -14,11 +14,18 @@ against a real rotor, showing sky target and rotor axis position as the
 distinct things :class:`~qsorbit.core.pointing.TrackSample` already keeps
 them as.
 
-**No threading, still.** :meth:`~qsorbit.core.pointing.TrackingLoop.tick`
-never blocks or sleeps, so a ``QTimer`` on the GUI thread can call it
-directly on every timeout. The streaming feed next door needs a worker
-thread and a bounded buffer; this one genuinely does not, and pretending
-otherwise would add a thread to make two dissimilar things look alike.
+**This widget follows; it no longer drives.** Until Chunk A PR2 each
+timer timeout called :meth:`~qsorbit.core.pointing.TrackingLoop.tick`
+directly, on the GUI thread, on the reasoning that a tick "never blocks
+or sleeps". That reasoning was wrong about the hardware: a tick writes a
+command, sleeps out the RS-485 turnaround, and blocks on a serial read,
+so it froze the interface for a sixth of a second every second and for
+the port's whole timeout whenever a reply went missing. The loop is now
+ticked by :class:`~qsorbit.core.receive.LoopRangeRate` on the receive
+session's tracking thread, and this widget reads
+:attr:`~qsorbit.core.pointing.TrackingLoop.latest_sample` and paints it
+-- the same pull-on-a-timer shape the waterfall next door already uses,
+now that the two turn out not to be dissimilar after all.
 
 Every label's text comes from :mod:`qsorbit.ui.readout_formatting`, which
 is plain Python with no Qt import. This module is the thin remainder:
@@ -29,6 +36,8 @@ Boundary rule: this module imports :mod:`qsorbit.core`; nothing in
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QGridLayout, QLabel, QWidget
@@ -41,10 +50,22 @@ from qsorbit.ui.readout_formatting import alignment_note, readout_text
 #: A 1 Hz refresh is plenty for a human reading a label — this is a
 #: display cadence, unrelated to
 #: :data:`~qsorbit.core.pointing.DEFAULT_TICK_INTERVAL_S`, which paces
-#: :meth:`~qsorbit.core.pointing.TrackingLoop.run` instead. Here the
-#: widget drives the loop itself, one tick per timer timeout, so this
-#: value sets the tick cadence too.
+#: :meth:`~qsorbit.core.pointing.TrackingLoop.run` instead. It no longer
+#: sets the tick cadence: the widget follows, so polling faster than the
+#: ticker only repaints the same sample twice.
 DEFAULT_POLL_INTERVAL_MS = 1000
+
+
+def _no_fault() -> BaseException | None:
+    """The default ``fault`` source: nothing is watching the ticker.
+
+    Used when the readout is driven by something that does its own error
+    reporting -- a bench script, a test. Returning ``None`` forever is
+    honest here rather than optimistic: this widget genuinely has no
+    information about a ticker it was never told about.
+    """
+    return None
+
 
 #: Row labels, in display order.
 _FIELDS = ("Time", "Sky target", "Rotor axis", "Rotor axis (sky dir.)", "Range", "Last tick")
@@ -60,36 +81,46 @@ class ReadoutWidget(QWidget):
     :func:`~qsorbit.core.pointing.rotor_to_sky` so it is directly
     comparable to "Sky target" without doing mod-360 arithmetic by eye.
 
-    The widget drives ``loop`` itself: each timer timeout calls
-    :meth:`~qsorbit.core.pointing.TrackingLoop.tick` directly and repaints
-    from the sample it returns. A tick that raises — a
-    :class:`~qsorbit.core.pointing.TravelGuardError`, a
-    :class:`~qsorbit.core.rotor.PositionLimitError`, a serial fault, a
-    propagation error, anything — stops the timer and shows the error in
-    place of the last-tick line, rather than letting the exception cross
-    into Qt's event loop or leaving stale numbers on screen while a real
-    fault sits underneath.
+    The widget **follows** ``loop``: each timer timeout reads
+    :attr:`~qsorbit.core.pointing.TrackingLoop.latest_sample` and
+    repaints from it, without touching the rotor. Whoever ticks the loop
+    is somebody else's job, and in a ``receive --window`` run it is the
+    session's tracking thread.
+
+    Because the tick happens elsewhere, a tick that raises no longer
+    arrives here as an exception. It arrives through ``fault``, and the
+    widget stops polling and shows it in place of the last-tick line --
+    the same outcome as before, reached differently. Without that, a
+    dead rotor would leave its last plausible-looking numbers frozen on
+    screen for the rest of a pass.
 
     Args:
-        loop: The tracking loop to drive and display. The widget neither
+        loop: The tracking loop to display. Something else ticks it;
+            this widget only reads what it produced. The widget neither
             builds it nor owns the rotor's connection — whoever
             constructed the loop is responsible for both, exactly as
             :class:`~qsorbit.core.pointing.TrackingLoop`'s own docs
             describe. Stopping the widget stops polling; it does not
             stop the rotor, matching the loop's own policy.
-        poll_interval_ms: How often to tick, in milliseconds. Defaults
-            to :data:`DEFAULT_POLL_INTERVAL_MS`.
+        fault: Asked on every timeout whether the thing ticking the
+            loop has died, and handed whatever killed it. Defaults to a
+            source that never reports one, for a caller that ticks the
+            loop itself and reports its own errors.
+        poll_interval_ms: How often to repaint, in milliseconds.
+            Defaults to :data:`DEFAULT_POLL_INTERVAL_MS`.
     """
 
     def __init__(
         self,
         loop: TrackingLoop,
         *,
+        fault: Callable[[], BaseException | None] = _no_fault,
         poll_interval_ms: int = DEFAULT_POLL_INTERVAL_MS,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._loop = loop
+        self._fault = fault
         self._target_name = loop.target.name
         # Read once, not per tick: the loop's own offset does not
         # change mid-run, and the note label is built once here too.
@@ -122,11 +153,17 @@ class ReadoutWidget(QWidget):
         self._timer.stop()
 
     def _on_timer(self) -> None:
-        try:
-            sample = self._loop.tick()
-        except Exception as exc:  # noqa: BLE001 - shown, not swallowed
+        fault = self._fault()
+        if fault is not None:
             self._timer.stop()
-            self._value_labels["Last tick"].setText(f"stopped: {exc}")
+            self._value_labels["Last tick"].setText(f"stopped: {fault}")
+            return
+
+        sample = self._loop.latest_sample
+        if sample is None:
+            # Nothing has been ticked yet. Normal in the moment between
+            # the window appearing and the first sample landing, and not
+            # a reason to repaint or to blank what is already shown.
             return
 
         text = readout_text(

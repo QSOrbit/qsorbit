@@ -170,63 +170,53 @@ class TargetRangeRate:
 class LoopRangeRate:
     """Range rates taken from a :class:`~qsorbit.core.pointing.TrackingLoop`.
 
-    Two modes, and which one is right depends on who else is holding the
-    loop:
+    **This source ticks the loop, and it is the only thing that does, in
+    every configuration.** A tick reads the rotor over serial and may
+    command it.
 
-    ``drive=True``
-        This source **ticks** the loop, which reads the rotor and may
-        command it. Headless ``receive --send``.
+    It used to have a second, *following* mode for windowed runs, where
+    :class:`~qsorbit.ui.readout_widget.ReadoutWidget` did the ticking
+    from a ``QTimer`` and this class merely read what the widget had
+    produced. That arrangement was exactly backwards, and Chunk A PR2
+    reversed it: :meth:`~qsorbit.core.pointing.TrackingLoop.tick` writes
+    a command, sleeps out the RS-485 turnaround, and then blocks on a
+    read, so a windowed run was freezing its own interface for a sixth of
+    a second every second -- and for as long as the port's whole timeout
+    whenever a reply went missing, which the rotor doc says is more often
+    a short turnaround than a real fault. Blocking serial I/O belongs on
+    a thread nobody is looking at, and this class already runs on one.
 
-    ``drive=False``
-        This source **follows** — it reads
-        :attr:`~qsorbit.core.pointing.TrackingLoop.latest_sample` and
-        reports it only when the time has advanced. For a windowed run,
-        where :class:`~qsorbit.ui.readout_widget.ReadoutWidget` already
-        ticks the loop on the GUI thread. Two things ticking one loop
-        would double the rotor's serial traffic and interleave two
-        streams of commands, so exactly one of them must.
+    The readout now follows the samples this produces. Exactly one thing
+    still ticks, which was always the requirement -- two would double the
+    rotor's serial traffic and interleave two streams of commands.
 
     Args:
-        loop: The tracking loop.
-        drive: Whether to tick it, per above.
+        loop: The tracking loop to tick.
     """
 
-    def __init__(self, loop: TrackingLoop, *, drive: bool) -> None:
+    def __init__(self, loop: TrackingLoop) -> None:
         self._loop = loop
-        self._drive = drive
-        self._last_time: datetime | None = None
 
     def prime(self) -> tuple[datetime, float]:
-        """Tick the loop once, whichever mode this is in.
+        """Tick the loop once, before anything else is running.
 
-        A follower ticks here and nowhere else, deliberately. Priming has
-        to produce a sample, and before the window is up there is nobody
-        else to produce one — so the alternative would be starting the
+        Priming has to produce a sample: the alternative is starting the
         radio with no correction at all for the first second of a pass.
         One tick before anything streams also leaves the antenna pointed
         at the target rather than wherever it was parked, which is what
         you would have done by hand anyway.
+
+        Runs on whichever thread calls :meth:`ReceiveSession.start`. That
+        is the only rotor read this class ever performs off its own
+        tracking thread, and it happens before the event loop exists, so
+        there is no interface for it to block.
         """
-        sample = self._loop.tick()
-        self._last_time = sample.time
-        return sample.time, sample.range_rate_km_s
+        return self.sample()
 
-    def sample(self) -> tuple[datetime, float] | None:
-        """Tick or follow, per ``drive``."""
-        if self._drive:
-            ticked = self._loop.tick()
-            self._last_time = ticked.time
-            return ticked.time, ticked.range_rate_km_s
-
-        latest = self._loop.latest_sample
-        if latest is None:
-            return None
-        if self._last_time is not None and latest.time <= self._last_time:
-            # Nothing new. Not an error: the loop ticks about once a
-            # second and this is asked more often than that.
-            return None
-        self._last_time = latest.time
-        return latest.time, latest.range_rate_km_s
+    def sample(self) -> tuple[datetime, float]:
+        """Tick the loop and report what it saw."""
+        ticked = self._loop.tick()
+        return ticked.time, ticked.range_rate_km_s
 
 
 @dataclass(frozen=True)
@@ -396,6 +386,8 @@ class ReceiveSession:
         self._demod_thread: threading.Thread | None = None
         self._tracking_thread: threading.Thread | None = None
         self._error: BaseException | None = None
+        # Kept apart from _error deliberately: see tracking_error().
+        self._tracking_error: BaseException | None = None
         self._stopped_cleanly = True
 
         self._lock = threading.Lock()
@@ -415,6 +407,27 @@ class ReceiveSession:
     def spectrum(self) -> SpectrumStream | None:
         """The spectrum stream, for a widget that needs to be handed one."""
         return self._spectrum
+
+    def tracking_error(self) -> BaseException | None:
+        """Whatever stopped the tracking thread, or ``None`` if nothing has.
+
+        Exposed for a readout that *follows* this session's tracking
+        rather than driving it. When the ticker dies, the panel has to be
+        able to say so: leaving the last good numbers on screen with a
+        dead rotor underneath them is the silent failure this project
+        keeps meeting, and it is worse here than most because the numbers
+        look perfectly plausible.
+
+        **Deliberately separate from the demodulating thread's error**,
+        which :meth:`stop` re-raises. They are different faults with
+        different consequences -- a tracking fault stops the antenna
+        following and leaves the audio playing, and the readout is the
+        only place a person would find out.
+
+        A method rather than a property so it can be handed to a widget
+        as a plain callable, without the caller having to wrap it.
+        """
+        return self._tracking_error
 
     def start(self) -> None:
         """Prime the tracker, then start everything. Starting twice is an error.
@@ -667,6 +680,11 @@ class ReceiveSession:
                 with self._lock:
                     self._range_rate_updates += 1
         except BaseException as exc:  # noqa: BLE001 - re-raised from stop()
+            # Recorded twice, on purpose. _error is what stop() re-raises
+            # so the run cannot end silently; _tracking_error is what a
+            # following readout reads, and it must not be confused with a
+            # demodulation fault, which says nothing about the rotor.
+            self._tracking_error = exc
             if self._error is None:
                 self._error = exc
 

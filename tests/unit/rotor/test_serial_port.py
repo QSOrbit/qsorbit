@@ -11,7 +11,7 @@ import pytest
 import serial
 
 from qsorbit.core.rotor.exceptions import SerialConnectionError, SerialTimeoutError
-from qsorbit.core.rotor.serial_port import SerialPort
+from qsorbit.core.rotor.serial_port import LINE_TERMINATOR, SerialPort
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -190,16 +190,53 @@ class TestReadline:
     def test_readline_returns_received_bytes(self):
         """readline() returns whatever the underlying serial instance reads."""
         mock_serial = _make_serial(is_open=True)
-        mock_serial.readline.return_value = b"AZ180.0\r\n"
+        mock_serial.read_until.return_value = b"AZ180.0\r\n"
         port = SerialPort("COM3", _serial=mock_serial)
         assert port.readline() == b"AZ180.0\r\n"
+
+    def test_it_reads_with_a_deadline_for_the_whole_line(self):
+        """pyserial's readline() has no deadline for the line, only per byte.
+
+        ``Serial.readline`` is ``io.IOBase.readline``: it loops on
+        ``read(1)``, and the configured timeout applies to each of those
+        separately. A controller trickling bytes just faster than the
+        timeout holds the caller for timeout x bytes, with no bound --
+        from a tracking loop, during a pass. ``read_until`` builds one
+        ``Timeout`` and checks it between bytes, so this asserts on the
+        call actually made rather than on its result.
+        """
+        mock_serial = _make_serial(is_open=True)
+        mock_serial.read_until.return_value = b"AZ180.0 EL45.0\n"
+        port = SerialPort("COM3", _serial=mock_serial)
+
+        port.readline()
+
+        mock_serial.read_until.assert_called_once_with(LINE_TERMINATOR)
+        mock_serial.readline.assert_not_called()
 
     def test_readline_raises_timeout_on_empty_response(self):
         """An empty response (pyserial's timeout indicator) raises SerialTimeoutError."""
         mock_serial = _make_serial(is_open=True)
-        mock_serial.readline.return_value = b""
+        mock_serial.read_until.return_value = b""
         port = SerialPort("COM3", _serial=mock_serial)
         with pytest.raises(SerialTimeoutError):
+            port.readline()
+
+    def test_an_unterminated_reply_is_a_timeout_not_a_short_line(self):
+        """A truncated reply parses to a smaller number, which is worse than none.
+
+        ``read_until`` hands back whatever it collected when the deadline
+        passes. ``AZ 19.5 EL 3.`` is a perfectly parseable elevation of
+        3.0 that happens to be wrong by 0.8 degrees, and nothing
+        downstream could tell. Session 24 lost a whole pass to one
+        corrupted RS-485 reply; a silently truncated one is the same
+        fault with the evidence removed.
+        """
+        mock_serial = _make_serial(is_open=True)
+        mock_serial.read_until.return_value = b"AZ 19.5 EL 3."
+        port = SerialPort("COM3", _serial=mock_serial)
+
+        with pytest.raises(SerialTimeoutError, match="unterminated"):
             port.readline()
 
     def test_readline_raises_when_port_not_open(self):
@@ -212,7 +249,7 @@ class TestReadline:
     def test_readline_raises_on_serial_exception(self):
         """serial.SerialException during read is wrapped in SerialConnectionError."""
         mock_serial = _make_serial(is_open=True)
-        mock_serial.readline.side_effect = serial.SerialException("device disconnected")
+        mock_serial.read_until.side_effect = serial.SerialException("device disconnected")
         port = SerialPort("COM3", _serial=mock_serial)
         with pytest.raises(SerialConnectionError):
             port.readline()

@@ -233,6 +233,16 @@ def _quit_on_sigint(app: _Quittable) -> Iterator[None]:
     ``app.exec()`` still returned and the run still completed, but a real
     ugliness on every single Ctrl-C.
 
+    **A corollary found the hard way (Session 25): this depends on some
+    Python callback still running.** When a lifetime bug collected the
+    window before the event loop started, every panel's timer went with
+    it, ``app.exec()`` spun with no Python code to reach a bytecode
+    boundary at all, and Ctrl-C stopped working entirely -- the terminal
+    had to be closed. The handler was installed and correct; nothing ever
+    got to run it. An event loop with no Python callbacks in it is
+    uninterruptible, which is worth knowing before anything here is
+    changed to poll less often.
+
     Installing a plain SIGINT handler sidesteps that path entirely: it
     still only runs at the next bytecode boundary, exactly the same
     timing an exception would have had, but it is an ordinary function
@@ -1033,12 +1043,11 @@ def _run_receive(
         doppler=doppler,
         audio=AudioOutput(nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)),
         range_rate=(
-            # With a window, ReadoutWidget ticks the loop on the GUI
-            # thread as Chunk F proved; the session follows. Headless,
-            # nobody else is ticking, so the session drives.
-            LoopRangeRate(loop, drive=not args.window)
-            if loop is not None
-            else TargetRangeRate(satellite, config.observer)
+            # The session's tracking thread ticks the loop in every
+            # configuration now. It used to hand the tick to
+            # ReadoutWidget whenever a window was open, which put a
+            # blocking serial read on the GUI thread once a second.
+            LoopRangeRate(loop) if loop is not None else TargetRangeRate(satellite, config.observer)
         ),
         squelch=squelch,
         # args.squelch is "let the gate's decision reach the speaker" -
@@ -1074,16 +1083,39 @@ def _run_receive(
         else None
     )
 
-    session.start()
+    # Built before the session starts, and the ordering is the point of
+    # the call rather than an accident of it. The window used to be built
+    # after the session had already started, so QApplication and five
+    # widgets were constructed while the SDR reader thread was already
+    # streaming -- and Session 24 measured the cost of that
+    # exactly once per run, in thirteen windowed runs across two commits,
+    # indoors and out, from 31 s to 1261 s: a single ~1.03 s stall
+    # accounting for essentially the whole of the reported USB loss,
+    # against 0.0018% for the same code headless. Standing up the
+    # graphics stack holds the GIL long enough to starve a thread that is
+    # mid-read, and the fix is to have finished doing it before there is
+    # a thread to starve.
+    #
+    # The session is therefore started *by* _show_instruments, through
+    # the callback below, rather than here. Handing the window builder a
+    # `start` rather than splitting it into build-then-run is deliberate:
+    # an InstrumentWindow is a top-level widget with no Qt parent, so the
+    # only thing keeping it alive is a Python reference, and a builder
+    # that returns leaves that reference nowhere. Keeping `window` a
+    # local of the frame that is still executing `app.exec()` makes the
+    # lifetime structural instead of something a later edit can drop.
     try:
         if args.window:
-            _show_instruments(args, satellite, session, loop, feeds)
-        elif session.wait(args.seconds):
-            # The demodulating thread ended before the clock did, which
-            # means the blocks stopped arriving. Sleeping out the rest of
-            # the run would have hidden that behind a normal-looking
-            # exit; session.stop() below raises whatever caused it.
-            print("The stream ended early - see the error below.", file=sys.stderr)
+            _show_instruments(args, satellite, session, loop, feeds, start=session.start)
+        else:
+            session.start()
+            if session.wait(args.seconds):
+                # The demodulating thread ended before the clock did,
+                # which means the blocks stopped arriving. Sleeping out
+                # the rest of the run would have hidden that behind a
+                # normal-looking exit; session.stop() below raises
+                # whatever caused it.
+                print("The stream ended early - see the error below.", file=sys.stderr)
     except KeyboardInterrupt:
         print()  # the ^C the terminal echoed deserves its own line
     finally:
@@ -1100,8 +1132,30 @@ def _show_instruments(
     session: ReceiveSession,
     loop: TrackingLoop | None,
     feeds: tuple[SpectrumSubscription, SpectrumSubscription] | None = None,
+    *,
+    start: Callable[[], None],
 ) -> None:
-    """Open the instrument window and run Qt's event loop until it closes.
+    """Build the instrument window, start the session, then run Qt's loop.
+
+    **The session is started from inside this function, after the window
+    exists and before the event loop runs**, and that ordering is the
+    point rather than an accident of it. Everything expensive about Qt --
+    constructing QApplication, loading the platform plugin, building five
+    widgets, realising a native window -- happens first, so the graphics
+    stack is standing before there is a reader thread for it to starve.
+    See :func:`_run_receive` for the measurement behind that.
+
+    Taking a ``start`` callback rather than being split into a builder
+    and a runner is also deliberate, and was learned the hard way. A
+    builder that returns hands its caller a closure while ``window``
+    itself goes out of scope -- and an :class:`InstrumentWindow` is a
+    top-level widget with no Qt parent, so that Python reference is the
+    only thing keeping it alive. Losing it collects the window the
+    instant the builder returns: it flashes on screen, disappears,
+    destroys every panel's ``QTimer`` with it, and leaves an event loop
+    running with nothing in it. Keeping ``window`` a local of the frame
+    that is still executing ``app.exec()`` makes that lifetime
+    structural.
 
     **Qt is imported here and nowhere above**, because importing PySide6
     at module scope would make the entire CLI unusable anywhere it is not
@@ -1110,10 +1164,11 @@ def _show_instruments(
     ``CDLL()`` — a dependency that can fail merely by being imported
     belongs inside the function that actually needs it.
 
-    The readout is present only when there is a loop to drive, and when
-    it is present **it owns the tick** — which is why the session was
-    built with ``drive=False`` in that case. Two things ticking one loop
-    would double the rotor's serial traffic.
+    The readout is present only when there is a loop to show. It
+    **follows** that loop rather than ticking it: the session's tracking
+    thread owns the tick, and the readout is handed
+    ``session.tracking_error`` so a rotor fault reaches the screen
+    instead of freezing the last good numbers there.
 
     **Ctrl-C is handled explicitly** via :func:`_quit_on_sigint` wrapping
     ``app.exec()`` below — see that function's own docstring for why
@@ -1158,7 +1213,11 @@ def _show_instruments(
 
     window = InstrumentWindow(
         readout=(
-            ReadoutWidget(loop, poll_interval_ms=int(args.interval * 1000))
+            ReadoutWidget(
+                loop,
+                fault=session.tracking_error,
+                poll_interval_ms=int(args.interval * 1000),
+            )
             if loop is not None
             else None
         ),
@@ -1173,11 +1232,20 @@ def _show_instruments(
         title=f"QSOrbit - receiving {satellite.name}",
     )
     window.show()
+
+    # Only now, with Qt fully up and the window realised, does anything
+    # begin streaming.
+    start()
+
     if args.seconds is not None:
         # Honoured rather than ignored: a --seconds that silently did
         # nothing under --window is precisely the sort of quiet
         # disagreement between a flag and its behaviour this project
         # keeps finding the hard way.
+        #
+        # Started after the session rather than before it so the countdown
+        # measures the receiving, not the receiving plus however long the
+        # session took to come up.
         QTimer.singleShot(int(args.seconds * 1000), app.quit)
 
     with _quit_on_sigint(app):

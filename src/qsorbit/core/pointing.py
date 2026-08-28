@@ -470,6 +470,7 @@ class TrackingLoop:
         self._monotonic = monotonic
         self._last_commanded: Position | None = None
         self._latest_sample: TrackSample | None = None
+        self._guard_rereads = 0
 
     # ------------------------------------------------------------------
     # Properties
@@ -540,8 +541,7 @@ class TrackingLoop:
         """
         now = self._now()
         state = self._target.topocentric_state(self._observer, now)
-        rotor_position = self._rotor.read_position()
-        self._guard_reported_position(rotor_position)
+        rotor_position = self._read_guarded_position()
 
         rotor_target = sky_to_rotor(state.sky_position, self._alignment_offset)
         outcome = self._decide(state.sky_position, rotor_target)
@@ -627,6 +627,73 @@ class TrackingLoop:
         if moved < self._deadband_deg:
             return TickOutcome.WITHIN_DEADBAND
         return TickOutcome.COMMANDED
+
+    @property
+    def guard_rereads(self) -> int:
+        """How many readings looked impossible and had to be re-read.
+
+        An instrument, not a health score. Session 24 saw exactly one
+        corrupted RS-485 reply and had no way to say whether that was a
+        link falling apart or a once-an-evening event -- "two events in
+        two attempts describes a very different link from two in twenty".
+        This is the count that answers it, and a run that ends with it
+        above zero has something worth writing down even though nothing
+        went wrong.
+        """
+        return self._guard_rereads
+
+    def _read_guarded_position(self) -> Position:
+        """Read the rotor's position, re-reading once if it looks impossible.
+
+        **A single corrupted reply used to cost a whole pass.** Session
+        24's run C died about two minutes in on an elevation reading of
+        -8.2 degrees; three later reads, sixty seconds apart with nothing
+        commanded in between, all returned 3.8. The reading was false,
+        the guard was right to refuse to command through a picture it
+        could not reason about, and the pass was gone -- and passes are
+        ten-minute appointments that do not come back.
+
+        Aborting remains the right default, because a genuine divergence
+        between our picture and the rotor's own is unsafe to drive
+        through. But a transient bad value and a real divergence look
+        identical in one sample and are trivially separable in two. The
+        rotor doc's line about empty replies -- "an empty reply is far
+        more often a too-short turnaround than a real fault" (section
+        2.11) -- applies with equal force to a corrupt one.
+
+        So: one re-read, and abort only if the second reading agrees that
+        something is wrong. The cost is a single extra round trip on a
+        path that was about to end the run anyway, and it is paid on a
+        background thread rather than the interface.
+
+        **Phil's call, taken at Session 25 rather than assumed**; the
+        roadmap did not answer it and Session 24 deliberately left it
+        open for this chunk.
+
+        Returns:
+            The position to trust: the confirming read when there was
+            one, the original otherwise.
+
+        Raises:
+            TravelGuardError: If a second, independent read agrees the
+                rotor is somewhere it cannot be.
+        """
+        position = self._rotor.read_position()
+        try:
+            self._guard_reported_position(position)
+        except TravelGuardError:
+            self._guard_rereads += 1
+            confirmation = self._rotor.read_position()
+            try:
+                self._guard_reported_position(confirmation)
+            except TravelGuardError as exc:
+                raise TravelGuardError(
+                    f"{exc} A second read taken immediately afterwards agreed, so "
+                    f"this is a real divergence rather than one corrupted reply "
+                    f"(the first read said {position})."
+                ) from exc
+            return confirmation
+        return position
 
     def _guard_reported_position(self, position: Position) -> None:
         """Raise if the rotor says it is well outside its own declared travel.
