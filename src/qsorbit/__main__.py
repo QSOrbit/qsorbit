@@ -227,11 +227,21 @@ def _quit_on_sigint(app: _Quittable) -> Iterator[None]:
     callback happens to be executing next. Before this existed that was
     :meth:`~qsorbit.ui.waterfall_widget.WaterfallWidget._on_timer`, its
     50 ms poll being the shortest-period timer always running under
-    ``_build_instruments``, and the ``KeyboardInterrupt`` raised inside it
+    ``_show_instruments``, and the ``KeyboardInterrupt`` raised inside it
     propagated out through Qt's C++ dispatch as an unhandled exception -
     PySide6's own exception hook printed a traceback, cosmetic since
     ``app.exec()`` still returned and the run still completed, but a real
     ugliness on every single Ctrl-C.
+
+    **A corollary found the hard way (Session 25): this depends on some
+    Python callback still running.** When a lifetime bug collected the
+    window before the event loop started, every panel's timer went with
+    it, ``app.exec()`` spun with no Python code to reach a bytecode
+    boundary at all, and Ctrl-C stopped working entirely -- the terminal
+    had to be closed. The handler was installed and correct; nothing ever
+    got to run it. An event loop with no Python callbacks in it is
+    uninterruptible, which is worth knowing before anything here is
+    changed to poll less often.
 
     Installing a plain SIGINT handler sidesteps that path entirely: it
     still only runs at the next bytecode boundary, exactly the same
@@ -1086,18 +1096,27 @@ def _run_receive(
     # graphics stack holds the GIL long enough to starve a thread that is
     # mid-read, and the fix is to have finished doing it before there is
     # a thread to starve.
-    run_window = _build_instruments(args, satellite, session, loop, feeds) if args.window else None
-
-    session.start()
+    #
+    # The session is therefore started *by* _show_instruments, through
+    # the callback below, rather than here. Handing the window builder a
+    # `start` rather than splitting it into build-then-run is deliberate:
+    # an InstrumentWindow is a top-level widget with no Qt parent, so the
+    # only thing keeping it alive is a Python reference, and a builder
+    # that returns leaves that reference nowhere. Keeping `window` a
+    # local of the frame that is still executing `app.exec()` makes the
+    # lifetime structural instead of something a later edit can drop.
     try:
-        if run_window is not None:
-            run_window()
-        elif session.wait(args.seconds):
-            # The demodulating thread ended before the clock did, which
-            # means the blocks stopped arriving. Sleeping out the rest of
-            # the run would have hidden that behind a normal-looking
-            # exit; session.stop() below raises whatever caused it.
-            print("The stream ended early - see the error below.", file=sys.stderr)
+        if args.window:
+            _show_instruments(args, satellite, session, loop, feeds, start=session.start)
+        else:
+            session.start()
+            if session.wait(args.seconds):
+                # The demodulating thread ended before the clock did,
+                # which means the blocks stopped arriving. Sleeping out
+                # the rest of the run would have hidden that behind a
+                # normal-looking exit; session.stop() below raises
+                # whatever caused it.
+                print("The stream ended early - see the error below.", file=sys.stderr)
     except KeyboardInterrupt:
         print()  # the ^C the terminal echoed deserves its own line
     finally:
@@ -1108,27 +1127,36 @@ def _run_receive(
     return 0
 
 
-def _build_instruments(
+def _show_instruments(
     args: argparse.Namespace,
     satellite: Satellite,
     session: ReceiveSession,
     loop: TrackingLoop | None,
     feeds: tuple[SpectrumSubscription, SpectrumSubscription] | None = None,
-) -> Callable[[], None]:
-    """Build the instrument window, and return a callable that runs it.
+    *,
+    start: Callable[[], None],
+) -> None:
+    """Build the instrument window, start the session, then run Qt's loop.
 
-    **Split from running the event loop so the caller can start the
-    session in between**, which is the whole reason this is two steps.
-    Everything expensive about Qt -- constructing QApplication, loading
-    the platform plugin, building five widgets, realising a native window
-    -- happens here, before any reader thread exists. See
-    :func:`_run_receive` for the measurement that made that ordering
-    load-bearing.
+    **The session is started from inside this function, after the window
+    exists and before the event loop runs**, and that ordering is the
+    point rather than an accident of it. Everything expensive about Qt --
+    constructing QApplication, loading the platform plugin, building five
+    widgets, realising a native window -- happens first, so the graphics
+    stack is standing before there is a reader thread for it to starve.
+    See :func:`_run_receive` for the measurement behind that.
 
-    Returning a closure rather than the window keeps every Qt object
-    inside this function, so the deferred import below stays the only
-    place PySide6 is named and nothing Qt-typed reaches a module-level
-    annotation.
+    Taking a ``start`` callback rather than being split into a builder
+    and a runner is also deliberate, and was learned the hard way. A
+    builder that returns hands its caller a closure while ``window``
+    itself goes out of scope -- and an :class:`InstrumentWindow` is a
+    top-level widget with no Qt parent, so that Python reference is the
+    only thing keeping it alive. Losing it collects the window the
+    instant the builder returns: it flashes on screen, disappears,
+    destroys every panel's ``QTimer`` with it, and leaves an event loop
+    running with nothing in it. Keeping ``window`` a local of the frame
+    that is still executing ``app.exec()`` makes that lifetime
+    structural.
 
     **Qt is imported here and nowhere above**, because importing PySide6
     at module scope would make the entire CLI unusable anywhere it is not
@@ -1201,23 +1229,23 @@ def _build_instruments(
     )
     window.show()
 
-    def run() -> None:
-        """Run Qt's event loop until the window closes or time is up."""
-        if args.seconds is not None:
-            # Honoured rather than ignored: a --seconds that silently did
-            # nothing under --window is precisely the sort of quiet
-            # disagreement between a flag and its behaviour this project
-            # keeps finding the hard way.
-            #
-            # Started here rather than at build time so the countdown
-            # measures the receiving, not the receiving plus however long
-            # the session took to come up.
-            QTimer.singleShot(int(args.seconds * 1000), app.quit)
+    # Only now, with Qt fully up and the window realised, does anything
+    # begin streaming.
+    start()
 
-        with _quit_on_sigint(app):
-            app.exec()
+    if args.seconds is not None:
+        # Honoured rather than ignored: a --seconds that silently did
+        # nothing under --window is precisely the sort of quiet
+        # disagreement between a flag and its behaviour this project
+        # keeps finding the hard way.
+        #
+        # Started after the session rather than before it so the countdown
+        # measures the receiving, not the receiving plus however long the
+        # session took to come up.
+        QTimer.singleShot(int(args.seconds * 1000), app.quit)
 
-    return run
+    with _quit_on_sigint(app):
+        app.exec()
 
 
 def _command_stop(config: StationConfig, factory: RotorFactory) -> int:
