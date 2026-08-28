@@ -40,6 +40,8 @@ import numpy as np
 import pytest
 
 from qsorbit.core.dsp.demod import NbfmConfig
+from qsorbit.core.dsp.spectrum import SpectrumConfig
+from qsorbit.core.dsp.spectrum_stream import SpectrumStream
 from qsorbit.core.dsp.squelch import NoiseSquelch
 from qsorbit.core.dsp.tuning import DopplerTracker
 from qsorbit.core.geometry import AzEl
@@ -298,6 +300,12 @@ def a_session(
     return session, audio
 
 
+def a_spectrum_factory():
+    """A real SpectrumStream factory, for tests about the wiring."""
+    config = SpectrumConfig(fft_size=64, sample_rate_hz=SAMPLE_RATE_HZ, center_freq_hz=CENTER_HZ)
+    return lambda blocks: SpectrumStream(blocks, config)
+
+
 def quietly_stop(session: ReceiveSession) -> None:
     """Stop a session whose fake device has run out, ignoring that fact.
 
@@ -414,11 +422,29 @@ class TestSessionWiring:
     def test_it_subscribes_twice_under_the_documented_names(self):
         device = SteppedFakeDevice([TUNING_OFFSET_HZ])
         source = ScriptedRangeRate([(AN_INSTANT, -3.0)])
-        session, _ = a_session(device, source)
+        session, _ = a_session(device, source, spectrum_factory=a_spectrum_factory())
 
         names = [entry.name for entry in session.stats.stream.subscribers]
 
         assert names == [AUDIO_SUBSCRIBER, WATERFALL_SUBSCRIBER]
+
+    def test_it_does_not_subscribe_a_spectrum_consumer_that_will_never_drain(self):
+        """A headless run reported 453 dropped blocks with nothing wrong.
+
+        The waterfall subscription was made unconditionally, so with no
+        window every block was offered to a consumer that did not exist
+        and the bounded deque evicted it. The bytes figure that produced
+        -- 118,751,232 on a 60-second run -- reads as catastrophic data
+        loss. "Off" and "broken" must never look the same (Session 24).
+        """
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ])
+        source = ScriptedRangeRate([(AN_INSTANT, -3.0)])
+        session, _ = a_session(device, source)
+
+        names = [entry.name for entry in session.stats.stream.subscribers]
+
+        assert names == [AUDIO_SUBSCRIBER]
+        assert session.stats.stream.blocks_dropped == 0
 
     def test_the_tracker_is_primed_before_anything_streams(self):
         # offset_at() raises if it has never been given a range rate, and
