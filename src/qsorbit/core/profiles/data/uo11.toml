@@ -1,0 +1,16 @@
+# UO-11 (UoSAT-2) -- launched 1984, still occasionally heard. NORAD id
+# verified against AMSAT's own TLE catalog, 2026-08-28.
+norad_id = 14781
+name = "UO-11"
+also_known_as = ["UoSAT-2", "OSCAR 11"]
+
+[alive]
+status = "unknown"
+as_of = 2026-08-25
+source = "bench-targets.md: 'launched 1984 and still occasionally heard. Charming, not dependable.' No confirmed-dead report found, but no reliable schedule either."
+
+[[transmitters]]
+downlink_hz = 145826000.0
+mode = "fm"
+reliability = "unconditional"
+notes = "FM-modulated telemetry, when it runs -- the satellite's own instrumentation, not dependent on another operator, but erratic after four decades in orbit. Do not treat silence here as a chain fault before ruling out that it simply didn't transmit this pass."

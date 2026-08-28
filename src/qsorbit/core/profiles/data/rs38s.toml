@@ -1,0 +1,16 @@
+# RS38S (VIZARD-meteo) -- Robot36 SSTV. NORAD id verified against
+# AMSAT's TLE catalog and n2yo, 2026-08-28.
+norad_id = 57189
+name = "RS38S"
+also_known_as = ["VIZARD-meteo", "VIZARD"]
+
+[alive]
+status = "active"
+as_of = 2026-08-25
+source = "bench-targets.md, checked against AMSAT Live OSCAR Satellite Status (https://www.amsat.org/status/)"
+
+[[transmitters]]
+downlink_hz = 437825000.0
+mode = "sstv"
+reliability = "scheduled"
+notes = "Robot36 SSTV."

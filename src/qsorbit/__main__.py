@@ -1,10 +1,14 @@
 """Command-line entry point, run as ``uv run qsorbit`` (or ``python -m qsorbit``).
 
-Six subcommands: ``point``, ``goto``, ``status``, ``stop``, ``sdr``
-(itself split into ``info`` and ``capture``), and ``receive`` — the whole
-vertical slice, tracking and receiving a pass together. ``goto`` is
+Seven subcommands: ``point``, ``goto``, ``plan``, ``status``, ``stop``,
+``sdr`` (itself split into ``info`` and ``capture``), and ``receive`` — the
+whole vertical slice, tracking and receiving a pass together. ``goto`` is
 ``point``'s raw-axis sibling: it sends AZ/EL numbers you typed, rather
 than working them out from a TLE, which is what calibration needs.
+``plan`` answers a question upstream of all of them -- what's worth
+pointing at in the first place -- by combining the curated satellite
+catalogue, this station's own TLEs, and its horizon mask; nothing in it
+touches the rotor or the SDR.
 
 **Computing is the default; moving is opt-in.** ``point`` works out where
 the rotor would have to go and prints it, without opening the serial port
@@ -43,7 +47,8 @@ import contextlib
 import signal
 import sys
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Protocol
 
 from qsorbit import __version__
@@ -62,6 +67,7 @@ from qsorbit.core.dsp import (
     SpectrumSubscription,
 )
 from qsorbit.core.pointing import AlignmentOffset, TrackingLoop, sky_to_rotor
+from qsorbit.core.profiles import ProfileError, SatelliteProfile, Transmitter, load_profile_catalog
 from qsorbit.core.receive import (
     DEFAULT_TRACKING_INTERVAL_S,
     LoopRangeRate,
@@ -88,10 +94,17 @@ from qsorbit.core.sdr import (
     capture_to_file,
 )
 from qsorbit.core.station import ConfigError, StationConfig, load_station_config
-from qsorbit.core.tracker import Satellite, TrackerError
+from qsorbit.core.tracker import Pass, Satellite, TrackerError, predict_passes
 
 #: How long ``point --send`` waits for the rotor to settle, in seconds.
 DEFAULT_ARRIVAL_TIMEOUT_S = 90.0
+
+#: How far ahead ``plan`` searches for passes by default, in hours.
+#: Long enough to span a whole evening's worth of scheduling without
+#: the operator having to think about it, short enough that a run
+#: finishes quickly -- see the pass_prediction module's own docstring
+#: for why this isn't performance-gated even so.
+DEFAULT_PLAN_HOURS = 24.0
 
 #: Default capture rate — what all of Phase 2's bring-up used.
 DEFAULT_SAMPLE_RATE_HZ = 2_048_000
@@ -379,6 +392,52 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ARRIVAL_TIMEOUT_S,
         metavar="SECONDS",
         help=f"How long to wait for the move to settle (default {DEFAULT_ARRIVAL_TIMEOUT_S:.0f}).",
+    )
+
+    plan = subcommands.add_parser(
+        "plan",
+        help="List upcoming passes worth pointing at, from the curated satellite catalogue.",
+        description=(
+            "Predicts passes for every satellite that has both a curated profile "
+            "and a TLE in --tle-dir, filtered by this station's horizon mask, and "
+            "prints what each one transmits and how likely it is to actually be "
+            "on. Read-only -- nothing is transmitted and no rotor is involved."
+        ),
+    )
+    plan.add_argument(
+        "--tle-dir",
+        required=True,
+        metavar="PATH",
+        help=(
+            "Directory of *.tle files, one satellite each. Matched to "
+            "profiles by NORAD catalog number."
+        ),
+    )
+    plan.add_argument(
+        "--profiles-dir",
+        metavar="PATH",
+        help="Directory of profile *.toml files. Defaults to QSOrbit's own curated starter set.",
+    )
+    plan.add_argument(
+        "--hours",
+        type=float,
+        default=DEFAULT_PLAN_HOURS,
+        metavar="HOURS",
+        help=f"How far ahead to search for passes (default {DEFAULT_PLAN_HOURS:.0f}).",
+    )
+    plan.add_argument(
+        "--at",
+        metavar="TIME",
+        help=(
+            "ISO 8601 instant to start the search from, e.g. "
+            "2026-08-20T18:30:00+00:00. Defaults to now. A time with no zone "
+            "offset is read as UTC."
+        ),
+    )
+    plan.add_argument(
+        "--visual",
+        action="store_true",
+        help="Also report whether each pass is naked-eye visible (sunlit satellite, dark sky).",
     )
 
     subcommands.add_parser(
@@ -691,6 +750,8 @@ def main(
             return _command_point(args, config, factory)
         if args.command == "goto":
             return _command_goto(args, config, factory)
+        if args.command == "plan":
+            return _command_plan(args, config)
         if args.command == "status":
             return _command_status(config, factory)
         if args.command == "sdr":
@@ -703,7 +764,15 @@ def main(
         # the link clears it, so "try again" would be the wrong advice.
         print(f"Homing failure: {exc}", file=sys.stderr)
         return 1
-    except (ConfigError, RotorError, SdrError, TrackerError, OSError, ValueError) as exc:
+    except (
+        ConfigError,
+        ProfileError,
+        RotorError,
+        SdrError,
+        TrackerError,
+        OSError,
+        ValueError,
+    ) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
@@ -777,6 +846,111 @@ def _command_goto(args: argparse.Namespace, config: StationConfig, factory: Roto
         return 0
 
     return _send_and_wait(config, factory, target, args.arrival_timeout)
+
+
+def _command_plan(args: argparse.Namespace, config: StationConfig) -> int:
+    """``plan``: what's worth pointing at, from the curated catalogue and this station's own TLEs.
+
+    Answers the question every other subcommand assumes has already
+    been answered -- *which* satellite, right now. Loads every TLE in
+    ``--tle-dir``, matches each one to a curated profile by NORAD
+    catalog number (:attr:`~qsorbit.core.tracker.satellite.Satellite.norad_id`),
+    predicts passes against this station's own horizon mask rather than
+    the bare geometric horizon, and prints AOS/TCA/LOS alongside what
+    each satellite actually transmits and how reliably. Read-only --
+    nothing is sent to the rotor and no SDR is opened, which is why it
+    takes a ``StationConfig`` but no ``RotorFactory``, unlike ``point``
+    and ``goto``.
+
+    A TLE with no matching profile, or a file that doesn't parse as a
+    TLE, is skipped with a note on stderr rather than aborting the
+    whole search -- the catalogue is a curated subset by design (see
+    ``core/profiles/``), so an unmatched TLE is the expected case, not
+    an error.
+    """
+    catalog = (
+        load_profile_catalog(args.profiles_dir) if args.profiles_dir else load_profile_catalog()
+    )
+
+    tle_dir = Path(args.tle_dir)
+    if not tle_dir.is_dir():
+        raise ValueError(f"TLE directory not found: {tle_dir}")
+
+    now = _parse_time(args.at)
+    end = now + timedelta(hours=args.hours)
+
+    entries: list[tuple[SatelliteProfile, Pass]] = []
+    for tle_path in sorted(tle_dir.glob("*.tle")):
+        try:
+            satellite = Satellite.from_file(tle_path)
+        except TrackerError as exc:
+            print(f"Could not read {tle_path} as a TLE: {exc}", file=sys.stderr)
+            continue
+
+        profile = catalog.by_norad_id(satellite.norad_id)
+        if profile is None:
+            print(
+                f"No curated profile for {satellite.name} (NORAD {satellite.norad_id}) "
+                f"in {tle_path} -- skipped.",
+                file=sys.stderr,
+            )
+            continue
+
+        passes = predict_passes(
+            satellite,
+            config.observer,
+            now,
+            end,
+            horizon_mask=config.horizon,
+            include_illumination=args.visual,
+        )
+        for one_pass in passes:
+            entries.append((profile, one_pass))
+
+    entries.sort(key=lambda entry: entry[1].aos.time)
+
+    print(f"Searched {tle_dir} for the next {args.hours:.1f} hours, from {now.isoformat()}.")
+    print()
+
+    if not entries:
+        print("Nothing above the horizon in that window.")
+        return 0
+
+    for profile, one_pass in entries:
+        _print_pass(profile, one_pass)
+
+    return 0
+
+
+def _print_pass(profile: SatelliteProfile, one_pass: Pass) -> None:
+    """Print one pass -- AOS/TCA/LOS, visibility, and what it transmits."""
+    reliability = profile.best_reliability()
+    reliability_text = reliability.value if reliability is not None else "no known transmitter"
+
+    print(f"{profile.name}  ({reliability_text})")
+    print(f"  AOS {one_pass.aos.time.isoformat()}  az {one_pass.aos.sky_position.azimuth:5.1f}")
+    print(f"  TCA {one_pass.tca.time.isoformat()}  el {one_pass.max_elevation_deg:5.1f}")
+    print(f"  LOS {one_pass.los.time.isoformat()}  az {one_pass.los.sky_position.azimuth:5.1f}")
+    if one_pass.illuminated is not None:
+        print(f"  naked-eye visible near TCA: {'yes' if one_pass.illuminated else 'no'}")
+    for transmitter in profile.transmitters:
+        print(f"  {_format_transmitter(transmitter)}")
+    print()
+
+
+def _format_transmitter(transmitter: Transmitter) -> str:
+    """One line (plus an optional indented note) describing a transmitter."""
+    downlink_mhz = transmitter.downlink_hz / 1_000_000.0
+    parts = [f"{downlink_mhz:.4f} MHz down"]
+    if transmitter.uplink_hz is not None:
+        parts.append(f"{transmitter.uplink_hz / 1_000_000.0:.4f} MHz up")
+    parts.append(transmitter.mode.value)
+    parts.append(transmitter.reliability.value)
+
+    line = "    " + "  ".join(parts)
+    if transmitter.notes:
+        line += f"\n      {transmitter.notes}"
+    return line
 
 
 def _send_and_wait(

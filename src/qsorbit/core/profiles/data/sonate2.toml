@@ -1,0 +1,21 @@
+# SONATE-2 -- VHF digipeater that also carries an SSTV payload. NORAD
+# id verified against AMSAT's own TLE catalog, 2026-08-28.
+norad_id = 59112
+name = "SONATE-2"
+
+[alive]
+status = "active"
+as_of = 2026-08-25
+source = "bench-targets.md: 'VHF digipeater, reported consistently active'"
+
+[[transmitters]]
+downlink_hz = 145880000.0
+mode = "fm"
+reliability = "dependent"
+notes = "VHF digipeater, reported consistently active. Baud rate not confirmed against a primary source, so left unset here rather than guessed."
+
+[[transmitters]]
+downlink_hz = 145880000.0
+mode = "sstv"
+reliability = "scheduled"
+notes = "Martin M1 SSTV, on the same downlink frequency as the digipeater above. Reported consistently active."

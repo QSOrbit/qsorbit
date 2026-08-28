@@ -1,0 +1,17 @@
+# FO-29 (JAS-2) -- unconditional CW beacon, but battery-limited in
+# recent years and sometimes scheduled off. NORAD id verified against
+# AMSAT's own TLE catalog, 2026-08-28.
+norad_id = 24278
+name = "FO-29"
+also_known_as = ["JAS-2", "Fuji-OSCAR-29"]
+
+[alive]
+status = "active"
+as_of = 2026-08-25
+source = "bench-targets.md, checked against AMSAT Live OSCAR Satellite Status (https://www.amsat.org/status/)"
+
+[[transmitters]]
+downlink_hz = 435795000.0
+mode = "cw"
+reliability = "unconditional"
+notes = "CW beacon. Reported active as of the last check, but battery-limited in recent years and sometimes scheduled off -- re-check the status board on the day, per bench-targets.md. Detected Session 22 at 5.7 dB, just under pass-scan.py's 6.0 dB gate, across 18 consecutive monotone slices matching the predicted Doppler curve at r-squared 0.990."

@@ -1,0 +1,18 @@
+# RS40S (UmKA-1) -- Robot36 SSTV, and the satellite that actually
+# closed Chunk H's audible-FM milestone (Session 22, 2026-08-25):
+# heard live through the full receive chain during a real pass. NORAD
+# id verified against AMSAT's TLE catalog and n2yo, 2026-08-28.
+norad_id = 57172
+name = "RS40S"
+also_known_as = ["UmKA-1"]
+
+[alive]
+status = "active"
+as_of = 2026-08-25
+source = "bench-targets.md; confirmed transmitting live, Session 22 bench day (2026-08-25)"
+
+[[transmitters]]
+downlink_hz = 437625000.0
+mode = "sstv"
+reliability = "scheduled"
+notes = "Robot36 SSTV. Confirmed audible end-to-end through QSOrbit on a real 10.45-degree pass (Session 22): measured on the waterfall at 43.3 sigma, 1.5 kHz from the Doppler-predicted frequency, present in 95% of history rows across the full ~36-second image cadence."

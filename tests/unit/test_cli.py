@@ -17,6 +17,7 @@ import pytest
 
 from qsorbit import __version__
 from qsorbit.__main__ import (
+    DEFAULT_PLAN_HOURS,
     DEFAULT_TUNING_OFFSET_KHZ,
     _parse_audio_device,
     _quit_on_sigint,
@@ -91,6 +92,63 @@ def tle_path(tmp_path):
     path = tmp_path / "example.tle"
     path.write_text(TEME_EXAMPLE_TLE, encoding="utf-8")
     return path
+
+
+#: A profile for the TEME EXAMPLE satellite (NORAD 00005) -- fictional
+#: as a real bird, but a real profile shape, matching
+#: tests/unit/profiles/test_catalog.py's VALID_PROFILE.
+PLAN_PROFILE = """
+    norad_id = 5
+    name = "TEME EXAMPLE"
+
+    [alive]
+    status = "active"
+    as_of = 2026-08-25
+    source = "test fixture"
+
+    [[transmitters]]
+    downlink_hz = 435600000.0
+    mode = "cw"
+    reliability = "unconditional"
+    notes = "test beacon"
+"""
+
+
+@pytest.fixture
+def tle_dir_path(tmp_path):
+    """A directory of one *.tle file, for --tle-dir."""
+    directory = tmp_path / "tles"
+    directory.mkdir()
+    (directory / "teme.tle").write_text(TEME_EXAMPLE_TLE, encoding="utf-8")
+    return directory
+
+
+@pytest.fixture
+def profiles_dir_path(tmp_path):
+    """A directory of one profile *.toml file, matching tle_dir_path's satellite."""
+    directory = tmp_path / "profiles"
+    directory.mkdir()
+    (directory / "teme.toml").write_text(textwrap.dedent(PLAN_PROFILE), encoding="utf-8")
+    return directory
+
+
+@pytest.fixture
+def plan_config_path(tmp_path):
+    # Same observer test_pass_prediction.py uses for this exact TLE, so
+    # the pass geometry here is proven elsewhere rather than a fresh,
+    # unverified claim -- CONFIG's own observer is close but not
+    # identical, and "close" isn't good enough for a fixture other
+    # tests' pass counts depend on.
+    text = textwrap.dedent(CONFIG).replace(
+        "latitude = 40.5\nlongitude = -83.25", "latitude = 40.0\nlongitude = -83.0"
+    )
+    path = tmp_path / "qsorbit_plan.toml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def run_plan(argv, config_path):
+    return main(["--config", str(config_path), *argv])
 
 
 #: What a freshly homed rotator reports: slightly past zero on both
@@ -442,6 +500,219 @@ class TestGoto:
         # a garbled or absurd axis number should read as an ordinary
         # error, not a traceback.
         code = run(["goto", "--az", "99999", "--el", "19"], config_path, factory)
+
+        assert code == 1
+        assert capsys.readouterr().err.startswith("Error:")
+
+
+# ---------------------------------------------------------------------------
+# plan
+# ---------------------------------------------------------------------------
+
+
+class TestPlanParser:
+    def test_plan_requires_a_tle_dir(self):
+        with pytest.raises(SystemExit) as exit_info:
+            build_parser().parse_args(["plan"])
+        assert exit_info.value.code == 2
+
+    def test_hours_defaults(self):
+        args = build_parser().parse_args(["plan", "--tle-dir", "x"])
+        assert args.hours == DEFAULT_PLAN_HOURS
+
+    def test_visual_defaults_to_off(self):
+        args = build_parser().parse_args(["plan", "--tle-dir", "x"])
+        assert args.visual is False
+
+    def test_at_defaults_to_none(self):
+        # None is "now" to _parse_time -- same convention as point's --at.
+        args = build_parser().parse_args(["plan", "--tle-dir", "x"])
+        assert args.at is None
+
+    def test_profiles_dir_defaults_to_none(self):
+        # None means "use the curated starter set" -- load_profile_catalog()
+        # with no argument -- not an empty directory.
+        args = build_parser().parse_args(["plan", "--tle-dir", "x"])
+        assert args.profiles_dir is None
+
+
+class TestPlan:
+    def test_lists_a_pass_with_its_transmitter(
+        self, plan_config_path, tle_dir_path, profiles_dir_path, capsys
+    ):
+        code = run_plan(
+            [
+                "plan",
+                "--tle-dir",
+                str(tle_dir_path),
+                "--profiles-dir",
+                str(profiles_dir_path),
+                "--at",
+                "2026-08-28T00:00:00+00:00",
+                "--hours",
+                "48",
+            ],
+            plan_config_path,
+        )
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "TEME EXAMPLE" in out
+        assert "(unconditional)" in out
+        assert "AOS" in out
+        assert "TCA" in out
+        assert "LOS" in out
+        assert "435.6000 MHz down" in out
+        assert "cw" in out
+        assert "test beacon" in out
+
+    def test_multiple_passes_come_out_in_chronological_order(
+        self, plan_config_path, tle_dir_path, profiles_dir_path, capsys
+    ):
+        # Same TLE, observer, and 48-hour window as
+        # test_pass_prediction.py's "finds multiple passes in a two day
+        # window" case -- that test is where ">5 passes" is proven; this
+        # one only checks the CLI prints more than one of them, in order.
+        code = run_plan(
+            [
+                "plan",
+                "--tle-dir",
+                str(tle_dir_path),
+                "--profiles-dir",
+                str(profiles_dir_path),
+                "--at",
+                "2026-08-28T00:00:00+00:00",
+                "--hours",
+                "48",
+            ],
+            plan_config_path,
+        )
+
+        out = capsys.readouterr().out
+        assert code == 0
+        aos_lines = [line for line in out.splitlines() if line.strip().startswith("AOS")]
+        assert len(aos_lines) > 1
+        aos_times = [line.split()[1] for line in aos_lines]
+        assert aos_times == sorted(aos_times)
+
+    def test_no_passes_in_window_says_so(
+        self, plan_config_path, tle_dir_path, profiles_dir_path, capsys
+    ):
+        code = run_plan(
+            [
+                "plan",
+                "--tle-dir",
+                str(tle_dir_path),
+                "--profiles-dir",
+                str(profiles_dir_path),
+                "--at",
+                "2026-08-28T00:00:00+00:00",
+                "--hours",
+                "0.001",
+            ],
+            plan_config_path,
+        )
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "Nothing above the horizon in that window." in out
+
+    def test_visual_flag_adds_an_illumination_line(
+        self, plan_config_path, tle_dir_path, profiles_dir_path, capsys
+    ):
+        code = run_plan(
+            [
+                "plan",
+                "--tle-dir",
+                str(tle_dir_path),
+                "--profiles-dir",
+                str(profiles_dir_path),
+                "--at",
+                "2026-08-28T00:00:00+00:00",
+                "--hours",
+                "48",
+                "--visual",
+            ],
+            plan_config_path,
+        )
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "naked-eye visible near TCA:" in out
+
+    def test_without_visual_no_illumination_line(
+        self, plan_config_path, tle_dir_path, profiles_dir_path, capsys
+    ):
+        code = run_plan(
+            [
+                "plan",
+                "--tle-dir",
+                str(tle_dir_path),
+                "--profiles-dir",
+                str(profiles_dir_path),
+                "--at",
+                "2026-08-28T00:00:00+00:00",
+                "--hours",
+                "48",
+            ],
+            plan_config_path,
+        )
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "naked-eye visible" not in out
+
+    def test_a_tle_with_no_matching_profile_is_skipped_not_fatal(
+        self, plan_config_path, tle_dir_path, tmp_path, capsys
+    ):
+        empty_profiles_dir = tmp_path / "empty_profiles"
+        empty_profiles_dir.mkdir()
+
+        code = run_plan(
+            [
+                "plan",
+                "--tle-dir",
+                str(tle_dir_path),
+                "--profiles-dir",
+                str(empty_profiles_dir),
+                "--at",
+                "2026-08-28T00:00:00+00:00",
+                "--hours",
+                "48",
+            ],
+            plan_config_path,
+        )
+
+        assert code == 0
+        assert "No curated profile" in capsys.readouterr().err
+
+    def test_an_unparseable_tle_file_is_skipped_not_fatal(
+        self, plan_config_path, profiles_dir_path, tmp_path, capsys
+    ):
+        garbled_dir = tmp_path / "garbled"
+        garbled_dir.mkdir()
+        (garbled_dir / "garbage.tle").write_text("not a tle\nat all\n", encoding="utf-8")
+
+        code = run_plan(
+            [
+                "plan",
+                "--tle-dir",
+                str(garbled_dir),
+                "--profiles-dir",
+                str(profiles_dir_path),
+                "--hours",
+                "48",
+            ],
+            plan_config_path,
+        )
+
+        assert code == 0
+        assert "Could not read" in capsys.readouterr().err
+
+    def test_missing_tle_dir_is_an_error(self, plan_config_path, tmp_path, capsys):
+        missing = tmp_path / "does-not-exist"
+
+        code = run_plan(["plan", "--tle-dir", str(missing)], plan_config_path)
 
         assert code == 1
         assert capsys.readouterr().err.startswith("Error:")
