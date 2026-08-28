@@ -227,7 +227,7 @@ def _quit_on_sigint(app: _Quittable) -> Iterator[None]:
     callback happens to be executing next. Before this existed that was
     :meth:`~qsorbit.ui.waterfall_widget.WaterfallWidget._on_timer`, its
     50 ms poll being the shortest-period timer always running under
-    ``_show_instruments``, and the ``KeyboardInterrupt`` raised inside it
+    ``_build_instruments``, and the ``KeyboardInterrupt`` raised inside it
     propagated out through Qt's C++ dispatch as an unhandled exception -
     PySide6's own exception hook printed a traceback, cosmetic since
     ``app.exec()`` still returned and the run still completed, but a real
@@ -1074,10 +1074,24 @@ def _run_receive(
         else None
     )
 
+    # Built before the session starts, and the ordering is the point of
+    # the call rather than an accident of it. The window used to be built
+    # after the session had already started, so QApplication and five
+    # widgets were constructed while the SDR reader thread was already
+    # streaming -- and Session 24 measured the cost of that
+    # exactly once per run, in thirteen windowed runs across two commits,
+    # indoors and out, from 31 s to 1261 s: a single ~1.03 s stall
+    # accounting for essentially the whole of the reported USB loss,
+    # against 0.0018% for the same code headless. Standing up the
+    # graphics stack holds the GIL long enough to starve a thread that is
+    # mid-read, and the fix is to have finished doing it before there is
+    # a thread to starve.
+    run_window = _build_instruments(args, satellite, session, loop, feeds) if args.window else None
+
     session.start()
     try:
-        if args.window:
-            _show_instruments(args, satellite, session, loop, feeds)
+        if run_window is not None:
+            run_window()
         elif session.wait(args.seconds):
             # The demodulating thread ended before the clock did, which
             # means the blocks stopped arriving. Sleeping out the rest of
@@ -1094,14 +1108,27 @@ def _run_receive(
     return 0
 
 
-def _show_instruments(
+def _build_instruments(
     args: argparse.Namespace,
     satellite: Satellite,
     session: ReceiveSession,
     loop: TrackingLoop | None,
     feeds: tuple[SpectrumSubscription, SpectrumSubscription] | None = None,
-) -> None:
-    """Open the instrument window and run Qt's event loop until it closes.
+) -> Callable[[], None]:
+    """Build the instrument window, and return a callable that runs it.
+
+    **Split from running the event loop so the caller can start the
+    session in between**, which is the whole reason this is two steps.
+    Everything expensive about Qt -- constructing QApplication, loading
+    the platform plugin, building five widgets, realising a native window
+    -- happens here, before any reader thread exists. See
+    :func:`_run_receive` for the measurement that made that ordering
+    load-bearing.
+
+    Returning a closure rather than the window keeps every Qt object
+    inside this function, so the deferred import below stays the only
+    place PySide6 is named and nothing Qt-typed reaches a module-level
+    annotation.
 
     **Qt is imported here and nowhere above**, because importing PySide6
     at module scope would make the entire CLI unusable anywhere it is not
@@ -1173,15 +1200,24 @@ def _show_instruments(
         title=f"QSOrbit - receiving {satellite.name}",
     )
     window.show()
-    if args.seconds is not None:
-        # Honoured rather than ignored: a --seconds that silently did
-        # nothing under --window is precisely the sort of quiet
-        # disagreement between a flag and its behaviour this project
-        # keeps finding the hard way.
-        QTimer.singleShot(int(args.seconds * 1000), app.quit)
 
-    with _quit_on_sigint(app):
-        app.exec()
+    def run() -> None:
+        """Run Qt's event loop until the window closes or time is up."""
+        if args.seconds is not None:
+            # Honoured rather than ignored: a --seconds that silently did
+            # nothing under --window is precisely the sort of quiet
+            # disagreement between a flag and its behaviour this project
+            # keeps finding the hard way.
+            #
+            # Started here rather than at build time so the countdown
+            # measures the receiving, not the receiving plus however long
+            # the session took to come up.
+            QTimer.singleShot(int(args.seconds * 1000), app.quit)
+
+        with _quit_on_sigint(app):
+            app.exec()
+
+    return run
 
 
 def _command_stop(config: StationConfig, factory: RotorFactory) -> int:
