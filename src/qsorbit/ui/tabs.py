@@ -48,12 +48,26 @@ from qsorbit.ui.waterfall_widget import WaterfallWidget
 from qsorbit.ui.zoom_controller import ZoomController
 from qsorbit.ui.zoom_controls_widget import ZoomControlsWidget
 
-#: Width of the Radio tab's right-hand column of small cards. Wide
-#: enough for the frequency readout at its 30 px size, which is the
-#: widest thing that has to fit.
+#: **Minimum** width of the Radio tab's right-hand column of small
+#: cards, not a fixed one. See :data:`ROTOR_COLUMN_WIDTH` for what a
+#: fixed width cost.
 SIDE_COLUMN_WIDTH: Final = 300
 
-#: Width of the Rotor tab's left-hand column.
+#: **Minimum** width of the Rotor tab's left-hand column.
+#:
+#: These were ``setFixedWidth`` when the shell shipped, and both were
+#: guesses about content this module does not own. With a real rotor
+#: attached the readout's value column needed 249 px and got 142, so
+#: four of its six rows were clipped mid-word on screen -- "39131 km,
+#: approaching at 0." with the rate itself gone, which is a readout
+#: quietly dropping the number it exists to show.
+#:
+#: The mocked rotor used while building the shell reported no sample at
+#: all, so every value was a one-character placeholder and nothing was
+#: ever too wide. The bug needed real hardware to appear, and a fixed
+#: width is what made it possible: **a container must not assert how
+#: wide somebody else's content is.** A minimum lets a column start at a
+#: sensible size and grow to whatever it is actually given to show.
 ROTOR_COLUMN_WIDTH: Final = 320
 
 #: Feed names claimed by a Radio tab, in claim order. A second Radio
@@ -98,7 +112,7 @@ class RadioTab(QWidget):
 
         left, left_layout = _column()
         right, right_layout = _column()
-        right.setFixedWidth(SIDE_COLUMN_WIDTH)
+        right.setMinimumWidth(SIDE_COLUMN_WIDTH)
 
         if hub.has_spectrum:
             # Claimed before any widget is constructed and long before
@@ -229,7 +243,7 @@ class RotorTab(QWidget):
         layout.setSpacing(10)
 
         left, left_layout = _column()
-        left.setFixedWidth(ROTOR_COLUMN_WIDTH)
+        left.setMinimumWidth(ROTOR_COLUMN_WIDTH)
 
         rotor = hub.rotor
         if rotor is not None:
