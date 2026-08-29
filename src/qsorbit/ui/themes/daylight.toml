@@ -1,0 +1,40 @@
+# Daylight -- Light theme for operating outdoors in sun. The waterfall ramp runs dark-on-light, so a strong carrier is the darkest thing on screen rather than the brightest.
+#
+# Palette tokens are named for what they are for, not what colour they are.
+# Every widget, stylesheet and custom-drawn alike, styles itself from these.
+#
+# Copy this file into the themes/ folder beside your config.toml, keep the
+# same filename, and yours is used instead of this one.
+
+# Optional. Absent means 1. Declare it if you publish a theme, so a build
+# that cannot read it can say so clearly instead of guessing.
+format = 1
+name = "Daylight"
+author = "QSOrbit"
+description = "Light theme for operating outdoors in sun. The waterfall ramp runs dark-on-light, so a strong carrier is the darkest thing on screen rather than the brightest."
+url = "https://github.com/QSOrbit/qsorbit"
+
+[palette]
+bg        = "#eef1f5"
+panel     = "#ffffff"
+panel_alt = "#e6ebf1"
+inset     = "#f7f9fc"
+edge      = "#c2ccd9"
+text      = "#1c2430"
+dim       = "#5a6a7d"
+accent    = "#0a6ebd"
+ok        = "#1d8a5b"
+warn      = "#a56a00"
+alarm     = "#c43d3d"
+
+# The colormap is part of the theme. Positions span 0.0 to 1.0 and must
+# rise strictly; brightness rises (or, for a light theme, falls) monotonically
+# across the whole ramp so "brighter is stronger" holds everywhere.
+[waterfall]
+stops = [
+    [0.0, "#f7f9fc"],
+    [0.3, "#c8dcf0"],
+    [0.55, "#6ea0cd"],
+    [0.8, "#285a8c"],
+    [1.0, "#0a2346"],
+]

@@ -1,0 +1,40 @@
+# Night Ops -- Red on black, for visual-pass evenings. Every token is a red so nothing on screen costs dark adaptation.
+#
+# Palette tokens are named for what they are for, not what colour they are.
+# Every widget, stylesheet and custom-drawn alike, styles itself from these.
+#
+# Copy this file into the themes/ folder beside your config.toml, keep the
+# same filename, and yours is used instead of this one.
+
+# Optional. Absent means 1. Declare it if you publish a theme, so a build
+# that cannot read it can say so clearly instead of guessing.
+format = 1
+name = "Night Ops"
+author = "QSOrbit"
+description = "Red on black, for visual-pass evenings. Every token is a red so nothing on screen costs dark adaptation."
+url = "https://github.com/QSOrbit/qsorbit"
+
+[palette]
+bg        = "#000000"
+panel     = "#0d0303"
+panel_alt = "#160404"
+inset     = "#000000"
+edge      = "#3a0d0d"
+text      = "#ff5a4d"
+dim       = "#8a2a20"
+accent    = "#ff3b30"
+ok        = "#d93a30"
+warn      = "#ff7a3d"
+alarm     = "#ff2d2d"
+
+# The colormap is part of the theme. Positions span 0.0 to 1.0 and must
+# rise strictly; brightness rises (or, for a light theme, falls) monotonically
+# across the whole ramp so "brighter is stronger" holds everywhere.
+[waterfall]
+stops = [
+    [0.0, "#000000"],
+    [0.35, "#3a0505"],
+    [0.6, "#8c0f0f"],
+    [0.8, "#ff2d2d"],
+    [1.0, "#ff9c8a"],
+]

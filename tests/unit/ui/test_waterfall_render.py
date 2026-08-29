@@ -12,7 +12,6 @@ import numpy as np
 import pytest
 
 from qsorbit.ui.waterfall_render import (
-    COLORMAP,
     WaterfallScale,
     bins_to_pixels,
     blank_row,
@@ -162,26 +161,8 @@ def test_rejects_an_empty_frame():
 # ----------------------------------------------------------------------
 
 
-def test_colormap_is_a_full_uint8_rgb_table():
-    assert COLORMAP.shape == (256, 3)
-    assert COLORMAP.dtype == np.uint8
-
-
-def test_brightness_rises_monotonically_across_the_ramp():
-    """'Brighter means stronger' has to hold everywhere, or the panel lies."""
-    luminance = COLORMAP.astype(np.float64).sum(axis=1)
-    steps = np.diff(luminance)
-    assert (steps >= -1e-9).all()
-    assert luminance[-1] > luminance[0]
-
-
-def test_the_ramp_starts_dark_and_ends_bright():
-    assert COLORMAP[0].max() <= 8
-    assert COLORMAP[255].min() >= 240
-
-
-def test_colorize_shapes_indices_into_rgb():
-    out = colorize(np.array([0, 128, 255], dtype=np.uint8))
+def test_colorize_shapes_indices_into_rgb(colormap):
+    out = colorize(np.array([0, 128, 255], dtype=np.uint8), colormap)
     assert out.shape == (3, 3)
     assert out.dtype == np.uint8
 
@@ -191,17 +172,17 @@ def test_colorize_shapes_indices_into_rgb():
 # ----------------------------------------------------------------------
 
 
-def test_render_row_produces_one_rgb_row_of_the_requested_width():
-    row = render_row(np.full(2048, -70.0), 640, WaterfallScale())
+def test_render_row_produces_one_rgb_row_of_the_requested_width(colormap):
+    row = render_row(np.full(2048, -70.0), 640, WaterfallScale(), colormap)
     assert row.shape == (640, 3)
     assert row.dtype == np.uint8
 
 
-def test_render_row_draws_a_carrier_brighter_than_its_noise_floor():
+def test_render_row_draws_a_carrier_brighter_than_its_noise_floor(colormap):
     """End to end, on the numbers a real capture actually produces."""
     bins = np.full(2048, -66.8)
     bins[1024] = -40.0
-    row = render_row(bins, 800, WaterfallScale())
+    row = render_row(bins, 800, WaterfallScale(), colormap)
 
     luminance = row.astype(np.float64).sum(axis=1)
     carrier_pixel = int(np.argmax(luminance))
@@ -210,9 +191,21 @@ def test_render_row_draws_a_carrier_brighter_than_its_noise_floor():
     assert abs(carrier_pixel - (1024 * 800) // 2048) <= 1
 
 
-def test_render_row_of_a_silent_frame_is_uniformly_dark():
-    row = render_row(np.full(1024, -200.0), 400, WaterfallScale())
-    assert row.max() <= 8
+def test_render_row_of_a_silent_frame_is_uniformly_the_ramp_floor(colormap):
+    """Silence is the bottom of *this theme's* ramp, which is not always dark.
+
+    This assertion used to read ``row.max() <= 8`` -- "silent means
+    nearly black" -- which was true only because the ramp was a module
+    constant starting at pure black. Daylight's ramp floor is
+    ``#f7f9fc``, so under a theme system the old assertion was testing
+    the wrong property and would have failed on a perfectly correct
+    light theme. The property that actually holds everywhere is exact
+    rather than approximate: every pixel of a silent frame is the
+    colormap's own floor colour.
+    """
+    row = render_row(np.full(1024, -200.0), 400, WaterfallScale(), colormap)
+    expected = np.array(colormap.floor_color, dtype=np.uint8)
+    assert np.array_equal(np.unique(row.reshape(-1, 3), axis=0), expected[np.newaxis, :])
 
 
 # ----------------------------------------------------------------------
@@ -287,18 +280,18 @@ def test_ticks_reject_a_useless_tick_budget():
         frequency_ticks(100.0, 200.0, 1)
 
 
-def test_blank_row_is_indistinguishable_from_genuine_silence():
+def test_blank_row_is_indistinguishable_from_genuine_silence(colormap):
     """A pre-filled row must not read as a seam against real quiet data."""
-    silent = render_row(np.full(512, -1e6), 320, WaterfallScale())
-    assert np.array_equal(blank_row(320), silent)
+    silent = render_row(np.full(512, -1e6), 320, WaterfallScale(), colormap)
+    assert np.array_equal(blank_row(320, colormap), silent)
 
 
-def test_blank_row_has_the_right_shape_and_dtype():
-    row = blank_row(640)
+def test_blank_row_has_the_right_shape_and_dtype(colormap):
+    row = blank_row(640, colormap)
     assert row.shape == (640, 3)
     assert row.dtype == np.uint8
 
 
-def test_blank_row_rejects_an_unusable_width():
+def test_blank_row_rejects_an_unusable_width(colormap):
     with pytest.raises(ValueError, match="width"):
-        blank_row(0)
+        blank_row(0, colormap)

@@ -29,6 +29,8 @@ from PySide6.QtWidgets import QWidget
 from qsorbit.core.dsp.spectrum import frequency_axis_hz
 from qsorbit.ui.spectrum_axis_paint import paint_frequency_axis
 from qsorbit.ui.spectrum_zoom import dc_spike_in_view, visible_slice
+from qsorbit.ui.theme import Theme
+from qsorbit.ui.theme_manager import ThemeManager, theme_color
 from qsorbit.ui.waterfall_render import WaterfallScale, bins_to_pixels, tick_position
 from qsorbit.ui.waterfall_widget import FrameSource
 from qsorbit.ui.zoom_controller import ZoomController
@@ -75,6 +77,7 @@ class SpectrumLineWidget(QWidget):
         self,
         source: FrameSource,
         *,
+        themes: ThemeManager,
         zoom: ZoomController | None = None,
         scale: WaterfallScale | None = None,
         render_width: int = DEFAULT_RENDER_WIDTH,
@@ -82,6 +85,8 @@ class SpectrumLineWidget(QWidget):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._themes = themes
+        themes.changed.connect(self._on_theme_changed)
         if render_width <= 0:
             raise ValueError(f"render_width must be positive, got {render_width!r}.")
 
@@ -204,12 +209,28 @@ class SpectrumLineWidget(QWidget):
         painter.setPen(self.palette().windowText().color())
         painter.drawPath(path)
 
+    def _on_theme_changed(self, theme: Theme) -> None:
+        self.update()
+
     def _paint_dc_marker(self, painter: QPainter, plot_rect: QRect, marker_hz: float) -> None:
         """See :meth:`~qsorbit.ui.waterfall_widget.WaterfallWidget._paint_dc_marker` —
         the same "visual marker only" decision, drawn identically here so
-        the marker lines up between the two panels."""
+        the marker lines up between the two panels.
+
+            The DC marker is drawn in the theme's ``warn`` colour,
+            which is the semantically right token: the spike is a
+            receiver artifact to be discounted, not a signal. It used to
+            be ``Qt.GlobalColor.yellow`` in both spectrum panels -- a
+            hardcoded colour that survived the first theme pass because
+            the check for literals matched ``Qt.yellow`` and the code
+            said ``Qt.GlobalColor.yellow``. It showed up as a bright
+            yellow line under Night Ops, the one theme where a bright
+            yellow line costs the operator their dark adaptation, which
+            is exactly the failure the no-hardcoded-colour rule exists
+            to prevent.
+        """
         x = int(round(tick_position(marker_hz, self._start_hz, self._stop_hz, plot_rect.width())))
-        painter.setPen(Qt.GlobalColor.yellow)
+        painter.setPen(theme_color(self._themes.current, "warn"))
         painter.drawLine(x, plot_rect.top(), x, plot_rect.bottom())
         painter.drawText(
             QRect(x + 3, plot_rect.top() + 2, 24, 14), Qt.AlignmentFlag.AlignLeft, "DC"

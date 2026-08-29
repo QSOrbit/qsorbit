@@ -1,0 +1,40 @@
+# Earth -- Deep ocean blues and a shoreline ramp.
+#
+# Palette tokens are named for what they are for, not what colour they are.
+# Every widget, stylesheet and custom-drawn alike, styles itself from these.
+#
+# Copy this file into the themes/ folder beside your config.toml, keep the
+# same filename, and yours is used instead of this one.
+
+# Optional. Absent means 1. Declare it if you publish a theme, so a build
+# that cannot read it can say so clearly instead of guessing.
+format = 1
+name = "Earth"
+author = "QSOrbit"
+description = "Deep ocean blues and a shoreline ramp."
+url = "https://github.com/QSOrbit/qsorbit"
+
+[palette]
+bg        = "#061420"
+panel     = "#0a1e30"
+panel_alt = "#0e2840"
+inset     = "#04101c"
+edge      = "#1d3f5c"
+text      = "#d6e6f2"
+dim       = "#6f8ba3"
+accent    = "#3fd0c9"
+ok        = "#58d68f"
+warn      = "#ffcc66"
+alarm     = "#ff7a6a"
+
+# The colormap is part of the theme. Positions span 0.0 to 1.0 and must
+# rise strictly; brightness rises (or, for a light theme, falls) monotonically
+# across the whole ramp so "brighter is stronger" holds everywhere.
+[waterfall]
+stops = [
+    [0.0, "#04101c"],
+    [0.35, "#0a3550"],
+    [0.6, "#0f7f8c"],
+    [0.8, "#48c48f"],
+    [1.0, "#f2ecd8"],
+]
