@@ -95,6 +95,7 @@ from qsorbit.core.sdr import (
 )
 from qsorbit.core.station import ConfigError, StationConfig, load_station_config
 from qsorbit.core.tracker import Pass, Satellite, TrackerError, predict_passes
+from qsorbit.ui.theme import DEFAULT_THEME_NAME
 
 #: How long ``point --send`` waits for the rotor to settle, in seconds.
 DEFAULT_ARRIVAL_TIMEOUT_S = 90.0
@@ -572,6 +573,16 @@ def _add_receive_command(subcommands: argparse._SubParsersAction) -> None:
         help=(
             "Open the instrument window - waterfall and live quieting, plus the "
             "readout when --send is given."
+        ),
+    )
+    receive.add_argument(
+        "--theme",
+        metavar="SLUG",
+        default=DEFAULT_THEME_NAME,
+        help=(
+            "Theme for the instrument window, by filename stem - one of the eight "
+            "shipped in ui/themes/, or your own dropped into the themes/ directory "
+            "beside config.toml. Defaults to %(default)s."
         ),
     )
     receive.add_argument(
@@ -1356,12 +1367,33 @@ def _show_instruments(
     from qsorbit.ui.quieting_widget import QuietingWidget
     from qsorbit.ui.readout_widget import ReadoutWidget
     from qsorbit.ui.spectrum_line_widget import SpectrumLineWidget
+    from qsorbit.ui.theme_manager import ThemeManager
     from qsorbit.ui.waterfall_render import WaterfallScale
     from qsorbit.ui.waterfall_widget import WaterfallWidget
     from qsorbit.ui.zoom_controller import ZoomController
     from qsorbit.ui.zoom_controls_widget import ZoomControlsWidget
 
     app = QApplication.instance() or QApplication([])
+
+    # Themed before a single widget is constructed. The order matters:
+    # apply() sets the application-wide stylesheet and palette, and a
+    # widget built beforehand would be styled on its first repaint
+    # rather than on creation - which shows up as a visible flash of
+    # unthemed chrome on a slow start.
+    themes = ThemeManager.discover()
+    try:
+        themes.apply(getattr(args, "theme", None) or DEFAULT_THEME_NAME)
+    except KeyError:
+        # A bad --theme is worth a word rather than a traceback: the
+        # window is still perfectly usable in the default theme, and
+        # refusing to open a receiver over a misspelt colour scheme
+        # would be the wrong trade during a pass.
+        print(
+            f"Unknown theme {args.theme!r}; using {DEFAULT_THEME_NAME}. "
+            f"Available: {', '.join(themes.slugs)}.",
+            file=sys.stderr,
+        )
+        themes.apply(DEFAULT_THEME_NAME)
 
     if feeds is None:  # pragma: no cover - guarded by args.window at the call site
         raise RuntimeError("The instrument window needs spectrum feeds to draw from.")
@@ -1400,9 +1432,12 @@ def _show_instruments(
         # always a live reading to show, muted or not.
         quieting=QuietingWidget(session),
         zoom_controls=ZoomControlsWidget(zoom_controller),
-        spectrum_line=SpectrumLineWidget(line_feed, zoom=zoom_controller, scale=scale),
-        waterfall=WaterfallWidget(waterfall_feed, zoom=zoom_controller, scale=scale),
+        spectrum_line=SpectrumLineWidget(
+            line_feed, themes=themes, zoom=zoom_controller, scale=scale
+        ),
+        waterfall=WaterfallWidget(waterfall_feed, themes=themes, zoom=zoom_controller, scale=scale),
         zoom_controller=zoom_controller,
+        themes=themes,
         title=f"QSOrbit - receiving {satellite.name}",
     )
     window.show()

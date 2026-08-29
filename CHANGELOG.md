@@ -54,10 +54,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pass prediction: acquisition of signal, time of closest approach, loss of signal, and the azimuth track between them, for a satellite over a given search window.
 - An optional horizon mask in station config (`[[horizon]]`) describing what your own site actually blocks, as a handful of measured azimuth/elevation points. Pass prediction filters out anything that never clears it. A station with no mask sees the plain geometric horizon, same as before this existed.
 - A per-pass naked-eye visibility flag, from a closed-form check of whether the satellite is sunlit and the sky is dark enough at the observer to see it.
+- Themes, as files. A theme is one small TOML file naming eleven colours and the waterfall's colour ramp, and QSOrbit ships eight: Deep Space, Daylight, Earth, Mars, Luna, Night Ops, LCARS and WOPR. Light and dark are both first-class, because the station operates outdoors in daylight and on into the night.
+- Night Ops is red on black throughout, so a visual-pass evening costs no dark adaptation.
+- Themes can also change shape and typography, not just colour — border treatment, corner radii and font — which is what LCARS and WOPR are for. Two fonts ship with the app so both look right on a machine that has never seen them.
+- Your own theme is the same kind of file, dropped into a `themes/` folder beside your config. Give it the same name as one of the shipped themes and yours is used instead, so "start from Deep Space and change two colours" needs nothing but a copy and an edit.
+- A theme can name its author, a description and a URL, so a theme someone shares stays attributable to whoever made it.
+- Theme files declare a format version, so a theme written for a later QSOrbit says so plainly instead of failing on a key name that looks like a typo.
+- A theme asking for a border-and-typography style this version doesn't have still loads and uses its colours, rather than refusing entirely. It says once that it's drawing in the plain style so a downloaded theme that looks unlike its screenshot isn't a mystery.
+- `qsorbit receive --theme` picks the theme for the instrument window.
+- Ctrl+T in the instrument window cycles through the installed themes (Ctrl+Shift+T steps back), so a theme can be judged against a live waterfall rather than by relaunching.
 
 ### Changed
 
 - Doppler arithmetic moved to its own module so the signal-processing layer can use it without pulling in the satellite-propagation library. Existing imports are unchanged.
+- The waterfall's colour ramp is now part of the theme rather than fixed in the code, so switching theme restyles it along with everything else. Every ramp still runs monotonically from dark to bright (or bright to dark, for the light theme), so brighter always means stronger and no band of the scale can look like a signal that is not there.
 
 - The helper that works out where a signal sits within a capture now measures from the frequency the tuner actually reached rather than the one it was asked for. The two differ by however much the tuner rounded, and nothing downstream could have noticed.
 - The rotor/sky readout is now a panel rather than a window in its own right, so it can share a window with the waterfall — or run without it. Each panel feeds itself, which means looking at a spectrum no longer needs a rotor connected, and watching the rotor no longer needs an SDR.
@@ -69,6 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The marker showing the receiver's own centre-frequency artifact is no longer always yellow. It follows the theme like everything else, which matters most in Night Ops, where a bright yellow line across the spectrum undid the whole point of a theme designed to preserve dark adaptation.
 - The waterfall and the spectrum line trace no longer take frames from each other. With both panels open, one would update while the other sat frozen, and they alternated: each was emptying a buffer they shared, so whichever asked first got everything that had arrived. Each panel now has its own feed and both show every frame.
 - Receiving without a window no longer reports a large number of dropped blocks. Nothing was being lost — the spectrum consumer was created whether or not anything would ever look at it, and blocks queued for it were discarded unread — but a 60-second run announcing 453 dropped blocks and 118 MB reads as catastrophic data loss. Off and broken should never look the same.
 - The receiver no longer loses about a second of samples every time it opens its window. It was building the window while the radio was already streaming, so standing up the graphics stack starved the reader exactly once per run — which is where essentially all of the "USB loss" this project has been reporting for months actually came from. Measured at 1.0331 seconds before and 0.001 seconds after, over runs from twenty seconds to twenty minutes.

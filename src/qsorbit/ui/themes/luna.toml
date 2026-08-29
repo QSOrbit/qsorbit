@@ -1,0 +1,39 @@
+# Luna -- Neutral greys, regolith to highlight. The only theme with no hue in its ramp.
+#
+# Palette tokens are named for what they are for, not what colour they are.
+# Every widget, stylesheet and custom-drawn alike, styles itself from these.
+#
+# Copy this file into the themes/ folder beside your config.toml, keep the
+# same filename, and yours is used instead of this one.
+
+# Optional. Absent means 1. Declare it if you publish a theme, so a build
+# that cannot read it can say so clearly instead of guessing.
+format = 1
+name = "Luna"
+author = "QSOrbit"
+description = "Neutral greys, regolith to highlight. The only theme with no hue in its ramp."
+url = "https://github.com/QSOrbit/qsorbit"
+
+[palette]
+bg        = "#0b0d10"
+panel     = "#14171b"
+panel_alt = "#1a1e23"
+inset     = "#0a0c0e"
+edge      = "#2c3138"
+text      = "#dfe4e9"
+dim       = "#7d858e"
+accent    = "#c0c8d2"
+ok        = "#9fb8a8"
+warn      = "#b9a88a"
+alarm     = "#c98a8a"
+
+# The colormap is part of the theme. Positions span 0.0 to 1.0 and must
+# rise strictly; brightness rises (or, for a light theme, falls) monotonically
+# across the whole ramp so "brighter is stronger" holds everywhere.
+[waterfall]
+stops = [
+    [0.0, "#0a0c0e"],
+    [0.35, "#3a4148"],
+    [0.65, "#8a939c"],
+    [1.0, "#e8edf2"],
+]

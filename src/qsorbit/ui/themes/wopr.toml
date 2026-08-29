@@ -1,0 +1,47 @@
+# WOPR -- CRT terminal: phosphor green, scanlines, and a glow on anything that matters.
+#
+# Palette tokens are named for what they are for, not what colour they are.
+# Every widget, stylesheet and custom-drawn alike, styles itself from these.
+#
+# Copy this file into the themes/ folder beside your config.toml, keep the
+# same filename, and yours is used instead of this one.
+
+# Optional. Absent means 1. Declare it if you publish a theme, so a build
+# that cannot read it can say so clearly instead of guessing.
+format = 1
+name = "WOPR"
+author = "QSOrbit"
+description = "CRT terminal: phosphor green, scanlines, and a glow on anything that matters."
+url = "https://github.com/QSOrbit/qsorbit"
+
+[palette]
+bg        = "#010904"
+panel     = "#03160b"
+panel_alt = "#052312"
+inset     = "#010904"
+edge      = "#155c30"
+text      = "#7dff9e"
+dim       = "#3f9159"
+accent    = "#4dff7a"
+ok        = "#7dff9e"
+warn      = "#ffd24a"
+alarm     = "#ff4f4f"
+
+# The colormap is part of the theme. Positions span 0.0 to 1.0 and must
+# rise strictly; brightness rises (or, for a light theme, falls) monotonically
+# across the whole ramp so "brighter is stronger" holds everywhere.
+[waterfall]
+stops = [
+    [0.0, "#010703"],
+    [0.4, "#08461e"],
+    [0.65, "#19a046"],
+    [0.85, "#5aff8c"],
+    [1.0, "#e1ffe1"],
+]
+
+# Shape, typography and effects. The shell implements the style; the theme
+# picks one and recolours it.
+[chrome]
+style = "crt"
+font  = "Share Tech Mono"
+mono  = "Share Tech Mono"

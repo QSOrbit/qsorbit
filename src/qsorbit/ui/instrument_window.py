@@ -25,12 +25,15 @@ rotor, or only an SDR, works exactly as well as one with both.
 
 from __future__ import annotations
 
-from PySide6.QtGui import QCloseEvent
+import sys
+
+from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import QLabel, QMainWindow, QVBoxLayout, QWidget
 
 from qsorbit.ui.quieting_widget import QuietingWidget
 from qsorbit.ui.readout_widget import ReadoutWidget
 from qsorbit.ui.spectrum_line_widget import SpectrumLineWidget
+from qsorbit.ui.theme_manager import ThemeManager
 from qsorbit.ui.waterfall_widget import WaterfallWidget
 from qsorbit.ui.zoom_controller import ZoomController
 from qsorbit.ui.zoom_controls_widget import ZoomControlsWidget
@@ -52,6 +55,18 @@ class InstrumentWindow(QMainWindow):
         quieting: The live squelch-quieting panel, or ``None``.
         zoom_controls: The span/lock numeric controls shared by
             ``spectrum_line`` and ``waterfall``, or ``None``.
+        themes: The theme manager, or ``None``. When given, **Ctrl+T
+            cycles through every available theme** and Ctrl+Shift+T
+            steps back. This is a bench affordance rather than the real
+            control: the theme picker belongs in the shell's top bar,
+            which is the next PR. It exists now because "switching
+            theme at runtime restyles every widget, waterfall colormap
+            included, without a restart" is the chunk's marquee
+            done-when clause, and a shortcut is what turns that from a
+            unit-test claim into something an operator watches happen
+            on a real monitor. It is also the fastest way to find a
+            widget that quietly fails to repaint — under a relaunch you
+            would never see it.
         zoom_controller: The pan/zoom/lock state itself, or ``None`` —
             not laid out (it draws nothing of its own), held only so
             :meth:`closeEvent` can stop its tracked-frequency polling
@@ -78,6 +93,7 @@ class InstrumentWindow(QMainWindow):
         quieting: QuietingWidget | None = None,
         zoom_controls: ZoomControlsWidget | None = None,
         zoom_controller: ZoomController | None = None,
+        themes: ThemeManager | None = None,
         title: str | None = None,
     ) -> None:
         super().__init__()
@@ -87,6 +103,7 @@ class InstrumentWindow(QMainWindow):
         self._quieting = quieting
         self._zoom_controls = zoom_controls
         self._zoom_controller = zoom_controller
+        self._themes = themes
 
         if title is None:
             title = (
@@ -125,6 +142,26 @@ class InstrumentWindow(QMainWindow):
         if readout is None and spectrum_line is None and waterfall is None and quieting is None:
             layout.addWidget(QLabel(_EMPTY_NOTE))
         self.setCentralWidget(central)
+
+        if themes is not None:
+            # Parented to the window, so both shortcuts die with it
+            # rather than outliving the thing they act on.
+            QShortcut(QKeySequence("Ctrl+T"), self, activated=lambda: self._cycle_theme(1))
+            QShortcut(QKeySequence("Ctrl+Shift+T"), self, activated=lambda: self._cycle_theme(-1))
+
+    def _cycle_theme(self, step: int) -> None:
+        """Apply the next (or previous) theme, wrapping around.
+
+        Prints the theme's name, because a theme whose palette is close
+        to its neighbour's is hard to tell apart at a glance and "which
+        one am I looking at" is the first question at the bench.
+        """
+        if self._themes is None:  # pragma: no cover - guarded at construction
+            return
+        slugs = self._themes.slugs
+        index = slugs.index(self._themes.current.slug)
+        theme = self._themes.apply(slugs[(index + step) % len(slugs)])
+        print(f"theme: {theme.name} ({theme.slug})", file=sys.stderr)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt's spelling
         """Stop every panel polling. Does not stop the hardware."""

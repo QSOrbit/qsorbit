@@ -30,6 +30,7 @@ from qsorbit.core.dsp.spectrum import SpectrumConfig
 from qsorbit.core.dsp.spectrum_stream import SpectrumStream
 from qsorbit.core.rotor import Arrival, HomingError, Position, Rotor, RotorErrorCode, RotorStatus
 from qsorbit.core.sdr import AppliedSettings, DeviceError, DeviceInfo, TunerType
+from qsorbit.ui.theme import DEFAULT_THEME_NAME, DEFAULT_THEMES_DIR, discover_themes
 
 # Vallado AIAA 2006-6753 Appendix C example, the same TLE used throughout
 # tests/unit/tracker/. Times below sit a few days past its epoch, inside
@@ -1386,3 +1387,68 @@ class TestReceiveParser:
             ["receive", "--tle", "x", "--downlink", "145.95", "--gain", "40"]
         )
         assert args.offset == DEFAULT_TUNING_OFFSET_KHZ
+
+
+class TestReceiveTheme:
+    """``receive --theme`` picks the instrument window's theme."""
+
+    def test_it_defaults_to_the_shipped_default(self):
+        args = build_parser().parse_args(
+            ["receive", "--tle", "x", "--downlink", "435.605e6", "--gain", "30"]
+        )
+        assert args.theme == DEFAULT_THEME_NAME
+
+    def test_it_accepts_a_slug(self):
+        args = build_parser().parse_args(
+            [
+                "receive",
+                "--tle",
+                "x",
+                "--downlink",
+                "435.605e6",
+                "--gain",
+                "30",
+                "--theme",
+                "night-ops",
+            ]
+        )
+        assert args.theme == "night-ops"
+
+    def test_every_shipped_slug_is_accepted_by_the_parser(self):
+        """The flag takes a stem rather than a choice list on purpose.
+
+        Restricting it to ``choices`` would reject a user's own theme
+        file, which is the whole point of themes being files -- so the
+        validation is a lookup at apply time, not at parse time.
+        """
+        for slug in discover_themes((DEFAULT_THEMES_DIR,)):
+            args = build_parser().parse_args(
+                [
+                    "receive",
+                    "--tle",
+                    "x",
+                    "--downlink",
+                    "435.605e6",
+                    "--gain",
+                    "30",
+                    "--theme",
+                    slug,
+                ]
+            )
+            assert args.theme == slug
+
+    def test_an_unknown_slug_still_parses(self):
+        args = build_parser().parse_args(
+            [
+                "receive",
+                "--tle",
+                "x",
+                "--downlink",
+                "435.605e6",
+                "--gain",
+                "30",
+                "--theme",
+                "hologram",
+            ]
+        )
+        assert args.theme == "hologram"

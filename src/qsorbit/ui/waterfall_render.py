@@ -30,6 +30,20 @@ as no change at all. A fixed window means brightness *means* something
 across time, which is the entire point of watching a pass. The defaults
 come from a real measurement rather than taste — see
 :class:`WaterfallScale`.
+
+**The colour ramp is not in here.** It used to be: a private ``_RAMP``
+interpolated into a module-level ``COLORMAP`` table once, at import.
+That made the waterfall the one widget in the app that could not be
+themed -- no restyling could reach a module global, and two panels could
+never differ -- so the ramp moved into
+:class:`~qsorbit.ui.theme.Colormap` and is handed to
+:func:`render_row` and :func:`blank_row` by the caller. What stays here
+is the argument the old ramp was chosen by, which the theme files
+inherited: brightness must rise (or, in a light theme, fall)
+monotonically across the whole range, so "brighter is stronger" holds
+everywhere and no band of the scale looks like a feature that is not
+there. All eight shipped themes are checked against that property by a
+test rather than by eye.
 """
 
 from __future__ import annotations
@@ -39,35 +53,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-#: Colour ramp control points, dark to bright, as ``(position, r, g, b)``
-#: with position in ``[0, 1]``. Black through blue and cyan into yellow
-#: and white: a conventional waterfall ramp, chosen because brightness
-#: rises monotonically across the whole range, so "brighter is stronger"
-#: holds everywhere and no band of the scale looks like a feature that
-#: is not there. Interpolated linearly into a 256-entry table once, at
-#: import, rather than per row.
-_RAMP: tuple[tuple[float, int, int, int], ...] = (
-    (0.00, 0, 0, 0),
-    (0.25, 0, 0, 128),
-    (0.50, 0, 160, 190),
-    (0.75, 240, 220, 60),
-    (1.00, 255, 255, 255),
-)
-
-
-def _build_colormap() -> np.ndarray:
-    """Interpolate :data:`_RAMP` into a 256x3 uint8 lookup table."""
-    positions = np.array([point[0] for point in _RAMP], dtype=np.float64)
-    table = np.empty((256, 3), dtype=np.uint8)
-    x = np.linspace(0.0, 1.0, 256)
-    for channel in range(3):
-        values = np.array([point[channel + 1] for point in _RAMP], dtype=np.float64)
-        table[:, channel] = np.interp(x, positions, values).astype(np.uint8)
-    return table
-
-
-#: The colour table, built once at import.
-COLORMAP: np.ndarray = _build_colormap()
+from qsorbit.ui.theme import Colormap
 
 
 @dataclass(frozen=True)
@@ -164,18 +150,21 @@ def db_to_index(power_db: np.ndarray, scale: WaterfallScale) -> np.ndarray:
     return (np.clip(normalised, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
-def colorize(indices: np.ndarray) -> np.ndarray:
-    """Look ``0..255`` indices up in :data:`COLORMAP`, returning RGB."""
-    return COLORMAP[indices]
+def colorize(indices: np.ndarray, colormap: Colormap) -> np.ndarray:
+    """Look ``0..255`` indices up in ``colormap``'s table, returning RGB."""
+    return colormap.table[indices]
 
 
-def render_row(power_db: np.ndarray, width: int, scale: WaterfallScale) -> np.ndarray:
+def render_row(
+    power_db: np.ndarray, width: int, scale: WaterfallScale, colormap: Colormap
+) -> np.ndarray:
     """Turn one spectrum frame into one row of RGB pixels.
 
     Args:
         power_db: The frame's power values, in dB.
         width: Pixels wide.
         scale: The dB window to map onto the ramp.
+        colormap: The ramp itself, from the active theme.
 
     Returns:
         A ``(width, 3)`` uint8 RGB array, ready to be written into an
@@ -188,7 +177,7 @@ def render_row(power_db: np.ndarray, width: int, scale: WaterfallScale) -> np.nd
     which, at 2048 bins against 800 pixels several times a second, is
     most of the work avoided.
     """
-    return colorize(db_to_index(bins_to_pixels(power_db, width), scale))
+    return colorize(db_to_index(bins_to_pixels(power_db, width), scale), colormap)
 
 
 def _label_decimals(step_hz: float) -> int:
@@ -261,7 +250,7 @@ def tick_position(frequency_hz: float, start_hz: float, stop_hz: float, width: i
     return (frequency_hz - start_hz) / (stop_hz - start_hz) * width
 
 
-def blank_row(width: int) -> np.ndarray:
+def blank_row(width: int, colormap: Colormap) -> np.ndarray:
     """One row of "nothing received", for pre-filling a waterfall's history.
 
     Exists so a display can start with a full-height buffer rather than
@@ -279,4 +268,4 @@ def blank_row(width: int) -> np.ndarray:
     """
     if width <= 0:
         raise ValueError(f"width must be positive, got {width!r}.")
-    return np.repeat(COLORMAP[0][np.newaxis, :], width, axis=0)
+    return np.repeat(colormap.table[0][np.newaxis, :], width, axis=0)

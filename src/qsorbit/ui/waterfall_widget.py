@@ -58,6 +58,8 @@ from qsorbit.core.dsp.spectrum import SpectrumConfig, frequency_axis_hz
 from qsorbit.core.dsp.spectrum_stream import SpectrumFrame
 from qsorbit.ui.spectrum_axis_paint import paint_frequency_axis
 from qsorbit.ui.spectrum_zoom import ZoomSpan, dc_spike_in_view, visible_slice
+from qsorbit.ui.theme import Colormap, Theme
+from qsorbit.ui.theme_manager import ThemeManager, theme_color
 from qsorbit.ui.waterfall_render import WaterfallScale, blank_row, render_row, tick_position
 from qsorbit.ui.zoom_controller import ZoomController
 
@@ -141,6 +143,22 @@ class WaterfallWidget(QWidget):
         source: Where frames come from. The widget neither builds it nor
             owns the device behind it; whoever constructed the source is
             responsible for starting and stopping it.
+        themes: The active theme, as shared state the widget
+            subscribes to itself -- the same shape as ``zoom`` below,
+            and for the same reason. Required rather than defaulted:
+            a default would be a colour chosen inside a widget, which
+            is the one thing Phase 3's standing rule forbids.
+
+            **Subscribing rather than being told is what makes the
+            Custom tab work.** That tab builds its widgets from a list
+            in a config file, so a second waterfall can exist that no
+            code anywhere was written to construct -- and if restyling
+            depended on its container remembering to connect a signal,
+            the failure would be a panel stuck in the previous theme's
+            colours beside correctly restyled ones, with nothing
+            raising. Same shape as the frame-stealing bug Chunk A
+            fixed: a display that is wrong while looking alive. A
+            widget that subscribes itself cannot be forgotten.
         scale: The dB window mapped onto the colour ramp. Defaults to
             :class:`~qsorbit.ui.waterfall_render.WaterfallScale`'s own
             measured defaults, which suit FM broadcast at bench gain and
@@ -166,6 +184,7 @@ class WaterfallWidget(QWidget):
         self,
         source: FrameSource,
         *,
+        themes: ThemeManager,
         scale: WaterfallScale | None = None,
         history_rows: int = DEFAULT_HISTORY_ROWS,
         render_width: int = DEFAULT_RENDER_WIDTH,
@@ -181,6 +200,9 @@ class WaterfallWidget(QWidget):
 
         self._source = source
         self._scale = scale if scale is not None else WaterfallScale()
+        self._themes = themes
+        self._colormap = themes.current.waterfall
+        themes.changed.connect(self._on_theme_changed)
         self._render_width = render_width
 
         # Taken from the source's own config, once, so the labels cannot
@@ -214,7 +236,8 @@ class WaterfallWidget(QWidget):
             maxlen=history_rows,
         )
         self._rendered_rows: deque[np.ndarray] = deque(
-            (blank_row(render_width) for _ in range(history_rows)), maxlen=history_rows
+            (blank_row(render_width, self._colormap) for _ in range(history_rows)),
+            maxlen=history_rows,
         )
         self._frames_seen = 0
         self._error: str | None = None
@@ -282,15 +305,35 @@ class WaterfallWidget(QWidget):
         sliced, _start_hz, _stop_hz = visible_slice(
             power_db, self._axis_hz, self._zoom_controller.zoom
         )
-        return render_row(sliced, self._render_width, self._scale)
+        return render_row(sliced, self._render_width, self._scale, self._colormap)
 
-    def _on_zoom_changed(self) -> None:
-        self._refresh_visible_edges()
+    def _on_theme_changed(self, theme: Theme) -> None:
+        self.set_colormap(theme.waterfall)
+
+    def set_colormap(self, colormap: Colormap) -> None:
+        """Restyle to a new theme's ramp, keeping every row of history.
+
+        The history is re-rendered from ``_raw_frames`` rather than
+        discarded, which is the whole reason that deck is the source of
+        truth and ``_rendered_rows`` is only a cache of it. A theme
+        switch mid-pass must not cost the operator the pass they are
+        watching — and re-colouring what is already on screen is also
+        the only way to *see* that the switch worked, rather than
+        watching a black panel slowly refill in new colours.
+        """
+        self._colormap = colormap
+        self._rebuild_rendered_rows()
+
+    def _rebuild_rendered_rows(self) -> None:
         self._rendered_rows = deque(
             (self._render_visible_row(raw) for raw in self._raw_frames),
             maxlen=self._rendered_rows.maxlen,
         )
         self.update()
+
+    def _on_zoom_changed(self) -> None:
+        self._refresh_visible_edges()
+        self._rebuild_rendered_rows()
 
     def _on_timer(self) -> None:
         try:
@@ -359,9 +402,22 @@ class WaterfallWidget(QWidget):
         """Mark the tuner's own zero-IF spike, per the "visual marker only"
         decision — see :func:`~qsorbit.ui.spectrum_zoom.dc_spike_in_view`'s
         own docstring for why this project does not remove the spike from
-        the data itself."""
+        the data itself.
+
+            The DC marker is drawn in the theme's ``warn`` colour,
+            which is the semantically right token: the spike is a
+            receiver artifact to be discounted, not a signal. It used to
+            be ``Qt.GlobalColor.yellow`` in both spectrum panels -- a
+            hardcoded colour that survived the first theme pass because
+            the check for literals matched ``Qt.yellow`` and the code
+            said ``Qt.GlobalColor.yellow``. It showed up as a bright
+            yellow line under Night Ops, the one theme where a bright
+            yellow line costs the operator their dark adaptation, which
+            is exactly the failure the no-hardcoded-colour rule exists
+            to prevent.
+        """
         x = int(round(tick_position(marker_hz, self._start_hz, self._stop_hz, image_rect.width())))
-        painter.setPen(Qt.GlobalColor.yellow)
+        painter.setPen(theme_color(self._themes.current, "warn"))
         painter.drawLine(x, image_rect.top(), x, image_rect.bottom())
         painter.drawText(
             QRect(x + 3, image_rect.top() + 2, 24, 14), Qt.AlignmentFlag.AlignLeft, "DC"
