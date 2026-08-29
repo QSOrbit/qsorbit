@@ -68,6 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A live frequency readout showing where the tracked downlink actually sits, with the Doppler shift under it. The megahertz are shown large and the hertz small, because during a pass the last three digits move continuously and the first six barely at all.
 - A tab whose hardware is absent says so in words rather than showing an empty instrument. A panel drawing nothing and a panel whose radio died look identical, and only one of them is a fault.
 
+### Fixed
+
+- The Rotor tab no longer cuts its own readings off mid-word. With a rotor connected, four of the six rows were clipped by a column that had been given a fixed width - the range row read "39131 km, approaching at 0." with the rate itself missing, which is a readout dropping the number it exists to show. Columns now size to what they are actually holding.
+
 ### Changed
 
 - The quieting panel now stacks its bar above its labels instead of running them in a row, so it stays readable in a narrow column. In the old layout its text was cut off mid-word when placed beside the spectrum.
