@@ -136,7 +136,25 @@ def build_stylesheet(theme: Theme) -> str:
     here is a literal. That is the standing Phase 3 rule -- no widget
     hardcodes a colour, ever -- applied to the one module whose entire
     job is emitting colours, and it is checked by a test rather than
-    left to review.
+    left to review. **Including the comments in the emitted CSS**, which
+    is worth knowing before writing one: that test does not strip them,
+    correctly, because a comment inside a generated stylesheet is
+    shipped text rather than source prose. An explanatory comment naming
+    two hex values got caught by it during Chunk C PR2, which is the
+    check working exactly as intended.
+
+    **``QWidget`` sets typography and foreground colour but deliberately
+    no background**, and that one omission is what makes a card visible.
+    A universal ``background`` rule reaches every *nested* QWidget as
+    well, so a card painted in ``panel`` was immediately painted over in
+    ``bg`` by its own children -- measured rather than guessed, by
+    sampling a rendered card interior and finding the background token
+    where the panel token should have been. A plain QWidget paints no
+    background of its own unless told to, so naming the background only
+    where it is wanted (the window, cards, insets, controls) leaves
+    ordinary containers transparent and lets the card show through.
+    Nothing that predates cards changes appearance: those children were
+    painting the window's own colour anyway.
     """
     p = theme.palette
     structure = chrome_structure(theme)
@@ -220,11 +238,17 @@ QLabel[role="heading"] {{
         f"""
 /* {theme.name} -- generated from theme tokens; no literal colours. */
 
+/* Typography and colour apply to everything; the background does not.
+   See build_stylesheet's docstring for why -- a universal background
+   rule reaches every nested widget and paints over the card it sits in. */
 QWidget {{
-    background: {p.bg};
     color: {p.text};
     font-family: {ui};
     font-size: 13px;
+}}
+
+QMainWindow, QDialog {{
+    background: {p.bg};
 }}
 
 QWidget#Card {{
