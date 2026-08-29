@@ -10,9 +10,24 @@ jobs:
   lint-and-test:
     name: Lint, format, and test
     runs-on: ubuntu-latest
+    env:
+      # The UI tests construct real Qt objects. There is no display on a
+      # runner, so Qt draws to a buffer instead of refusing to start.
+      QT_QPA_PLATFORM: offscreen
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Install Qt's system libraries
+        # PySide6's wheel bundles Qt itself but links against these, and a
+        # bare runner has none of them. Without libEGL in particular,
+        # `import PySide6.QtGui` fails at the shared-library level even
+        # though `import PySide6` succeeds -- which is why the UI tests'
+        # import guard has to name a submodule rather than the package.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
@@ -30,6 +45,15 @@ jobs:
 
       - name: Lint
         run: uv run ruff check
+
+      - name: Verify Qt is importable
+        # Deliberately separate from the test run. The UI tests skip
+        # themselves when Qt cannot be imported, which is right for a
+        # contributor without the system libraries and wrong for CI: a
+        # skipped suite is not a passing suite, and a silent skip here
+        # would quietly stop exercising every widget test. This step
+        # fails loudly instead.
+        run: uv run python -c "from PySide6.QtWidgets import QApplication; QApplication([]); print('Qt OK')"
 
       - name: Test
         run: uv run pytest

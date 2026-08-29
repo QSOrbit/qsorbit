@@ -15,7 +15,11 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("PySide6")
+# A submodule, not the package: `import PySide6` succeeds on a machine
+# with no Qt system libraries, and only `PySide6.QtWidgets` fails --
+# with an ImportError for libEGL.so.1 rather than anything mentioning
+# Qt. Guarding the package alone let CI die at collection.
+pytest.importorskip("PySide6.QtWidgets")
 
 from PySide6.QtGui import QPalette  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
