@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Final
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QColor, QFontDatabase, QPalette
@@ -84,6 +85,93 @@ def theme_color(theme: Theme, token: str) -> QColor:
             loudly rather than painting something arbitrary.
     """
     return QColor(*theme.palette.rgb(token))
+
+
+#: Hue rotations, in degrees, applied to a theme's accent to produce the
+#: LCARS accent-bar sequence. Derived rather than declared, which was
+#: Phil's call at PR2 kickoff: the alternative was a new optional
+#: ``[chrome]`` key listing bar colours, and adding theme-format surface
+#: one PR after v1 shipped is a cost that lands on every theme author
+#: forever, to buy pixel fidelity on one shipped theme.
+#:
+#: **Where the numbers come from.** LCARS is the reference, so the
+#: offsets are the ones that reproduce it: the mockup's bars are
+#: ``#ff9966`` (hue 20), ``#cc99cc`` (hue 300) and ``#9c9cff`` (hue 240),
+#: which is the accent plus 220 degrees and plus 280 degrees --
+#: in that order, because the mockup's ``nth-child(3n+2)`` rule puts the
+#: periwinkle on the *second* card and the mauve on the third. Getting
+#: that pair the wrong way round is invisible in a unit test and obvious
+#: the moment two cards sit next to each other, which is how it was
+#: caught. Saturation
+#: and value come from the accent rather than from the mockup, so the
+#: sequence stays in that theme's own key -- a user theme picking
+#: ``style = "lcars"`` gets three bars drawn from *its* accent, not from
+#: a Star Trek palette bolted onto it. The visible cost, recorded here
+#: rather than left to be discovered: QSOrbit's LCARS bars are more
+#: saturated than the mockup's pastels, and the mockup gets updated to
+#: match, per the standing rule that bench reality wins.
+ACCENT_BAR_HUE_OFFSETS: Final[tuple[int, ...]] = (0, 220, 280)
+
+#: Opacity of a single CRT scanline, out of 255. The mockup draws 20%
+#: black on a 3-pixel period; this is that number, kept where the widget
+#: that paints it can read it rather than inside the painter.
+SCANLINE_ALPHA: Final = 51
+
+#: Opacity of the CRT text halo. The mockup's glow is 55% of the accent.
+GLOW_ALPHA: Final = 140
+
+
+def accent_bar_color(theme: Theme, index: int) -> QColor:
+    """The colour of the ``index``-th LCARS-style accent bar.
+
+    Cycles through :data:`ACCENT_BAR_HUE_OFFSETS`, so consecutive cards
+    down a column do not all wear the same stripe -- which is the thing
+    that makes LCARS read as LCARS rather than as a themed left border.
+
+    An accent with no meaningful hue -- a pure grey, which a monochrome
+    user theme could easily have -- rotates to nothing, so every bar
+    comes out as the accent itself. That is the right degradation:
+    three identical bars in the theme's own colour, rather than three
+    arbitrary hues invented for a palette that deliberately had none.
+    """
+    color = theme_color(theme, "accent")
+    hue = color.hue()
+    if hue < 0:
+        return color
+    offset = ACCENT_BAR_HUE_OFFSETS[index % len(ACCENT_BAR_HUE_OFFSETS)]
+    if offset == 0:
+        # Returned unrotated rather than round-tripped through HSV. The
+        # colour would come back the same to the eye either way, but not
+        # in the same *spec*: QColor compares by spec as well as value,
+        # so an HSV-built copy of an RGB accent is unequal to it. Cheap
+        # to avoid, and it keeps "the first bar is the accent" true as
+        # an identity rather than only as a rendering.
+        return color
+    rotated = QColor()
+    rotated.setHsv((hue + offset) % 360, color.saturation(), color.value())
+    return rotated
+
+
+def scanline_color(theme: Theme) -> QColor:
+    """The colour of one CRT scanline, for the ``crt`` chrome's overlay.
+
+    The background at partial alpha, so the overlay darkens whatever is
+    under it rather than tinting it -- a scanline is an absence of
+    phosphor, not a colour of its own. Taken from ``bg`` rather than
+    from black so that a light theme which ever picks ``style = "crt"``
+    scans *lighter*, which is what a gap between bright lines actually
+    looks like.
+    """
+    color = theme_color(theme, "bg")
+    color.setAlpha(SCANLINE_ALPHA)
+    return color
+
+
+def glow_color(theme: Theme) -> QColor:
+    """The halo colour for the ``crt`` chrome's glowing headline text."""
+    color = theme_color(theme, "accent")
+    color.setAlpha(GLOW_ALPHA)
+    return color
 
 
 def build_qpalette(theme: Theme) -> QPalette:

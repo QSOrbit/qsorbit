@@ -60,7 +60,17 @@ FORBIDDEN = re.compile(
 
 
 def ui_modules() -> list[Path]:
-    return sorted(p for p in UI_DIR.glob("*.py") if p.name not in EXEMPT)
+    """Every module under ``ui/``, at any depth.
+
+    ``rglob`` rather than ``glob``, closed in Chunk C PR2 before anyone
+    fell in: the check walked only the top level, so the first ``ui/``
+    subpackage anybody added -- and PR3's Custom tab plus Chunk D's map
+    are both plausible candidates -- would have been silently exempt
+    from the standing rule. A hole in a rule that nobody has reached yet
+    is still a hole, and this one would have been found the way the last
+    one was, by a yellow line on a real screen in Night Ops.
+    """
+    return sorted(p for p in UI_DIR.rglob("*.py") if p.name not in EXEMPT)
 
 
 def code_only(source: str) -> str:

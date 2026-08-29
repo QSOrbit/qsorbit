@@ -461,7 +461,210 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_sdr_commands(subcommands)
     _add_receive_command(subcommands)
+    _add_shell_command(subcommands)
     return parser
+
+
+def _add_shell_command(subcommands: argparse._SubParsersAction) -> None:
+    """Add ``shell``: the tabbed application.
+
+    **Why this is a command of its own rather than a flag on
+    ``receive``.** Two of the shell's tabs need no SDR at all -- the
+    rotor readout, and the pass planning that arrives in Chunk D -- and
+    ``receive`` structurally cannot run without one. A shell reachable
+    only through ``receive --window`` would be an application you had to
+    start a radio to look at.
+
+    ``receive --window`` is deliberately left exactly as it was. It is
+    the instrument every USB-loss measurement in Sessions 24 through 27
+    was taken through, including the 0.0175% that proved the theme
+    system costs the read path nothing, and changing it in the same PR
+    that adds the shell would leave the next bench number with nothing
+    comparable to sit beside. It becomes the control run instead, which
+    is worth more than the duplication costs for one chunk.
+    """
+    shell = subcommands.add_parser(
+        "shell",
+        help="Open the QSOrbit application window.",
+        description=(
+            "The tabbed shell: Radio, Rotor, Plan and Decode, with every panel "
+            "fed by one hub. Every part of it is optional. With no --tle it "
+            "opens with each tab saying what it is waiting for, which is what a "
+            "sky-free evening looks like; with --tle and --downlink it receives; "
+            "with --send as well it moves the antenna too."
+        ),
+    )
+    _add_radio_arguments(shell, required=False)
+
+
+def _add_radio_arguments(parser: argparse.ArgumentParser, *, required: bool) -> None:
+    """Add the radio options shared by ``receive`` and ``shell``.
+
+    One definition, two parsers, and that is the point rather than
+    tidiness. Eighteen options copied into a second command would
+    drift the first time one of them gained a default -- and a
+    ``--gain`` that meant something slightly different depending on
+    which command you typed is exactly the kind of quiet
+    disagreement between a flag and its behaviour this project keeps
+    finding the hard way.
+
+    Args:
+        parser: The subcommand parser to add them to.
+        required: Whether the radio is mandatory. ``receive`` cannot
+            run without a TLE, a downlink and a gain, so it passes
+            ``True``. ``shell`` can: it opens with the Radio tab in
+            placeholder and the rest of the application working,
+            which is what a sky-free evening looks like.
+
+    ``--window`` is deliberately **not** here. It is ``receive``'s
+    own flag, and a shell that had to be told to open a window would
+    be a strange thing to have typed.
+    """
+    parser.add_argument(
+        "--tle",
+        required=required,
+        metavar="PATH",
+        help="File holding one TLE: two element lines, optionally preceded by a name line.",
+    )
+    parser.add_argument(
+        "--downlink",
+        type=float,
+        required=required,
+        metavar="MHZ",
+        help=(
+            "The satellite's nominal downlink in MHz, as transmitted - not the "
+            "frequency you expect to hear. Doppler is what makes those differ, "
+            "and computing it is this command's job."
+        ),
+    )
+    parser.add_argument(
+        "--offset",
+        type=float,
+        default=DEFAULT_TUNING_OFFSET_KHZ,
+        metavar="KHZ",
+        help=(
+            f"How far below the downlink to place the tuner, in kHz (default "
+            f"{DEFAULT_TUNING_OFFSET_KHZ:.0f}). Same reason as 'sdr capture': the "
+            "receiver's DC spike sits at the centre of its own passband."
+        ),
+    )
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=DEFAULT_SAMPLE_RATE_HZ,
+        metavar="SPS",
+        help=f"IQ sample rate (default {DEFAULT_SAMPLE_RATE_HZ:,}).",
+    )
+    parser.add_argument(
+        "--if-rate",
+        type=float,
+        default=DEFAULT_NBFM_IF_RATE_HZ,
+        metavar="HZ",
+        help=(
+            f"Channel-filter output rate (default {DEFAULT_NBFM_IF_RATE_HZ:,.0f}). "
+            "Must divide --rate evenly and be more than twice --deviation."
+        ),
+    )
+    parser.add_argument(
+        "--audio-rate",
+        type=float,
+        default=DEFAULT_AUDIO_RATE_HZ,
+        metavar="HZ",
+        help=f"Playback sample rate (default {DEFAULT_AUDIO_RATE_HZ:,.0f}).",
+    )
+    parser.add_argument(
+        "--deviation",
+        type=float,
+        default=DEFAULT_NBFM_DEVIATION_HZ,
+        metavar="HZ",
+        help=(
+            f"Transmitter peak deviation (default {DEFAULT_NBFM_DEVIATION_HZ:,.0f}, "
+            "which suits amateur FM). Wider modes need both this and --if-rate raised."
+        ),
+    )
+    parser.add_argument(
+        "--seconds",
+        type=float,
+        default=None,
+        metavar="S",
+        help="Stop automatically after this long. Default: run until Ctrl-C.",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=DEFAULT_TRACKING_INTERVAL_S,
+        metavar="S",
+        help=f"Seconds between tracking updates (default {DEFAULT_TRACKING_INTERVAL_S:.0f}).",
+    )
+    parser.add_argument(
+        "--send",
+        action="store_true",
+        help=(
+            "Actually move the rotor to follow the pass. Without this nothing "
+            "is transmitted to the controller and the serial port is not opened."
+        ),
+    )
+    parser.add_argument(
+        "--theme",
+        metavar="SLUG",
+        default=DEFAULT_THEME_NAME,
+        help=(
+            "Theme for the instrument window, by filename stem - one of the eight "
+            "shipped in ui/themes/, or your own dropped into the themes/ directory "
+            "beside config.toml. Defaults to %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--squelch",
+        action="store_true",
+        help=(
+            "Mute the noise squelch's closed gate. Off by default: a mute set "
+            "slightly too tight makes a working receiver indistinguishable from "
+            "a broken one. The gate is always measured and shown live either way "
+            "- see --window - this only controls whether it silences audio."
+        ),
+    )
+    parser.add_argument(
+        "--audio-device",
+        type=str,
+        default=None,
+        metavar="DEVICE",
+        help=(
+            "Output device: a numeric index or a name substring, matching "
+            "sounddevice's own OutputStream(device=...). Defaults to the system's "
+            "configured default. To see what's available, run "
+            "'python -c \"import sounddevice as sd; print(sd.query_devices())\"'."
+        ),
+    )
+    parser.add_argument(
+        "--squelch-open",
+        type=float,
+        default=DEFAULT_OPEN_ABOVE_DB,
+        metavar="DB",
+        help=f"Quieting at/above which the gate opens (default {DEFAULT_OPEN_ABOVE_DB:.1f}).",
+    )
+    parser.add_argument(
+        "--squelch-close",
+        type=float,
+        default=DEFAULT_CLOSE_BELOW_DB,
+        metavar="DB",
+        help=f"Quieting at/below which it closes (default {DEFAULT_CLOSE_BELOW_DB:.1f}).",
+    )
+    gain = parser.add_mutually_exclusive_group(required=required)
+    gain.add_argument(
+        "--gain",
+        type=float,
+        metavar="DB",
+        help=(
+            "Tuner gain in dB. Required, and deliberately has no default: a "
+            "default gain is how a pass comes back silent with nobody noticing."
+        ),
+    )
+    gain.add_argument(
+        "--auto-gain",
+        action="store_true",
+        help="Let the tuner choose. Rarely what you want - during bring-up it reported 0.0 dB.",
+    )
 
 
 def _add_receive_command(subcommands: argparse._SubParsersAction) -> None:
@@ -483,90 +686,7 @@ def _add_receive_command(subcommands: argparse._SubParsersAction) -> None:
             "rotor, so the whole radio job works with nothing on the serial port."
         ),
     )
-    receive.add_argument(
-        "--tle",
-        required=True,
-        metavar="PATH",
-        help="File holding one TLE: two element lines, optionally preceded by a name line.",
-    )
-    receive.add_argument(
-        "--downlink",
-        type=float,
-        required=True,
-        metavar="MHZ",
-        help=(
-            "The satellite's nominal downlink in MHz, as transmitted - not the "
-            "frequency you expect to hear. Doppler is what makes those differ, "
-            "and computing it is this command's job."
-        ),
-    )
-    receive.add_argument(
-        "--offset",
-        type=float,
-        default=DEFAULT_TUNING_OFFSET_KHZ,
-        metavar="KHZ",
-        help=(
-            f"How far below the downlink to place the tuner, in kHz (default "
-            f"{DEFAULT_TUNING_OFFSET_KHZ:.0f}). Same reason as 'sdr capture': the "
-            "receiver's DC spike sits at the centre of its own passband."
-        ),
-    )
-    receive.add_argument(
-        "--rate",
-        type=float,
-        default=DEFAULT_SAMPLE_RATE_HZ,
-        metavar="SPS",
-        help=f"IQ sample rate (default {DEFAULT_SAMPLE_RATE_HZ:,}).",
-    )
-    receive.add_argument(
-        "--if-rate",
-        type=float,
-        default=DEFAULT_NBFM_IF_RATE_HZ,
-        metavar="HZ",
-        help=(
-            f"Channel-filter output rate (default {DEFAULT_NBFM_IF_RATE_HZ:,.0f}). "
-            "Must divide --rate evenly and be more than twice --deviation."
-        ),
-    )
-    receive.add_argument(
-        "--audio-rate",
-        type=float,
-        default=DEFAULT_AUDIO_RATE_HZ,
-        metavar="HZ",
-        help=f"Playback sample rate (default {DEFAULT_AUDIO_RATE_HZ:,.0f}).",
-    )
-    receive.add_argument(
-        "--deviation",
-        type=float,
-        default=DEFAULT_NBFM_DEVIATION_HZ,
-        metavar="HZ",
-        help=(
-            f"Transmitter peak deviation (default {DEFAULT_NBFM_DEVIATION_HZ:,.0f}, "
-            "which suits amateur FM). Wider modes need both this and --if-rate raised."
-        ),
-    )
-    receive.add_argument(
-        "--seconds",
-        type=float,
-        default=None,
-        metavar="S",
-        help="Stop automatically after this long. Default: run until Ctrl-C.",
-    )
-    receive.add_argument(
-        "--interval",
-        type=float,
-        default=DEFAULT_TRACKING_INTERVAL_S,
-        metavar="S",
-        help=f"Seconds between tracking updates (default {DEFAULT_TRACKING_INTERVAL_S:.0f}).",
-    )
-    receive.add_argument(
-        "--send",
-        action="store_true",
-        help=(
-            "Actually move the rotor to follow the pass. Without this nothing "
-            "is transmitted to the controller and the serial port is not opened."
-        ),
-    )
+    _add_radio_arguments(receive, required=True)
     receive.add_argument(
         "--window",
         action="store_true",
@@ -574,67 +694,6 @@ def _add_receive_command(subcommands: argparse._SubParsersAction) -> None:
             "Open the instrument window - waterfall and live quieting, plus the "
             "readout when --send is given."
         ),
-    )
-    receive.add_argument(
-        "--theme",
-        metavar="SLUG",
-        default=DEFAULT_THEME_NAME,
-        help=(
-            "Theme for the instrument window, by filename stem - one of the eight "
-            "shipped in ui/themes/, or your own dropped into the themes/ directory "
-            "beside config.toml. Defaults to %(default)s."
-        ),
-    )
-    receive.add_argument(
-        "--squelch",
-        action="store_true",
-        help=(
-            "Mute the noise squelch's closed gate. Off by default: a mute set "
-            "slightly too tight makes a working receiver indistinguishable from "
-            "a broken one. The gate is always measured and shown live either way "
-            "- see --window - this only controls whether it silences audio."
-        ),
-    )
-    receive.add_argument(
-        "--audio-device",
-        type=str,
-        default=None,
-        metavar="DEVICE",
-        help=(
-            "Output device: a numeric index or a name substring, matching "
-            "sounddevice's own OutputStream(device=...). Defaults to the system's "
-            "configured default. To see what's available, run "
-            "'python -c \"import sounddevice as sd; print(sd.query_devices())\"'."
-        ),
-    )
-    receive.add_argument(
-        "--squelch-open",
-        type=float,
-        default=DEFAULT_OPEN_ABOVE_DB,
-        metavar="DB",
-        help=f"Quieting at/above which the gate opens (default {DEFAULT_OPEN_ABOVE_DB:.1f}).",
-    )
-    receive.add_argument(
-        "--squelch-close",
-        type=float,
-        default=DEFAULT_CLOSE_BELOW_DB,
-        metavar="DB",
-        help=f"Quieting at/below which it closes (default {DEFAULT_CLOSE_BELOW_DB:.1f}).",
-    )
-    gain = receive.add_mutually_exclusive_group(required=True)
-    gain.add_argument(
-        "--gain",
-        type=float,
-        metavar="DB",
-        help=(
-            "Tuner gain in dB. Required, and deliberately has no default: a "
-            "default gain is how a pass comes back silent with nobody noticing."
-        ),
-    )
-    gain.add_argument(
-        "--auto-gain",
-        action="store_true",
-        help="Let the tuner choose. Rarely what you want - during bring-up it reported 0.0 dB.",
     )
 
 
@@ -769,6 +828,8 @@ def main(
             return _command_sdr(args, config, sdr_factory or _open_sdr)
         if args.command == "receive":
             return _command_receive(args, config, factory, sdr_factory or _open_sdr)
+        if args.command == "shell":
+            return _command_shell(args, config, factory, sdr_factory or _open_sdr)
         return _command_stop(config, factory)
     except HomingError as exc:
         # Its own state rather than a generic failure: nothing sent over
@@ -1114,14 +1175,27 @@ def _command_receive(
     config: StationConfig,
     rotor_factory: RotorFactory,
     sdr_factory: SdrFactory,
+    *,
+    runner: Callable[..., int] | None = None,
 ) -> int:
     """Run the vertical slice: track, stream, demodulate, correct, play.
+
+    ``runner`` is what actually builds the window and runs the session,
+    defaulting to :func:`_run_receive`. ``shell`` passes
+    :func:`_run_shell` instead and gets every line of the setup above it
+    unchanged -- the TLE read, the tuner configuration, the printed
+    chain description, the gain warning, the squelch line, and above all
+    **the order those happen in**, which is "fails cheapest first" and
+    was arrived at deliberately. A second command that re-implemented
+    that order would drift from it, and the drift would show up as a
+    rotor that homes before a typo in ``--tle`` is noticed.
 
     Reads in the order that fails cheapest first — the TLE before the
     radio, the radio before the rotor — so a typo in ``--tle`` does not
     wait behind opening a USB device, and a rotor that will not home does
     not cost the SDR configuration that already succeeded.
     """
+    run = runner if runner is not None else _run_receive
     satellite = Satellite.from_file(args.tle)
     downlink_hz = args.downlink * 1e6
     center_hz = downlink_hz - args.offset * 1e3
@@ -1186,7 +1260,7 @@ def _command_receive(
                 "Rotor:     not being moved. Doppler correction needs the TLE and "
                 "your location, not the rotor, so this is a complete receive."
             )
-            return _run_receive(args, config, satellite, applied, nbfm, doppler, squelch, sdr)
+            return run(args, config, satellite, applied, nbfm, doppler, squelch, sdr)
 
         with _Connected(config, rotor_factory) as rotor:
             print(f"Rotor:     connected, {rotor.firmware_version}")
@@ -1197,9 +1271,7 @@ def _command_receive(
                 interval_s=args.interval,
                 alignment_offset=_alignment_offset(config),
             )
-            return _run_receive(
-                args, config, satellite, applied, nbfm, doppler, squelch, sdr, loop=loop
-            )
+            return run(args, config, satellite, applied, nbfm, doppler, squelch, sdr, loop=loop)
 
 
 def _run_receive(
@@ -1459,6 +1531,361 @@ def _show_instruments(
 
     with _quit_on_sigint(app):
         app.exec()
+
+
+def _command_shell(
+    args: argparse.Namespace,
+    config: StationConfig,
+    rotor_factory: RotorFactory,
+    sdr_factory: SdrFactory,
+) -> int:
+    """Open the shell, with as much hardware behind it as was asked for.
+
+    Three modes, and the checks below are what keep them from blurring
+    into each other:
+
+    ``shell``
+        No radio, no rotor. Every tab opens and says what it is waiting
+        for. Useful for looking at themes, and it is what an evening
+        with no sky looks like.
+    ``shell --tle X --send``
+        Rotor only. The antenna follows the target and the Radio tab
+        stays in placeholder.
+    ``shell --tle X --downlink M --gain G``
+        The full receive chain, plus the rotor with ``--send``.
+
+    **The gain check is here rather than in argparse**, because the
+    option is only conditionally required: ``receive`` must have one and
+    ``shell`` need not, so argparse cannot enforce it for both. The
+    message is worth the special case -- a default gain is how a pass
+    comes back silent with nobody noticing, which is the same reason
+    ``sdr capture`` refuses to invent one.
+    """
+    if args.tle is None:
+        if args.downlink is not None or args.send:
+            print(
+                "shell: --downlink and --send both need --tle - they describe what "
+                "to follow, and there is nothing to follow yet.",
+                file=sys.stderr,
+            )
+            return 1
+        return _run_shell_alone(args)
+
+    if args.downlink is None:
+        if not args.send:
+            print(
+                "shell: --tle with no --downlink means rotor-only, which needs "
+                "--send. Add --downlink to receive instead.",
+                file=sys.stderr,
+            )
+            return 1
+        return _run_shell_tracking_only(args, config, rotor_factory)
+
+    if args.gain is None and not args.auto_gain:
+        print(
+            "shell: --downlink needs --gain (or --auto-gain). There is "
+            "deliberately no default: a default gain is how a pass comes back "
+            "silent with nobody noticing.",
+            file=sys.stderr,
+        )
+        return 1
+
+    return _command_receive(args, config, rotor_factory, sdr_factory, runner=_run_shell)
+
+
+def _shell_theme(args: argparse.Namespace) -> object:
+    """Build a theme manager and apply the requested theme.
+
+    **Applied before a single widget is constructed**, which is the same
+    ordering PR1 settled: ``apply()`` sets the application-wide
+    stylesheet and palette, and a widget built beforehand is styled on
+    its first repaint rather than on creation -- visible as a flash of
+    unthemed chrome on a slow start.
+
+    A bad ``--theme`` is worth a word rather than a traceback. Refusing
+    to open over a misspelt colour scheme would be the wrong trade at
+    any time, and a spectacularly wrong one during a pass.
+    """
+    from qsorbit.ui.theme_manager import ThemeManager
+
+    themes = ThemeManager.discover()
+    try:
+        themes.apply(getattr(args, "theme", None) or DEFAULT_THEME_NAME)
+    except KeyError:
+        print(
+            f"Unknown theme {args.theme!r}; using {DEFAULT_THEME_NAME}. "
+            f"Available: {', '.join(themes.slugs)}.",
+            file=sys.stderr,
+        )
+        themes.apply(DEFAULT_THEME_NAME)
+    return themes
+
+
+def _exec_shell(window: object, app: object, args: argparse.Namespace) -> None:
+    """Show the window, honour ``--seconds``, and run Qt's loop.
+
+    **Ctrl-C works here even with nothing attached**, and that is a
+    property worth naming rather than assuming. Qt's event loop can only
+    be interrupted at a Python bytecode boundary, so it needs some
+    Python callback still running -- Session 25 lost Ctrl-C entirely
+    when a lifetime bug killed every panel timer. An empty shell has no
+    panels at all, and what keeps it interruptible is the top bar's
+    one-second clock, which runs in every configuration. Anything that
+    ever stops that timer takes Ctrl-C with it.
+    """
+    from PySide6.QtCore import QTimer
+
+    # show(), not showMaximized(), and the difference was measured
+    # rather than debated. Maximizing this window costs 28x the USB
+    # loss on the receive path -- 0.7444% against 0.0262% windowed,
+    # reproduced across two maximized runs -- because
+    # WaterfallWidget.paintEvent scales its whole history image to the
+    # widget's size on every one of its 20 repaints a second, and that
+    # scale is the one part of its cost that grows with the window.
+    # The inefficiency predates the shell (`receive --window` pays the
+    # same tax over fewer pixels), so the fix belongs to the waterfall
+    # and gets its own before/after measurement. Opening maximized
+    # comes back once it is free.
+    window.show()
+    if args.seconds is not None:
+        QTimer.singleShot(int(args.seconds * 1000), app.quit)
+    with _quit_on_sigint(app):
+        app.exec()
+
+
+def _run_shell_alone(args: argparse.Namespace) -> int:
+    """The shell with no hardware behind it. Every tab in placeholder."""
+    from PySide6.QtWidgets import QApplication
+
+    from qsorbit.ui.feed_hub import FeedHub
+    from qsorbit.ui.shell_window import ShellWindow
+
+    app = QApplication.instance() or QApplication([])
+    themes = _shell_theme(args)
+    hub = FeedHub()
+    print(hub.describe())
+    print("Nothing attached. Pass --tle to track, and --downlink to receive.")
+    window = ShellWindow(hub, themes=themes)
+    _exec_shell(window, app, args)
+    return 0
+
+
+def _run_shell_tracking_only(
+    args: argparse.Namespace, config: StationConfig, rotor_factory: RotorFactory
+) -> int:
+    """The shell with a rotor and no radio.
+
+    The mirror image of ``receive``'s standing asymmetry: that command
+    runs the whole radio job with nothing on the serial port, and this
+    runs the whole pointing job with nothing on USB. On a bench evening
+    where several things could be wrong at once, neither fault costs you
+    the other half.
+
+    Unlike ``receive``, **this ticks the loop from the GUI thread**, and
+    that is a deliberate exception rather than a regression of Chunk A's
+    fix. The fix moved the tick off the GUI thread because it was
+    competing with a live SDR reader for the GIL and stalling it; with
+    no reader running there is nothing to stall, and the rotor's own
+    measured cost is 18-30 ms over a whole pass. Standing up a thread
+    and a stop protocol to move a 30 ms budget off an idle event loop
+    would be machinery for its own sake -- but if a radio is ever added
+    to this path, the tick moves with it.
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from qsorbit.ui.feed_hub import FeedHub
+    from qsorbit.ui.shell_window import ShellWindow
+
+    satellite = Satellite.from_file(args.tle)
+    app = QApplication.instance() or QApplication([])
+    themes = _shell_theme(args)
+
+    with _Connected(config, rotor_factory) as rotor:
+        print(f"Rotor:     connected, {rotor.firmware_version}")
+        loop = TrackingLoop(
+            satellite,
+            config.observer,
+            rotor,
+            interval_s=args.interval,
+            alignment_offset=_alignment_offset(config),
+        )
+        # The ticker is built BEFORE the hub, because the hub needs its
+        # fault callable. A readout left showing its last plausible
+        # numbers under a dead rotor is the exact silent failure Chunk A
+        # PR2 added `tracking_error` to prevent, and it would be a poor
+        # joke to reintroduce it in the shell.
+        ticker = _GuiThreadTicker(loop, interval_s=args.interval)
+        hub = FeedHub(tracking=loop, tracking_fault=ticker.fault)
+        print(hub.describe())
+        window = ShellWindow(hub, themes=themes, title=f"QSOrbit - tracking {satellite.name}")
+        try:
+            _exec_shell(window, app, args)
+        finally:
+            ticker.stop()
+    return 0
+
+
+def _run_shell(
+    args: argparse.Namespace,
+    config: StationConfig,
+    satellite: Satellite,
+    applied: AppliedSettings,
+    nbfm: NbfmConfig,
+    doppler: DopplerTracker,
+    squelch: NoiseSquelch,
+    sdr: RtlSdr,
+    *,
+    loop: TrackingLoop | None = None,
+) -> int:
+    """Build the session, wrap it in a hub, and run the shell over it.
+
+    The same shape as :func:`_run_receive`, and the ordering inside it is
+    the same ordering for the same measured reason: **the window is
+    built before anything streams.** Session 24 found a single ~1.03 s
+    stall in every windowed run, in thirteen runs across two commits,
+    caused by standing up QApplication and five widgets while the SDR
+    reader thread was already going; Session 25 fixed it by swapping two
+    lines and measured it down to 0.001-0.015 s. The session is
+    therefore started *by* this function after the window exists, and
+    ``window`` is kept as a local of a frame that is still executing
+    ``app.exec()`` -- a top-level widget with no Qt parent is kept alive
+    by exactly one Python reference, and a builder that returned would
+    drop it.
+
+    What is genuinely new is that **the widgets no longer subscribe to
+    anything**. ``_run_receive`` claims two spectrum feeds by hand and
+    passes them down; here the hub does it, from inside whichever tab
+    wants one, and this function never learns how many feeds were
+    claimed or by whom. That is the difference between a window that
+    knows its panels and a shell that does not have to.
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from qsorbit.ui.feed_hub import FeedHub
+    from qsorbit.ui.shell_window import ShellWindow
+
+    stream = IqStream(sdr)
+    spectrum_config = SpectrumConfig(
+        fft_size=RECEIVE_FFT_SIZE,
+        sample_rate_hz=applied.sample_rate_hz,
+        center_freq_hz=applied.center_hz,
+    )
+    session = ReceiveSession(
+        stream=stream,
+        nbfm=nbfm,
+        doppler=doppler,
+        audio=AudioOutput(nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)),
+        range_rate=(
+            LoopRangeRate(loop) if loop is not None else TargetRangeRate(satellite, config.observer)
+        ),
+        squelch=squelch,
+        mute_squelch=args.squelch,
+        # Unconditional here, unlike `receive`, where it follows
+        # --window: a shell always has a Radio tab, so there is always
+        # something that would drain the frames.
+        spectrum_factory=_spectrum_factory(True, spectrum_config),
+        tracking_interval_s=args.interval,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    themes = _shell_theme(args)
+    hub = FeedHub(
+        spectrum=session.spectrum,
+        radio=session,
+        tracking=loop,
+        tracking_fault=session.tracking_error,
+    )
+    print(hub.describe())
+    print(
+        "Receiving - Ctrl-C to stop."
+        if args.seconds is None
+        else f"Receiving for {args.seconds:.0f}s."
+    )
+
+    window = ShellWindow(
+        hub,
+        themes=themes,
+        nominal_hz=args.downlink * 1e6,
+        title=f"QSOrbit - receiving {satellite.name}",
+    )
+    # show(), not showMaximized(), and the difference was measured
+    # rather than debated. Maximizing this window costs 28x the USB
+    # loss on the receive path -- 0.7444% against 0.0262% windowed,
+    # reproduced across two maximized runs -- because
+    # WaterfallWidget.paintEvent scales its whole history image to the
+    # widget's size on every one of its 20 repaints a second, and that
+    # scale is the one part of its cost that grows with the window.
+    # The inefficiency predates the shell (`receive --window` pays the
+    # same tax over fewer pixels), so the fix belongs to the waterfall
+    # and gets its own before/after measurement. Opening maximized
+    # comes back once it is free.
+    window.show()
+
+    try:
+        # Only now, with Qt fully up and the window realised, does
+        # anything begin streaming.
+        session.start()
+        if args.seconds is not None:
+            from PySide6.QtCore import QTimer
+
+            QTimer.singleShot(int(args.seconds * 1000), app.quit)
+        with _quit_on_sigint(app):
+            app.exec()
+    except KeyboardInterrupt:
+        print()  # the ^C the terminal echoed deserves its own line
+    finally:
+        stats = session.stop()
+
+    print()
+    print(stats.describe())
+    print(f"feeds: {', '.join(hub.claimed) or 'none claimed'}")
+    return 0
+
+
+class _GuiThreadTicker:
+    """Ticks a tracking loop from the GUI thread. Rotor-only shell runs.
+
+    Deliberately not used anywhere a radio is running -- see
+    :func:`_run_shell_tracking_only` for the argument, which turns
+    entirely on whether there is a reader thread to starve.
+    """
+
+    def __init__(self, loop: TrackingLoop, *, interval_s: float) -> None:
+        from PySide6.QtCore import QTimer
+
+        self._loop = loop
+        self._error: BaseException | None = None
+        # Unparented, and kept alive by the caller's own local for as
+        # long as `app.exec()` runs -- the same lifetime rule a
+        # top-level widget follows, and for the same reason. It is
+        # unparented because it has to exist before the window does, so
+        # that the hub can be handed its fault callable.
+        self._timer = QTimer()
+        self._timer.setInterval(int(interval_s * 1000))
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+        self._tick()
+
+    def fault(self) -> BaseException | None:
+        """Whatever stopped the ticker, or ``None``. Read by the readout."""
+        return self._error
+
+    def stop(self) -> None:
+        """Stop ticking. Does not stop the rotor."""
+        self._timer.stop()
+
+    def _tick(self) -> None:
+        try:
+            self._loop.tick()
+        except Exception as exc:  # noqa: BLE001 - recorded, not raised into Qt
+            # Raising here would unwind through Qt's C++ dispatch, which
+            # prints a traceback and carries on -- leaving a readout
+            # frozen on its last plausible numbers, which is the silent
+            # failure this project keeps meeting. Recording it where the
+            # readout will find it, and stopping, is the honest outcome.
+            self._error = exc
+            self._timer.stop()
+            print(f"tracking stopped: {exc}", file=sys.stderr)
 
 
 def _command_stop(config: StationConfig, factory: RotorFactory) -> int:

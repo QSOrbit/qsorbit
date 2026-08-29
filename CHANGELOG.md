@@ -63,6 +63,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A theme asking for a border-and-typography style this version doesn't have still loads and uses its colours, rather than refusing entirely. It says once that it's drawing in the plain style so a downloaded theme that looks unlike its screenshot isn't a mystery.
 - `qsorbit receive --theme` picks the theme for the instrument window.
 - Ctrl+T in the instrument window cycles through the installed themes (Ctrl+Shift+T steps back), so a theme can be judged against a live waterfall rather than by relaunching.
+- `qsorbit shell`, the application window: Radio, Rotor, Plan and Decode tabs above one live radio, with the theme picker in the top bar and the local and UTC clocks beside it. Every part of it is optional - with nothing attached it opens and each tab says what it is waiting for, which is what an evening with no sky looks like.
+- Panels no longer subscribe to anything themselves. A feed hub owns the radio, the rotor and the spectrum, and hands each panel its own independent view - so two waterfalls can watch the same radio without taking frames from each other, which is what will make a custom tab possible.
+- A live frequency readout showing where the tracked downlink actually sits, with the Doppler shift under it. The megahertz are shown large and the hertz small, because during a pass the last three digits move continuously and the first six barely at all.
+- A tab whose hardware is absent says so in words rather than showing an empty instrument. A panel drawing nothing and a panel whose radio died look identical, and only one of them is a fault.
+
+### Changed
+
+- The quieting panel now stacks its bar above its labels instead of running them in a row, so it stays readable in a narrow column. In the old layout its text was cut off mid-word when placed beside the spectrum.
+- Cards, panels and headings are drawn from the theme's own tokens throughout the new window, including the LCARS accent bars, which take their colours from whichever accent the active theme sets rather than from a fixed palette. A theme of your own that asks for the LCARS style gets bars in its own key.
+
 
 ### Changed
 

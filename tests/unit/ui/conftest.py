@@ -21,6 +21,31 @@ from qsorbit.ui.theme import DEFAULT_THEMES_DIR, Colormap, Theme, load_theme
 
 
 @pytest.fixture(scope="session")
+def qapp():
+    """One QApplication for the whole session -- Qt allows only one.
+
+    Moved here from ``test_theme_manager.py`` when a second Qt test
+    module appeared, which is the moment the module-level version stops
+    being shareable: there is no ``__init__.py`` under ``tests/``, so
+    one test module cannot import another's fixture, and copying it
+    would be two QApplications waiting to disagree.
+
+    Qt is imported **inside the fixture**, not at the top of this file.
+    conftest is loaded for every test in this directory including the
+    ones with no Qt in them at all, and an import at module scope would
+    take the whole UI suite down on a machine without Qt's system
+    libraries rather than skipping the tests that actually need it --
+    the collection failure Session 27 met on the CI runner, in the one
+    file positioned to cause it everywhere at once.
+    """
+    pytest.importorskip("PySide6.QtWidgets")
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    yield app
+
+
+@pytest.fixture(scope="session")
 def deep_space() -> Theme:
     """The shipped default theme, loaded from its real file.
 

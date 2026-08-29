@@ -28,7 +28,7 @@ from __future__ import annotations
 from typing import Final, Protocol
 
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QProgressBar, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QProgressBar, QVBoxLayout, QWidget
 
 from qsorbit.ui.quieting_formatting import quieting_text
 
@@ -46,6 +46,11 @@ DEFAULT_POLL_INTERVAL_MS: Final = 200
 #: bar rather than a stepped meter" - the underlying value is a float
 #: fraction from :func:`~qsorbit.ui.quieting_formatting.quieting_text`.
 _BAR_STEPS: Final = 1000
+
+#: Height of the bar, in pixels. Slim on purpose: it is a level, and a
+#: full-height progress bar reads as a task making progress towards
+#: finishing, which is not what a squelch does.
+_BAR_HEIGHT: Final = 10
 
 
 class QuietingSource(Protocol):
@@ -98,15 +103,39 @@ class QuietingWidget(QWidget):
         super().__init__(parent)
         self._source = source
 
-        layout = QHBoxLayout(self)
-        layout.addWidget(QLabel("Quieting:"))
-        self._value_label = QLabel("-")
-        layout.addWidget(self._value_label)
+        # Bar above, labels below, rather than one long horizontal row.
+        # **Changed in Chunk C PR2, and by measurement rather than
+        # taste.** The row shape was fine as the only thing in a
+        # full-width instrument window; in the shell's 300 px side
+        # column it rendered as "Quieting: -6.2 dB quietin" with the
+        # text cut off mid-word and the bar squeezed to a stub. That is
+        # the standing widget rule failing in the direction nobody
+        # checks -- a panel has to work in whatever container it is put
+        # in, and a second instance in a narrow Custom-tab cell is
+        # exactly what PR3 will do to it. Stacking also happens to be
+        # the mockup's own layout: a full-width bar, then the gate state
+        # on the left and the figure on the right.
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
         self._bar = QProgressBar()
         self._bar.setRange(0, _BAR_STEPS)
         self._bar.setValue(0)
         self._bar.setTextVisible(False)
-        layout.addWidget(self._bar, 1)
+        self._bar.setFixedHeight(_BAR_HEIGHT)
+        layout.addWidget(self._bar)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        self._gate_label = QLabel("-")
+        self._gate_label.setProperty("role", "dim")
+        self._value_label = QLabel("-")
+        self._value_label.setProperty("role", "value")
+        row.addWidget(self._gate_label)
+        row.addStretch(1)
+        row.addWidget(self._value_label)
+        layout.addLayout(row)
 
         self._timer = QTimer(self)
         self._timer.setInterval(poll_interval_ms)
@@ -119,5 +148,6 @@ class QuietingWidget(QWidget):
 
     def _on_timer(self) -> None:
         text = quieting_text(self._source.live_quieting_db, self._source.live_squelch_open)
-        self._value_label.setText(f"{text.quieting_label} ({text.gate_label})")
+        self._value_label.setText(text.quieting_label)
+        self._gate_label.setText(text.gate_label)
         self._bar.setValue(round(text.bar_fraction * _BAR_STEPS))

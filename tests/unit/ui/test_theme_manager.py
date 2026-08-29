@@ -22,7 +22,6 @@ import pytest
 pytest.importorskip("PySide6.QtWidgets")
 
 from PySide6.QtGui import QPalette  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from qsorbit.ui.theme import (  # noqa: E402
     DEFAULT_THEME_NAME,
@@ -37,13 +36,6 @@ from qsorbit.ui.theme_manager import (  # noqa: E402
     build_qpalette,
     register_bundled_fonts,
 )
-
-
-@pytest.fixture(scope="session")
-def qapp():
-    """One QApplication for the whole session -- Qt allows only one."""
-    app = QApplication.instance() or QApplication([])
-    yield app
 
 
 @pytest.fixture
