@@ -19,7 +19,7 @@ from qsorbit.core.geometry import AzEl
 from qsorbit.core.tracker._shared import require_timezone_aware, ts
 from qsorbit.core.tracker.exceptions import PropagationError, TleError
 from qsorbit.core.tracker.observer import ObserverLocation
-from qsorbit.core.tracker.state import EciState, TopocentricState
+from qsorbit.core.tracker.state import EciState, Subpoint, TopocentricState
 
 
 class Satellite:
@@ -211,6 +211,44 @@ class Satellite:
             time=time.astimezone(UTC),
             position_km=(x, y, z),
             velocity_km_s=(vx, vy, vz),
+        )
+
+    def subpoint_at(self, time: datetime) -> Subpoint:
+        """Compute this satellite's ground-track position at ``time``.
+
+        The sub-satellite point: where on Earth's surface this
+        satellite is directly overhead at ``time``. Feeds the map's
+        ground track (a series of these across a time window, see
+        :func:`~qsorbit.core.tracker.ground_track.ground_track`) and
+        the current visibility footprint's center, which is drawn
+        around this point using
+        :func:`~qsorbit.core.orbit_geometry.footprint_circle`.
+
+        Args:
+            time: The instant to compute, as a timezone-aware datetime
+                (see :meth:`state_at`).
+
+        Returns:
+            The satellite's geodetic ground-track position at
+            ``time``.
+
+        Raises:
+            ValueError: If ``time`` is naive (has no ``tzinfo``).
+            PropagationError: If SGP4 cannot compute a valid position at
+                ``time``.
+        """
+        require_timezone_aware(time)
+        t = ts.from_datetime(time)
+        geocentric = self._sat.at(t)
+        if geocentric.message is not None:
+            raise PropagationError(
+                f"SGP4 could not compute a valid position at {time.isoformat()}: "
+                f"{geocentric.message}"
+            )
+        subpoint = geocentric.subpoint()
+        return Subpoint(
+            latitude_deg=subpoint.latitude.degrees,
+            longitude_deg=subpoint.longitude.degrees,
         )
 
     def topocentric_state(self, observer: ObserverLocation, time: datetime) -> TopocentricState:

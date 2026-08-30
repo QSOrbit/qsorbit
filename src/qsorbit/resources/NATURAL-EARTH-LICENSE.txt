@@ -1,0 +1,31 @@
+Natural Earth (naturalearthdata.com)
+=====================================
+
+File: ne_110m_coastline.geojson
+Source: Natural Earth, 1:110m cultural/physical vector data, "Coastline" layer.
+Distribution used: https://github.com/nvkelso/natural-earth-vector
+  (geojson/ne_110m_coastline.geojson, fetched 2026-08-30)
+
+Coordinates rounded to 2 decimal places (~1 km at the equator) from the
+distribution's original precision -- well below both this dataset's own
+110m-scale resolution and anything a small on-screen map widget can
+render a difference for. No features added, removed, or reprojected;
+only the coordinate rounding above.
+
+Natural Earth is public domain. From the project's own Terms of Use
+(https://www.naturalearthdata.com/about/terms-of-use/):
+
+  "All versions of Natural Earth raster + vector map data found on this
+  website are in the public domain. You may use the maps in any manner,
+  including modifying the content and design, electronic dissemination,
+  and offset printing. The primary authors, Tom Patterson and Nathaniel
+  Vaughn Kelso, and all other contributors renounce all financial claim
+  to the maps and invite you to use them for personal, educational, and
+  commercial purposes.
+
+  No permission is needed to use Natural Earth. Crediting the authors is
+  unnecessary."
+
+Credited here anyway, as a courtesy: Natural Earth was built through a
+collaboration of volunteers and is supported by NACIS (North American
+Cartographic Information Society). See naturalearthdata.com.
