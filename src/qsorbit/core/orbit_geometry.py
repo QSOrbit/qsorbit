@@ -113,6 +113,73 @@ def footprint_radius_deg(altitude_km: float) -> float:
     return math.degrees(math.acos(MEAN_EARTH_RADIUS_KM / (MEAN_EARTH_RADIUS_KM + altitude_km)))
 
 
+def footprint_circle(
+    center_latitude_deg: float,
+    center_longitude_deg: float,
+    radius_deg: float,
+    *,
+    points: int = 36,
+) -> tuple[tuple[float, float], ...]:
+    """A ring of ``(latitude_deg, longitude_deg)`` points tracing a footprint's edge.
+
+    The great-circle destination-point construction: starting at the
+    center and walking ``radius_deg`` of angular distance along each of
+    ``points`` evenly spaced bearings traces the actual circle on the
+    sphere's surface, not an ellipse that only looks right near the
+    equator -- the map draws this by projecting each returned point
+    individually, so a footprint near either pole or crossing the
+    antimeridian comes out the right shape without this function
+    needing to know anything about the map's projection.
+
+    Args:
+        center_latitude_deg: The footprint's center latitude, in
+            degrees -- typically a satellite's current
+            :class:`~qsorbit.core.tracker.state.Subpoint`.
+        center_longitude_deg: The footprint's center longitude, in
+            degrees.
+        radius_deg: The footprint's angular radius, in degrees -- see
+            :func:`footprint_radius_deg`.
+        points: How many points to trace the ring with. 36 (one every
+            10 degrees of bearing) draws smoothly at any on-screen map
+            size this is used for.
+
+    Returns:
+        ``points`` ``(latitude_deg, longitude_deg)`` pairs tracing the
+        footprint's edge, in bearing order starting from due north. Not
+        closed -- the last point does not repeat the first; a caller
+        drawing a closed polygon closes it itself.
+
+    Raises:
+        ValueError: If ``radius_deg`` is not positive, or ``points`` is
+            less than 3.
+    """
+    if radius_deg <= 0.0:
+        raise ValueError(f"radius_deg must be positive, got {radius_deg}.")
+    if points < 3:
+        raise ValueError(f"points must be at least 3, got {points}.")
+
+    center_lat = math.radians(center_latitude_deg)
+    center_lon = math.radians(center_longitude_deg)
+    angular_radius = math.radians(radius_deg)
+
+    ring = []
+    for i in range(points):
+        bearing = math.radians(360.0 * i / points)
+        edge_lat = math.asin(
+            math.sin(center_lat) * math.cos(angular_radius)
+            + math.cos(center_lat) * math.sin(angular_radius) * math.cos(bearing)
+        )
+        edge_lon = center_lon + math.atan2(
+            math.sin(bearing) * math.sin(angular_radius) * math.cos(center_lat),
+            math.cos(angular_radius) - math.sin(center_lat) * math.sin(edge_lat),
+        )
+        # Wrap longitude back into (-180, 180] -- edge_lon drifts outside
+        # that range whenever the footprint straddles the antimeridian.
+        wrapped_lon = (math.degrees(edge_lon) + 540.0) % 360.0 - 180.0
+        ring.append((math.degrees(edge_lat), wrapped_lon))
+    return tuple(ring)
+
+
 def is_ever_visible_from_latitude(
     inclination_deg: float, altitude_km: float, station_latitude_deg: float
 ) -> bool:

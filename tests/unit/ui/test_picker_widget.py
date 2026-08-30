@@ -221,6 +221,82 @@ class TestRowRendering:
         assert widget._table.item(0, 6).text() == "dead 2025-06"
 
 
+class TestVisibleEntriesAndSignal:
+    """The map's own feed: what PR3's ``MapWidget`` is wired to.
+
+    ``visible_entries`` and ``entries_changed`` carry exactly the same
+    data ``_render_table()`` already computes for the table -- these
+    tests prove that surface independently of the table itself, the
+    same "prove what the widget does with entries" reasoning
+    ``TestFilterChips`` above gives for injecting hand-built entries
+    directly.
+    """
+
+    def test_visible_entries_starts_empty_before_any_render(self, qapp, tmp_path):
+        tle_dir = tmp_path / "tles"
+        tle_dir.mkdir()
+        catalog = ProfileCatalog([])
+
+        subject = PickerWidget(catalog, None, tle_dir, OBSERVER, HorizonMask(), now=lambda: NOW)
+
+        # refresh() already ran once at construction (see
+        # TestRefreshEndToEnd below), so an empty directory means
+        # visible_entries is the empty tuple, not unset.
+        assert subject.visible_entries == ()
+
+    def test_visible_entries_reflects_the_active_filters(self, widget):
+        matching = _profile(name="MATCH", transmitters=(_transmitter(),))
+        filtered_out = _profile(name="OTHER", transmitters=())
+        widget._entries = (
+            PickerEntry(profile=matching, next_pass=None, visible_from_latitude=True),
+            PickerEntry(profile=filtered_out, next_pass=None, visible_from_latitude=True),
+        )
+
+        widget._needs_transmitter_chip.setChecked(True)
+
+        assert len(widget.visible_entries) == 1
+        assert widget.visible_entries[0].profile.name == "MATCH"
+
+    def test_entries_changed_emits_the_same_entries_as_the_property(self, widget):
+        widget._entries = (
+            PickerEntry(
+                profile=_profile(name="A", transmitters=(_transmitter(),)),
+                next_pass=None,
+                visible_from_latitude=True,
+            ),
+        )
+        received = []
+        widget.entries_changed.connect(received.append)
+
+        widget._render_table()
+
+        assert len(received) == 1
+        assert received[0] == widget.visible_entries
+
+    def test_toggling_a_chip_re_emits_the_narrowed_set(self, widget):
+        widget._entries = (
+            PickerEntry(
+                profile=_profile(name="A", transmitters=(_transmitter(),)),
+                next_pass=None,
+                visible_from_latitude=True,
+            ),
+            PickerEntry(
+                profile=_profile(name="B", transmitters=()),
+                next_pass=None,
+                visible_from_latitude=True,
+            ),
+        )
+        widget._render_table()
+        received = []
+        widget.entries_changed.connect(received.append)
+
+        widget._needs_transmitter_chip.setChecked(True)
+
+        assert len(received) == 1
+        assert len(received[0]) == 1
+        assert received[0][0].profile.name == "A"
+
+
 class TestMissingTleDirectory:
     def test_shows_a_warning_and_stays_empty(self, qapp, tmp_path):
         missing = tmp_path / "does-not-exist"

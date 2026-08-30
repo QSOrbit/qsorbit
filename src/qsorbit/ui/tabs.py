@@ -47,6 +47,7 @@ from qsorbit.ui.custom_tab import (
 )
 from qsorbit.ui.feed_hub import FeedHub
 from qsorbit.ui.frequency_widget import FrequencyWidget
+from qsorbit.ui.map_widget import MapWidget
 from qsorbit.ui.picker_widget import PickerWidget
 from qsorbit.ui.quieting_widget import QuietingWidget
 from qsorbit.ui.readout_widget import ReadoutWidget
@@ -300,9 +301,16 @@ class RotorTab(QWidget):
 class PlanTab(QWidget):
     """The target picker's home.
 
-    The table and its filter chips shipped in Chunk D PR2; the
-    ground-track map is PR3's, and this tab still shows a placeholder
-    where it will go.
+    The map and the table below it are two independent widgets, not
+    one -- the map's own module docstring explains why (fed by the
+    picker's :attr:`~qsorbit.ui.picker_widget.PickerWidget.entries_changed`
+    signal, sibling-to-sibling, rather than by the hub every other
+    tab's widgets share). This tab just wires that one connection and
+    seeds the map's first paint from :attr:`~qsorbit.ui.picker_widget.
+    PickerWidget.visible_entries`, since the picker has already rendered
+    once by the time its own constructor returns, before this tab gets a
+    chance to connect the signal that would otherwise carry that first
+    update.
 
     Args:
         themes: Passed to every widget that draws its own pixels.
@@ -344,10 +352,19 @@ class PlanTab(QWidget):
                 "everything it needs already works from the command line: "
                 "try `qsorbit plan --tle-dir PATH`."
             )
+            layout.addWidget(Card("Plan", content, themes=themes, index=0, stretch=True), 1)
         else:
-            content = PickerWidget(catalog, catalog_manifest, tle_dir, observer, horizon)
+            picker = PickerWidget(catalog, catalog_manifest, tle_dir, observer, horizon)
+            map_widget = MapWidget(themes=themes, tle_dir=tle_dir, observer=observer)
+            # The picker has already rendered once by its own constructor's
+            # return -- connecting first and seeding second would still miss
+            # that first emission, so this seeds explicitly rather than
+            # relying on the signal to cover a frame it never saw.
+            picker.entries_changed.connect(map_widget.set_visible_entries)
+            map_widget.set_visible_entries(picker.visible_entries)
 
-        layout.addWidget(Card("Plan", content, themes=themes, index=0, stretch=True), 1)
+            layout.addWidget(Card("Ground tracks", map_widget, themes=themes, index=0))
+            layout.addWidget(Card("Plan", picker, themes=themes, index=1, stretch=True), 1)
 
 
 class DecodeTab(QWidget):

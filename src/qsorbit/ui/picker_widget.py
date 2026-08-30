@@ -38,6 +38,7 @@ from datetime import UTC, date, datetime, tzinfo
 from pathlib import Path
 from typing import Final
 
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -101,6 +102,19 @@ def _make_chip(label: str) -> QPushButton:
 class PickerWidget(QWidget):
     """A refreshable, filterable table of curated satellites and their next pass.
 
+    Signals:
+        entries_changed: Emitted at the end of every table render with
+            the entries currently passing every active filter -- the
+            picker's own "current selection" in the roadmap's sense.
+            :class:`~qsorbit.ui.tabs.PlanTab` connects this straight to
+            :meth:`~qsorbit.ui.map_widget.MapWidget.set_visible_entries`,
+            so the map redraws whenever a chip toggles or a refresh
+            changes what the table shows, without either widget
+            knowing the other exists -- the same "widgets receive feeds
+            and know nothing about their container" convention this
+            whole package follows, applied to one widget feeding
+            another instead of a hub feeding both.
+
     Args:
         catalog: The curated profile catalogue to match TLEs against.
         manifest: The catalogue's optional shipped-date manifest, for
@@ -123,6 +137,8 @@ class PickerWidget(QWidget):
             :class:`~qsorbit.core.pointing.TrackingLoop`'s own
             convention.
     """
+
+    entries_changed = Signal(tuple)
 
     def __init__(
         self,
@@ -147,6 +163,7 @@ class PickerWidget(QWidget):
         self._local_zone = local_zone
         self._now = now
         self._entries: tuple[PickerEntry, ...] = ()
+        self._visible_entries: tuple[PickerEntry, ...] = ()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -240,6 +257,20 @@ class PickerWidget(QWidget):
     def _on_filters_changed(self, _checked: bool) -> None:
         self._render_table()
 
+    @property
+    def visible_entries(self) -> tuple[PickerEntry, ...]:
+        """The entries currently passing every active filter.
+
+        Reflects whatever the table last rendered -- current as of
+        construction and after every :meth:`refresh` or chip toggle,
+        without needing a fresh :meth:`~qsorbit.ui.picker_widget.
+        PickerWidget._render_table` call to ask. Reading this once,
+        right after construction, is how a caller seeds a listener that
+        connects to :attr:`entries_changed` after the widget's own
+        constructor already triggered its first render.
+        """
+        return self._visible_entries
+
     def _collect_filters(self) -> PickerFilters:
         return PickerFilters(
             needs_transmitter=self._needs_transmitter_chip.isChecked(),
@@ -256,6 +287,8 @@ class PickerWidget(QWidget):
     def _render_table(self) -> None:
         filters = self._collect_filters()
         visible = [entry for entry in self._entries if entry_passes_filters(entry, filters)]
+        self._visible_entries = tuple(visible)
+        self.entries_changed.emit(self._visible_entries)
 
         self._table.setRowCount(len(visible))
         for row, entry in enumerate(visible):

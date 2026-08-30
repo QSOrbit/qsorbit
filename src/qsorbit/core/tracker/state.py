@@ -34,6 +34,24 @@ class EciState:
 
 
 @dataclass(frozen=True)
+class Subpoint:
+    """A satellite's ground-track position: the point on Earth's surface directly below it.
+
+    ``Subpoint`` is a value object: immutable and comparable by value.
+
+    Args:
+        latitude_deg: Geodetic latitude in degrees, -90 (south pole) to
+            90 (north pole).
+        longitude_deg: Longitude in degrees, -180 to 180. East is
+            positive, matching :attr:`~qsorbit.core.tracker.observer.
+            ObserverLocation.longitude`'s own convention.
+    """
+
+    latitude_deg: float
+    longitude_deg: float
+
+
+@dataclass(frozen=True)
 class TopocentricState:
     """A satellite's position relative to a ground observer.
 

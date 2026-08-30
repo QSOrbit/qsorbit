@@ -14,6 +14,7 @@ import pytest
 
 from qsorbit.core.orbit_geometry import (
     MEAN_EARTH_RADIUS_KM,
+    footprint_circle,
     footprint_radius_deg,
     is_ever_visible_from_latitude,
     max_ground_track_latitude_deg,
@@ -64,6 +65,56 @@ class TestFootprintRadiusDeg:
     def test_non_positive_altitude_is_an_error(self, bad):
         with pytest.raises(ValueError, match="altitude_km"):
             footprint_radius_deg(bad)
+
+
+class TestFootprintCircle:
+    def test_returns_the_requested_number_of_points(self):
+        ring = footprint_circle(0.0, 0.0, 10.0, points=12)
+
+        assert len(ring) == 12
+
+    def test_equatorial_circle_lands_on_the_compass_points(self):
+        # Centered on the equator/prime meridian, walking due
+        # north/east/south/west by 10 degrees is elementary to check by
+        # hand: no spherical distortion crosses in along a meridian or
+        # the equator itself.
+        north, east, south, west = footprint_circle(0.0, 0.0, 10.0, points=4)
+
+        assert north == pytest.approx((10.0, 0.0), abs=1e-9)
+        assert east == pytest.approx((0.0, 10.0), abs=1e-9)
+        assert south == pytest.approx((-10.0, 0.0), abs=1e-9)
+        assert west[0] == pytest.approx(0.0, abs=1e-9)
+        assert west[1] == pytest.approx(-10.0, abs=1e-9)
+
+    def test_a_ring_over_the_pole_wraps_to_the_opposite_meridian(self):
+        # From 85N, walking 10 degrees due north climbs over the pole
+        # (85 + 10 = 95, past 90) and comes back down the other side at
+        # 180 - 95 = 85, on the meridian 180 degrees away.
+        ring = footprint_circle(85.0, 0.0, 10.0, points=4)
+        north = ring[0]
+
+        assert north[0] == pytest.approx(85.0)
+        assert north[1] == pytest.approx(-180.0)
+
+    def test_antimeridian_straddle_wraps_into_range(self):
+        # Centered near +179 degrees longitude, the eastward point
+        # crosses +180/-180 and must come back as a value in
+        # (-180, 180], not drift outside it.
+        ring = footprint_circle(0.0, 179.0, 5.0, points=4)
+        east = ring[1]
+
+        assert -180.0 < east[1] <= 180.0
+        assert east[1] == pytest.approx(-176.0)
+
+    @pytest.mark.parametrize("bad", [0.0, -5.0])
+    def test_non_positive_radius_is_an_error(self, bad):
+        with pytest.raises(ValueError, match="radius_deg"):
+            footprint_circle(0.0, 0.0, bad)
+
+    @pytest.mark.parametrize("bad", [0, 1, 2])
+    def test_too_few_points_is_an_error(self, bad):
+        with pytest.raises(ValueError, match="points"):
+            footprint_circle(0.0, 0.0, 10.0, points=bad)
 
 
 class TestIsEverVisibleFromLatitude:

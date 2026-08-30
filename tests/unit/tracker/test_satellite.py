@@ -254,6 +254,47 @@ class TestStateAt:
 
 
 # ---------------------------------------------------------------------------
+# subpoint_at() -- public API behavior
+# ---------------------------------------------------------------------------
+
+
+class TestSubpointAt:
+    def test_matches_skyfield_directly_at_the_same_instant(self):
+        """Wiring check, same shape as TestStateAt's own above.
+
+        subpoint_at() is a thin pass-through to skyfield's own
+        subpoint() computation -- this checks the wrapper doesn't
+        introduce its own bug (wrong field, swapped lat/lon) rather
+        than re-proving the underlying geodesy, which is skyfield's job
+        to get right, not this project's.
+        """
+        sat = Satellite.from_tle(_TEME_EXAMPLE_TLE)
+        ts = load.timescale(builtin=True)
+        epoch = sat.skyfield_satellite.epoch
+        t = ts.tt_jd(epoch.whole + 3.0, epoch.tt_fraction)
+
+        direct = sat.skyfield_satellite.at(t).subpoint()
+        subpoint = sat.subpoint_at(t.utc_datetime())
+
+        assert subpoint.latitude_deg == pytest.approx(direct.latitude.degrees)
+        assert subpoint.longitude_deg == pytest.approx(direct.longitude.degrees)
+
+    def test_latitude_and_longitude_land_in_valid_ranges(self):
+        sat = Satellite.from_tle(_TEME_EXAMPLE_TLE)
+
+        subpoint = sat.subpoint_at(sat.epoch + timedelta(hours=1))
+
+        assert -90.0 <= subpoint.latitude_deg <= 90.0
+        assert -180.0 <= subpoint.longitude_deg <= 180.0
+
+    def test_naive_datetime_rejected(self):
+        sat = Satellite.from_tle(_TEME_EXAMPLE_TLE)
+        naive = datetime(2000, 6, 30, 18, 50, 20)
+        with pytest.raises(ValueError, match="timezone-aware"):
+            sat.subpoint_at(naive)
+
+
+# ---------------------------------------------------------------------------
 # Propagation errors
 # ---------------------------------------------------------------------------
 
