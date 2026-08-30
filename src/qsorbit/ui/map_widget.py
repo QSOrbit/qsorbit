@@ -445,11 +445,28 @@ class _MapCanvas(QWidget):
             # view, if any of it does.
             return
         screen = _to_screen(current_point, scale, center_x, center_y)
+        # The marker dot is the only filled thing this widget draws, and
+        # its brush is scoped rather than reset afterwards. A bare
+        # setBrush(NoBrush) on the way out would work until somebody
+        # adds an early return between here and there -- and the leak
+        # this replaces happened by omission in the first place, so the
+        # fix should not be another line that has to be remembered.
+        #
+        # What leaked: the brush stayed set through the footprint ring
+        # below and through the *next* satellite's track on the following
+        # iteration, so both were filled. Every track became a solid
+        # blob, which is the opposite of this map's stated design -- a
+        # ring is stroked precisely so that a segment split by the
+        # antimeridian or the globe's limb degrades to the pieces that
+        # are actually correct, instead of closing itself into a polygon
+        # that was never there.
+        painter.save()
         painter.setBrush(color)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(screen, 3.0, 3.0)
         painter.setPen(color)
         painter.drawText(screen + QPointF(6.0, -4.0), satellite.name)
+        painter.restore()
 
         footprint_deg = footprint_radius_deg(satellite.mean_altitude_km)
         ring = footprint_circle(current.latitude_deg, current.longitude_deg, footprint_deg)

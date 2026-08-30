@@ -33,6 +33,7 @@ pytest.importorskip("PySide6.QtWidgets")
 from PySide6.QtCore import QRectF  # noqa: E402
 
 from qsorbit.core.map_projection import Projection  # noqa: E402
+from qsorbit.core.orbit_geometry import footprint_radius_deg  # noqa: E402
 from qsorbit.core.picker import PickerEntry  # noqa: E402
 from qsorbit.core.profiles import (  # noqa: E402
     AliveRecord,
@@ -48,7 +49,7 @@ from qsorbit.ui.map_widget import (  # noqa: E402
     _to_screen,
 )
 from qsorbit.ui.theme import DEFAULT_THEMES_DIR, discover_themes  # noqa: E402
-from qsorbit.ui.theme_manager import ThemeManager  # noqa: E402
+from qsorbit.ui.theme_manager import ThemeManager, accent_bar_color  # noqa: E402
 
 TEME_EXAMPLE_TLE = """\
 TEME EXAMPLE
@@ -300,3 +301,95 @@ class TestPaintSmoke:
         subject.show()
 
         subject.grab()
+
+
+class TestFootprintIsStroked:
+    """The footprint ring is an outline, and the inside of it is not painted.
+
+    This exists because the map reached a real screen drawing solid
+    blobs. ``_paint_satellite`` set a fill brush for the satellite's
+    marker dot and never unset it, so the footprint ring below it was
+    filled, and so was the *next* satellite's ground track on the
+    following iteration.
+
+    **Every one of the four paint smoke tests above passed the whole
+    time.** They assert that painting does not raise, which is worth
+    having and is a different claim from painting the right thing. The
+    only way to tell a ring from a disc is to look at a pixel inside it
+    -- Session 28's lesson about verifying a rendered result rather than
+    the code that was supposed to produce it.
+
+    Filling also defeats the ring's stated design: it is stroked
+    precisely so a segment split by the antimeridian or the globe's limb
+    degrades to the pieces that are really there, instead of closing
+    itself into a polygon that never existed.
+    """
+
+    def _interior_samples(self, subject):
+        """Screen points strictly inside the footprint ring, derived not guessed.
+
+        Uses the widget's own transform helpers, so the sample points
+        follow the projection rather than depending on a hand-measured
+        pixel that a layout change would invalidate. Nothing is sampled
+        to the *right* of the marker: the satellite's name label is
+        drawn there.
+        """
+        canvas = subject._canvas
+        scale, center_x, center_y = _fit_transform(QRectF(canvas.rect()), Projection.FLAT)
+
+        satellite = next(iter(subject._satellites.values()))
+        current = satellite.subpoint_at(NOW)
+        point = _project_point(
+            current.latitude_deg, current.longitude_deg, Projection.FLAT, 0.0, 0.0
+        )
+        assert point is not None, "the flat projection drops no points"
+        base = _to_screen(point, scale, center_x, center_y)
+
+        radius_deg = footprint_radius_deg(satellite.mean_altitude_km)
+        offsets_deg = (
+            (-0.5, 0.0),
+            (-0.3, 0.0),
+            (-0.35, 0.35),
+            (0.0, 0.4),
+            (0.0, -0.4),
+        )
+        points = []
+        for dx, dy in offsets_deg:
+            x = int(base.x() + dx * radius_deg * scale)
+            y = int(base.y() - dy * radius_deg * scale)
+            if 0 <= x < canvas.width() and 0 <= y < canvas.height():
+                points.append((x, y))
+        assert points, "no interior sample landed on the canvas"
+        return points
+
+    def test_the_inside_of_a_footprint_is_not_painted_in_the_track_colour(
+        self, manager, populated_tle_dir
+    ):
+        """The defect, as an assertion.
+
+        Before the fix every one of these samples came back as the
+        satellite's own accent colour, because the ring was a filled
+        disc. The colour is read from the theme rather than typed here,
+        so this cannot drift out of step with the palette.
+        """
+        subject = MapWidget(
+            themes=manager, tle_dir=populated_tle_dir, observer=OBSERVER, now=lambda: NOW
+        )
+        subject.set_visible_entries(
+            (PickerEntry(profile=_profile(), next_pass=None, visible_from_latitude=True),)
+        )
+        subject.resize(400, 300)
+        subject.show()
+
+        image = subject._canvas.grab().toImage()
+        filled = accent_bar_color(manager.current, 0)
+
+        painted = [
+            (x, y)
+            for x, y in self._interior_samples(subject)
+            if image.pixelColor(x, y).rgb() == filled.rgb()
+        ]
+        assert painted == [], (
+            f"the footprint interior is filled with the track colour at {painted} -- "
+            "the ring is being drawn as a disc"
+        )
