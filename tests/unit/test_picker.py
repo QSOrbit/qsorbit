@@ -21,6 +21,7 @@ from qsorbit.core.picker import (
     _sort_key,
     build_picker_entries,
     classify_band,
+    entry_passes_filters,
     mode_group,
     passes_filters,
     primary_transmitter,
@@ -205,6 +206,51 @@ class TestPassesFilters:
         assert not passes_filters(wrong_band, filters)
 
 
+class TestEntryPassesFilters:
+    def test_default_filters_pass_everything(self):
+        entry = PickerEntry(
+            profile=_profile(transmitters=()), next_pass=None, visible_from_latitude=False
+        )
+
+        assert entry_passes_filters(entry, PickerFilters())
+
+    def test_require_visible_from_latitude_excludes_when_false(self):
+        filters = PickerFilters(require_visible_from_latitude=True)
+        entry = PickerEntry(profile=_profile(), next_pass=None, visible_from_latitude=False)
+
+        assert not entry_passes_filters(entry, filters)
+
+    def test_require_visible_from_latitude_keeps_when_true(self):
+        filters = PickerFilters(require_visible_from_latitude=True)
+        entry = PickerEntry(profile=_profile(), next_pass=None, visible_from_latitude=True)
+
+        assert entry_passes_filters(entry, filters)
+
+    def test_combines_with_the_profile_axes(self):
+        # visible_from_latitude=True alone isn't enough if a profile
+        # axis also fails, and vice versa -- entry_passes_filters
+        # checks both, not just its own axis.
+        filters = PickerFilters(require_visible_from_latitude=True, needs_transmitter=True)
+        transmitter = _transmitter(435_640_000.0, Mode.CW, ReliabilityClass.UNCONDITIONAL)
+        visible_but_no_transmitter = PickerEntry(
+            profile=_profile(transmitters=()), next_pass=None, visible_from_latitude=True
+        )
+        has_transmitter_but_not_visible = PickerEntry(
+            profile=_profile(transmitters=(transmitter,)),
+            next_pass=None,
+            visible_from_latitude=False,
+        )
+        matches_both = PickerEntry(
+            profile=_profile(transmitters=(transmitter,)),
+            next_pass=None,
+            visible_from_latitude=True,
+        )
+
+        assert not entry_passes_filters(visible_but_no_transmitter, filters)
+        assert not entry_passes_filters(has_transmitter_but_not_visible, filters)
+        assert entry_passes_filters(matches_both, filters)
+
+
 class TestBuildPickerEntries:
     def _tle_dir(self, tmp_path, text=TEME_EXAMPLE_TLE):
         directory = tmp_path / "tles"
@@ -269,6 +315,28 @@ class TestBuildPickerEntries:
         assert len(all_passes) > 1
         assert entries[0].next_pass.aos.time == min(p.aos.time for p in all_passes)
 
+    def test_computes_visible_from_latitude_for_a_reachable_station(self, tmp_path):
+        tle_dir = self._tle_dir(tmp_path)
+        catalog = ProfileCatalog([_profile(norad_id=5, name="TEME EXAMPLE")])
+
+        entries = build_picker_entries(catalog, tle_dir, OBSERVER, HorizonMask(), NOW, hours=0.001)
+
+        assert entries[0].visible_from_latitude is True
+
+    def test_computes_visible_from_latitude_for_an_unreachable_station(self, tmp_path):
+        # This TLE's inclination (34.2682 deg) and mean altitude give a
+        # ground-track-plus-footprint reach of roughly 76.7 degrees
+        # (see test_orbit_geometry.py's own geometry tests) -- a
+        # station at 85 degrees north is beyond that reach and can
+        # never see this satellite, no matter the search window.
+        tle_dir = self._tle_dir(tmp_path)
+        catalog = ProfileCatalog([_profile(norad_id=5, name="TEME EXAMPLE")])
+        far_north = ObserverLocation(latitude=85.0, longitude=-83.0, altitude_m=250.0)
+
+        entries = build_picker_entries(catalog, tle_dir, far_north, HorizonMask(), NOW, hours=0.001)
+
+        assert entries[0].visible_from_latitude is False
+
 
 class TestSortKey:
     """Direct tests of the private sort key, since proving order needs
@@ -281,19 +349,27 @@ class TestSortKey:
         return Pass(aos=event, los=event, tca=event, max_elevation_deg=10.0, az_track=(event,))
 
     def test_a_pass_sorts_before_no_pass(self):
-        with_pass = PickerEntry(profile=_profile(name="Z"), next_pass=self._pass_at(1))
-        without_pass = PickerEntry(profile=_profile(name="A"), next_pass=None)
+        with_pass = PickerEntry(
+            profile=_profile(name="Z"), next_pass=self._pass_at(1), visible_from_latitude=True
+        )
+        without_pass = PickerEntry(
+            profile=_profile(name="A"), next_pass=None, visible_from_latitude=True
+        )
 
         assert sorted([without_pass, with_pass], key=_sort_key) == [with_pass, without_pass]
 
     def test_earlier_pass_sorts_first(self):
-        later = PickerEntry(profile=_profile(name="LATER"), next_pass=self._pass_at(5))
-        earlier = PickerEntry(profile=_profile(name="EARLIER"), next_pass=self._pass_at(1))
+        later = PickerEntry(
+            profile=_profile(name="LATER"), next_pass=self._pass_at(5), visible_from_latitude=True
+        )
+        earlier = PickerEntry(
+            profile=_profile(name="EARLIER"), next_pass=self._pass_at(1), visible_from_latitude=True
+        )
 
         assert sorted([later, earlier], key=_sort_key) == [earlier, later]
 
     def test_no_pass_entries_sort_by_name(self):
-        z = PickerEntry(profile=_profile(name="Z"), next_pass=None)
-        a = PickerEntry(profile=_profile(name="A"), next_pass=None)
+        z = PickerEntry(profile=_profile(name="Z"), next_pass=None, visible_from_latitude=True)
+        a = PickerEntry(profile=_profile(name="A"), next_pass=None, visible_from_latitude=True)
 
         assert sorted([z, a], key=_sort_key) == [a, z]

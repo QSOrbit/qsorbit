@@ -116,6 +116,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The Plan tab now shows a real target picker: a filterable, refreshable table of curated satellites and their next pass, matched against this station's own TLEs and horizon mask exactly as `qsorbit plan` computes them. Four filter axes -- needs a transmitter, band, modulation, and reliability class -- combine as chips above the table; a fifth, "visible from this latitude," is deliberately not here yet and lands in its own follow-up PR with its own geometry. Recompute is a manual Refresh button rather than a timer, since matching TLEs and predicting passes is real CPU work, not a cheap property read.
 - An optional `[planning]` section in station config, with a `tle_dir` key naming where the Plan tab should look for this station's TLEs. A station that hasn't set one sees a placeholder naming the config key instead of an empty table with no explanation.
+- The target picker's fifth filter axis: "visible from here," a chip that excludes satellites whose orbit can geometrically never rise above this station's horizon at all -- an equatorial bird will never show up for a station at 60 degrees north, no matter how long the search window runs. Whether an orbit reaches a given latitude is computed from its inclination and mean altitude alone (ground-track reach plus flat-horizon footprint radius), a permanent fact about the orbit and the station, not a per-pass prediction.
 
 
 <!--

@@ -96,8 +96,16 @@ def widget(qapp, tmp_path):
 class TestFilterChips:
     def test_no_chips_checked_shows_everything(self, widget):
         widget._entries = (
-            PickerEntry(profile=_profile(name="A", transmitters=(_transmitter(),)), next_pass=None),
-            PickerEntry(profile=_profile(name="B", transmitters=()), next_pass=None),
+            PickerEntry(
+                profile=_profile(name="A", transmitters=(_transmitter(),)),
+                next_pass=None,
+                visible_from_latitude=True,
+            ),
+            PickerEntry(
+                profile=_profile(name="B", transmitters=()),
+                next_pass=None,
+                visible_from_latitude=True,
+            ),
         )
         widget._render_table()
 
@@ -105,8 +113,16 @@ class TestFilterChips:
 
     def test_needs_transmitter_hides_profiles_with_none(self, widget):
         widget._entries = (
-            PickerEntry(profile=_profile(name="A", transmitters=(_transmitter(),)), next_pass=None),
-            PickerEntry(profile=_profile(name="B", transmitters=()), next_pass=None),
+            PickerEntry(
+                profile=_profile(name="A", transmitters=(_transmitter(),)),
+                next_pass=None,
+                visible_from_latitude=True,
+            ),
+            PickerEntry(
+                profile=_profile(name="B", transmitters=()),
+                next_pass=None,
+                visible_from_latitude=True,
+            ),
         )
 
         widget._needs_transmitter_chip.setChecked(True)
@@ -120,8 +136,8 @@ class TestFilterChips:
         )
         two_m = _profile(name="TWO", transmitters=(_transmitter(downlink_hz=145_825_000.0),))
         widget._entries = (
-            PickerEntry(profile=seventy_cm, next_pass=None),
-            PickerEntry(profile=two_m, next_pass=None),
+            PickerEntry(profile=seventy_cm, next_pass=None, visible_from_latitude=True),
+            PickerEntry(profile=two_m, next_pass=None, visible_from_latitude=True),
         )
 
         widget._band_chips[Band.SEVENTY_CM].setChecked(True)
@@ -133,8 +149,8 @@ class TestFilterChips:
         fm = _profile(name="FM-SAT", transmitters=(_transmitter(mode=Mode.FM),))
         cw = _profile(name="CW-SAT", transmitters=(_transmitter(mode=Mode.CW),))
         widget._entries = (
-            PickerEntry(profile=fm, next_pass=None),
-            PickerEntry(profile=cw, next_pass=None),
+            PickerEntry(profile=fm, next_pass=None, visible_from_latitude=True),
+            PickerEntry(profile=cw, next_pass=None, visible_from_latitude=True),
         )
 
         widget._mode_chips[ModeGroup.FM].setChecked(True)
@@ -152,8 +168,8 @@ class TestFilterChips:
             transmitters=(_transmitter(reliability=ReliabilityClass.DEPENDENT),),
         )
         widget._entries = (
-            PickerEntry(profile=beacon, next_pass=None),
-            PickerEntry(profile=transponder, next_pass=None),
+            PickerEntry(profile=beacon, next_pass=None, visible_from_latitude=True),
+            PickerEntry(profile=transponder, next_pass=None, visible_from_latitude=True),
         )
 
         widget._reliability_chips[ReliabilityClass.UNCONDITIONAL].setChecked(True)
@@ -167,14 +183,27 @@ class TestFilterChips:
         )
         two_m = _profile(name="TWO", transmitters=(_transmitter(downlink_hz=145_825_000.0),))
         widget._entries = (
-            PickerEntry(profile=seventy_cm, next_pass=None),
-            PickerEntry(profile=two_m, next_pass=None),
+            PickerEntry(profile=seventy_cm, next_pass=None, visible_from_latitude=True),
+            PickerEntry(profile=two_m, next_pass=None, visible_from_latitude=True),
         )
 
         widget._band_chips[Band.SEVENTY_CM].setChecked(True)
         widget._band_chips[Band.TWO_METERS].setChecked(True)
 
         assert widget._table.rowCount() == 2
+
+    def test_visible_from_latitude_chip_keeps_only_matching_entries(self, widget):
+        reachable = _profile(name="REACHABLE", transmitters=(_transmitter(),))
+        unreachable = _profile(name="UNREACHABLE", transmitters=(_transmitter(),))
+        widget._entries = (
+            PickerEntry(profile=reachable, next_pass=None, visible_from_latitude=True),
+            PickerEntry(profile=unreachable, next_pass=None, visible_from_latitude=False),
+        )
+
+        widget._visible_from_latitude_chip.setChecked(True)
+
+        assert widget._table.rowCount() == 1
+        assert widget._table.item(0, 1).text() == "REACHABLE"
 
 
 class TestRowRendering:
@@ -184,7 +213,7 @@ class TestRowRendering:
             transmitters=(_transmitter(),),
             alive=_alive(status=AliveStatus.INACTIVE, as_of=date(2025, 6, 1)),
         )
-        widget._entries = (PickerEntry(profile=dead, next_pass=None),)
+        widget._entries = (PickerEntry(profile=dead, next_pass=None, visible_from_latitude=True),)
         widget._render_table()
 
         dot = widget._table.cellWidget(0, 0)

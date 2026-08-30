@@ -21,6 +21,7 @@ Two external sources are used:
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
@@ -116,6 +117,43 @@ class TestEpoch:
         assert sat.epoch.month == 6
         assert sat.epoch.day == 27
         assert sat.epoch.tzinfo is not None
+
+
+class TestInclinationDeg:
+    def test_matches_the_tle_lines_own_declared_inclination(self):
+        # Line 2 of the TEME EXAMPLE TLE declares inclination
+        # "34.2682" degrees directly -- a calendar-fact-style read
+        # straight off the element set, not a value recomputed from
+        # propagated state.
+        sat = Satellite.from_tle(_TEME_EXAMPLE_TLE)
+        assert sat.inclination_deg == pytest.approx(34.2682, abs=1e-4)
+
+
+class TestMeanAltitudeKm:
+    def test_matches_an_independent_keplers_third_law_estimate(self):
+        # Independent cross-check: derive the semi-major axis from the
+        # TLE's own declared mean motion via Kepler's third law (a
+        # two-body approximation using WGS72's mu), rather than
+        # reading the SGP4-internally-corrected semi-major axis the
+        # property itself uses. The two disagree by roughly 0.13%,
+        # which is expected -- SGP4 applies secular/periodic
+        # corrections a plain two-body estimate doesn't reproduce --
+        # so this is a coarse independent sanity check, not an
+        # exact-match test.
+        mean_motion_rev_per_day = 10.82419157413667  # TLE line 2, cols 53-63
+        mean_motion_rad_per_s = mean_motion_rev_per_day * 2 * math.pi / 86400.0
+        mu_km3_s2 = 398600.8  # WGS72 Earth gravitational constant, SGP4's default
+        earth_radius_km = 6378.135  # WGS72, matching SGP4's internal radiusearthkm
+        semi_major_axis_km = (mu_km3_s2 / mean_motion_rad_per_s**2) ** (1 / 3)
+        independent_altitude_km = semi_major_axis_km - earth_radius_km
+
+        sat = Satellite.from_tle(_TEME_EXAMPLE_TLE)
+
+        assert sat.mean_altitude_km == pytest.approx(independent_altitude_km, rel=0.01)
+
+    def test_is_positive_for_a_realistic_leo_orbit(self):
+        sat = Satellite.from_tle(_TEME_EXAMPLE_TLE)
+        assert sat.mean_altitude_km > 0
 
 
 class TestNoradId:

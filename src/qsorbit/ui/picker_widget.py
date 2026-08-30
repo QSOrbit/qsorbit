@@ -58,7 +58,7 @@ from qsorbit.core.picker import (
     PickerEntry,
     PickerFilters,
     build_picker_entries,
-    passes_filters,
+    entry_passes_filters,
 )
 from qsorbit.core.profiles import CatalogManifest, ProfileCatalog, ReliabilityClass
 from qsorbit.core.tracker import ObserverLocation
@@ -179,11 +179,13 @@ class PickerWidget(QWidget):
             ReliabilityClass.SCHEDULED: _make_chip("B"),
             ReliabilityClass.DEPENDENT: _make_chip("C"),
         }
+        self._visible_from_latitude_chip = _make_chip("visible from here")
         all_chips = (
             (self._needs_transmitter_chip,)
             + tuple(self._band_chips.values())
             + tuple(self._mode_chips.values())
             + tuple(self._reliability_chips.values())
+            + (self._visible_from_latitude_chip,)
         )
         for chip in all_chips[1:]:
             chip_row.addWidget(chip)
@@ -248,11 +250,12 @@ class PickerWidget(QWidget):
             reliability_classes=frozenset(
                 rc for rc, chip in self._reliability_chips.items() if chip.isChecked()
             ),
+            require_visible_from_latitude=self._visible_from_latitude_chip.isChecked(),
         )
 
     def _render_table(self) -> None:
         filters = self._collect_filters()
-        visible = [entry for entry in self._entries if passes_filters(entry.profile, filters)]
+        visible = [entry for entry in self._entries if entry_passes_filters(entry, filters)]
 
         self._table.setRowCount(len(visible))
         for row, entry in enumerate(visible):

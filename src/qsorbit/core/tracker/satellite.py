@@ -9,6 +9,7 @@ QSOrbit-shaped API around it — see :class:`Satellite`.
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -114,6 +115,43 @@ class Satellite:
         never reused.
         """
         return self._sat.model.satnum
+
+    @property
+    def inclination_deg(self) -> float:
+        """Orbital inclination, in degrees.
+
+        0 is equatorial-prograde, 90 is polar, values approaching 180
+        are equatorial-retrograde. Read straight from the TLE's own
+        line 2 via SGP4's parsed model -- this is exactly the
+        inclination the element set already declares, not a value
+        recomputed from propagated state.
+
+        :func:`~qsorbit.core.orbit_geometry.max_ground_track_latitude_deg`
+        is the reason this is exposed: "how far this orbit's ground
+        track reaches from the equator" needs it, and reaching for
+        :attr:`skyfield_satellite` from outside this module for one
+        radian-to-degree conversion would be exactly the case this
+        class's escape-hatch docstring says to avoid.
+        """
+        return math.degrees(self._sat.model.inclo)
+
+    @property
+    def mean_altitude_km(self) -> float:
+        """Mean height above Earth's surface, in kilometres, from the orbit's semi-major axis.
+
+        A circular-orbit approximation -- ``(a - 1) * Re`` in the
+        orbit's own semi-major axis ``a`` and Earth radius ``Re``, both
+        taken from SGP4's own internal model so the two stay in the
+        same units throughout. For the near-circular orbits every
+        curated profile in this project's catalogue actually flies,
+        apogee and perigee differ from this mean by a rounding error;
+        for a genuinely eccentric orbit this is a single representative
+        altitude, not apogee or perigee specifically -- exactly the
+        granularity :func:`~qsorbit.core.orbit_geometry.footprint_radius_deg`
+        needs and no more.
+        """
+        model = self._sat.model
+        return (model.a - 1.0) * model.radiusearthkm
 
     @property
     def epoch(self) -> datetime:
