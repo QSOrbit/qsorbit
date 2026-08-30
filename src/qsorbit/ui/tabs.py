@@ -36,6 +36,9 @@ from typing import Final
 from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QVBoxLayout, QWidget
 
 from qsorbit.core.dsp.spectrum import frequency_axis_hz
+from qsorbit.core.horizon import HorizonMask
+from qsorbit.core.profiles import CatalogManifest, ProfileCatalog
+from qsorbit.core.tracker import ObserverLocation
 from qsorbit.ui.cards import Card, Placeholder
 from qsorbit.ui.custom_tab import (
     KNOWN_WIDGETS,
@@ -44,6 +47,7 @@ from qsorbit.ui.custom_tab import (
 )
 from qsorbit.ui.feed_hub import FeedHub
 from qsorbit.ui.frequency_widget import FrequencyWidget
+from qsorbit.ui.picker_widget import PickerWidget
 from qsorbit.ui.quieting_widget import QuietingWidget
 from qsorbit.ui.readout_widget import ReadoutWidget
 from qsorbit.ui.spectrum_line_widget import SpectrumLineWidget
@@ -294,26 +298,56 @@ class RotorTab(QWidget):
 
 
 class PlanTab(QWidget):
-    """The target picker's home. Populated in Chunk D."""
+    """The target picker's home.
 
-    def __init__(self, *, themes: ThemeManager, parent: QWidget | None = None) -> None:
+    The table and its filter chips shipped in Chunk D PR2; the
+    ground-track map is PR3's, and this tab still shows a placeholder
+    where it will go.
+
+    Args:
+        themes: Passed to every widget that draws its own pixels.
+        catalog: The curated profile catalogue the picker matches TLEs
+            against.
+        catalog_manifest: The catalogue's optional shipped-date
+            manifest, for the picker's staleness line.
+        tle_dir: This station's configured TLE directory
+            (``[planning] tle_dir`` in station config), or ``None`` if
+            it has not been set -- in which case this tab shows a
+            placeholder naming the config key rather than a picker with
+            nothing to search, the same "off, not broken" convention
+            :class:`RadioTab` and :class:`RotorTab` already follow for
+            a missing feed.
+        observer: This station's location, for pass prediction.
+        horizon: This station's own horizon mask, applied the same way
+            ``qsorbit plan`` applies it.
+    """
+
+    def __init__(
+        self,
+        *,
+        themes: ThemeManager,
+        catalog: ProfileCatalog,
+        catalog_manifest: CatalogManifest | None,
+        tle_dir: str | None,
+        observer: ObserverLocation,
+        horizon: HorizonMask,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.addWidget(
-            Card(
-                "Plan",
-                Placeholder(
-                    "The target picker and the ground-track map arrive in "
-                    "Chunk D. Everything they need already works from the "
-                    "command line: try `qsorbit plan`."
-                ),
-                themes=themes,
-                index=0,
-                stretch=True,
-            ),
-            1,
-        )
+
+        if tle_dir is None:
+            content: QWidget = Placeholder(
+                "No TLE directory configured. Set tle_dir under [planning] in "
+                "your station config to light up the target picker here -- "
+                "everything it needs already works from the command line: "
+                "try `qsorbit plan --tle-dir PATH`."
+            )
+        else:
+            content = PickerWidget(catalog, catalog_manifest, tle_dir, observer, horizon)
+
+        layout.addWidget(Card("Plan", content, themes=themes, index=0, stretch=True), 1)
 
 
 class DecodeTab(QWidget):

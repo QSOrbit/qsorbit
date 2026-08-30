@@ -45,6 +45,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from qsorbit.core.horizon import HorizonMask
+from qsorbit.core.profiles import CatalogManifest, ProfileCatalog
+from qsorbit.core.tracker import ObserverLocation
 from qsorbit.ui.custom_tab import CustomTabConfig
 from qsorbit.ui.feed_hub import FeedHub
 from qsorbit.ui.tabs import CustomTab, DecodeTab, PlanTab, RadioTab, RotorTab
@@ -231,6 +234,27 @@ class ShellWindow(QMainWindow):
             verbatim in the Custom tab rather than only on the console,
             since a typo in the file should not cost more than that one
             tab.
+        catalog: The curated profile catalogue, threaded straight to
+            :class:`~qsorbit.ui.tabs.PlanTab`'s target picker. Loaded
+            by the caller the same way every shell-launching function
+            in ``__main__`` already loads it for ``qsorbit plan``.
+            Defaults to an empty catalogue -- harmless, since
+            :class:`~qsorbit.ui.tabs.PlanTab` never reads it unless
+            ``tle_dir`` is also given.
+        catalog_manifest: The catalogue's optional shipped-date
+            manifest, for the picker's staleness line.
+        tle_dir: This station's configured TLE directory
+            (``config.planning.tle_dir``), or ``None`` (the default) if
+            it has not been set -- see :class:`~qsorbit.ui.tabs.PlanTab`.
+            A caller with nothing to say about planning at all can
+            simply omit ``catalog``, ``tle_dir``, ``observer`` and
+            ``horizon`` together and get the Plan tab's placeholder.
+        observer: This station's location, for the picker's pass
+            prediction. Defaults to a harmless placeholder location,
+            unread unless ``tle_dir`` is given -- see ``catalog``.
+        horizon: This station's own horizon mask, for the same.
+            Defaults to :class:`~qsorbit.core.horizon.HorizonMask`'s
+            own no-obstruction default.
         title: Window title.
     """
 
@@ -242,12 +266,30 @@ class ShellWindow(QMainWindow):
         nominal_hz: float | None = None,
         custom_tab: CustomTabConfig | None = None,
         custom_tab_error: str | None = None,
+        catalog: ProfileCatalog | None = None,
+        catalog_manifest: CatalogManifest | None = None,
+        tle_dir: str | None = None,
+        observer: ObserverLocation | None = None,
+        horizon: HorizonMask | None = None,
         title: str = "QSOrbit",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._themes = themes
         self.setWindowTitle(title)
+
+        # Harmless placeholders: PlanTab only reads these when tle_dir
+        # is also given, so a caller with nothing to say about planning
+        # (most of this window's own test suite, say) can leave all
+        # four of catalog/tle_dir/observer/horizon unset and get the
+        # Plan tab's placeholder, exactly as omitting nominal_hz or
+        # custom_tab already does for their own tabs.
+        if catalog is None:
+            catalog = ProfileCatalog([])
+        if observer is None:
+            observer = ObserverLocation(latitude=0.0, longitude=0.0)
+        if horizon is None:
+            horizon = HorizonMask()
 
         rotor = hub.rotor
         central = QWidget(self)
@@ -265,7 +307,17 @@ class ShellWindow(QMainWindow):
         self.tabs = QTabWidget(central)
         self.tabs.addTab(RadioTab(hub, themes=themes, nominal_hz=nominal_hz), TAB_TITLES[0])
         self.tabs.addTab(RotorTab(hub, themes=themes), TAB_TITLES[1])
-        self.tabs.addTab(PlanTab(themes=themes), TAB_TITLES[2])
+        self.tabs.addTab(
+            PlanTab(
+                themes=themes,
+                catalog=catalog,
+                catalog_manifest=catalog_manifest,
+                tle_dir=tle_dir,
+                observer=observer,
+                horizon=horizon,
+            ),
+            TAB_TITLES[2],
+        )
         self.tabs.addTab(DecodeTab(themes=themes), TAB_TITLES[3])
         self.tabs.addTab(
             CustomTab(
