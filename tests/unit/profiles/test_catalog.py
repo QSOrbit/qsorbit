@@ -12,9 +12,12 @@ from datetime import date
 import pytest
 
 from qsorbit.core.profiles.catalog import (
+    CATALOG_MANIFEST_FILENAME,
     DEFAULT_PROFILES_DIR,
+    CatalogManifest,
     ProfileCatalog,
     ProfileError,
+    load_catalog_manifest,
     load_profile_catalog,
 )
 from qsorbit.core.profiles.profile import (
@@ -212,6 +215,58 @@ class TestLoadProfileCatalog:
         for profile in catalog:
             assert profile.norad_id > 0
             assert profile.name
+
+    def test_catalog_manifest_file_is_not_treated_as_a_profile(self, tmp_path):
+        write_profile(tmp_path)
+        (tmp_path / CATALOG_MANIFEST_FILENAME).write_text(
+            "shipped = 2026-08-28\n", encoding="utf-8"
+        )
+
+        catalog = load_profile_catalog(tmp_path)
+
+        assert len(catalog) == 1
+
+
+class TestLoadCatalogManifest:
+    def test_returns_none_when_no_manifest_file(self, tmp_path):
+        assert load_catalog_manifest(tmp_path) is None
+
+    def test_loads_a_valid_manifest(self, tmp_path):
+        (tmp_path / CATALOG_MANIFEST_FILENAME).write_text(
+            "shipped = 2026-08-28\n", encoding="utf-8"
+        )
+
+        manifest = load_catalog_manifest(tmp_path)
+
+        assert manifest == CatalogManifest(shipped=date(2026, 8, 28))
+
+    def test_unknown_key_is_an_error(self, tmp_path):
+        (tmp_path / CATALOG_MANIFEST_FILENAME).write_text(
+            "shipped = 2026-08-28\nversion = 3\n", encoding="utf-8"
+        )
+
+        with pytest.raises(ProfileError, match="version"):
+            load_catalog_manifest(tmp_path)
+
+    def test_missing_shipped_is_an_error(self, tmp_path):
+        (tmp_path / CATALOG_MANIFEST_FILENAME).write_text("", encoding="utf-8")
+
+        with pytest.raises(ProfileError, match="shipped"):
+            load_catalog_manifest(tmp_path)
+
+    def test_non_date_shipped_is_an_error(self, tmp_path):
+        (tmp_path / CATALOG_MANIFEST_FILENAME).write_text(
+            'shipped = "2026-08-28"\n', encoding="utf-8"
+        )
+
+        with pytest.raises(ProfileError, match="shipped"):
+            load_catalog_manifest(tmp_path)
+
+    def test_shipped_starter_set_has_a_valid_manifest(self):
+        manifest = load_catalog_manifest(DEFAULT_PROFILES_DIR)
+
+        assert manifest is not None
+        assert manifest.shipped.year == 2026
 
 
 class TestProfileCatalog:

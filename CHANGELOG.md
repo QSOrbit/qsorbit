@@ -107,6 +107,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A Custom tab: a grid of widgets built from a config file (`custom_tab.toml`) rather than from code -- the same widgets the built-in tabs already show, in whatever combination and repetition you list, each cell getting its own independent feed. With no file present the tab says so and every other tab works exactly as it would otherwise; a bad file costs only this one tab, with the specific problem named right there rather than only on the console.
 
+### Added
+
+- The curated profile catalogue can now carry a catalogue-level manifest (`CATALOG.toml`, optional, beside the profile files) recording when the curated set itself was last revised, distinct from any one satellite's own alive-status date. `qsorbit plan` prints it when present.
+- `qsorbit plan --refresh-catalogue`, for fetching an updated catalogue over the network ahead of planning. No real source is wired up yet -- it fails with a clear, specific error rather than silently using the shipped snapshot -- but the interface any future source will satisfy is in place now, shared with the still-deferred TLE-catalog fetch.
+
 
 <!--
 When adding entries, group them under these headings as needed:

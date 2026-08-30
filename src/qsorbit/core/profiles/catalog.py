@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import tomllib
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,11 @@ from qsorbit.core.profiles.profile import (
 
 #: The curated starter set shipped with QSOrbit.
 DEFAULT_PROFILES_DIR = Path(__file__).parent / "data"
+
+#: A catalogue-level manifest, optional, living beside the profile files
+#: it describes. Reserved -- load_profile_catalog() skips it rather than
+#: trying to parse it as a profile.
+CATALOG_MANIFEST_FILENAME = "CATALOG.toml"
 
 
 class ProfileError(Exception):
@@ -97,8 +103,71 @@ def load_profile_catalog(directory: str | Path = DEFAULT_PROFILES_DIR) -> Profil
     resolved = Path(directory)
     if not resolved.is_dir():
         raise ProfileError(f"Profile directory not found: {resolved}")
-    profiles = [_load_profile_file(path) for path in sorted(resolved.glob("*.toml"))]
+    profiles = [
+        _load_profile_file(path)
+        for path in sorted(resolved.glob("*.toml"))
+        if path.name != CATALOG_MANIFEST_FILENAME
+    ]
     return ProfileCatalog(profiles)
+
+
+@dataclass(frozen=True)
+class CatalogManifest:
+    """Catalogue-level metadata: when this directory's curated profile set was last revised.
+
+    Distinct from any single profile's ``alive.as_of`` -- that is when
+    one satellite's status was last checked; this is when the *set
+    itself* (which satellites are curated, at all) was last revised.
+    Optional: a directory of profiles with no ``CATALOG.toml`` simply
+    has no catalogue-level staleness to report, which is why
+    :func:`load_catalog_manifest` returns ``None`` rather than raising
+    when the file is simply absent -- an older or hand-rolled
+    ``--profiles-dir`` predating this feature is the expected case, not
+    an error.
+
+    Args:
+        shipped: The date this profile set was last revised.
+    """
+
+    shipped: date
+
+
+def load_catalog_manifest(directory: str | Path = DEFAULT_PROFILES_DIR) -> CatalogManifest | None:
+    """Load ``directory``'s catalogue manifest, if it has one.
+
+    Args:
+        directory: Where to look. Defaults to :data:`DEFAULT_PROFILES_DIR`,
+            the curated starter set shipped with QSOrbit.
+
+    Returns:
+        The loaded manifest, or ``None`` if ``directory`` has no
+        :data:`CATALOG_MANIFEST_FILENAME` -- missing is fine, same
+        "no file yet" tolerance as ``custom_tab.toml``'s loader.
+
+    Raises:
+        ProfileError: If the manifest file exists but can't be read,
+            can't be parsed, or fails validation.
+    """
+    path = Path(directory) / CATALOG_MANIFEST_FILENAME
+    if not path.is_file():
+        return None
+
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except tomllib.TOMLDecodeError as exc:
+        raise ProfileError(f"Could not parse {path}: {exc}") from exc
+    except OSError as exc:
+        raise ProfileError(f"Could not read {path}: {exc}") from exc
+
+    _reject_unknown_keys(data, {"shipped"}, section="top level", path=path)
+    shipped = _require(data, "shipped", "top level", path)
+    if not isinstance(shipped, date):
+        raise ProfileError(
+            f"'shipped' in {path} must be a TOML date (e.g. 2026-08-28), got {shipped!r}."
+        )
+
+    return CatalogManifest(shipped=shipped)
 
 
 def _load_profile_file(path: Path) -> SatelliteProfile:

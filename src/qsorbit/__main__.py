@@ -67,7 +67,14 @@ from qsorbit.core.dsp import (
     SpectrumSubscription,
 )
 from qsorbit.core.pointing import AlignmentOffset, TrackingLoop, sky_to_rotor
-from qsorbit.core.profiles import ProfileError, SatelliteProfile, Transmitter, load_profile_catalog
+from qsorbit.core.profiles import (
+    NotConfiguredCatalogSource,
+    ProfileError,
+    SatelliteProfile,
+    Transmitter,
+    load_catalog_manifest,
+    load_profile_catalog,
+)
 from qsorbit.core.receive import (
     DEFAULT_TRACKING_INTERVAL_S,
     LoopRangeRate,
@@ -439,6 +446,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--visual",
         action="store_true",
         help="Also report whether each pass is naked-eye visible (sunlit satellite, dark sky).",
+    )
+    plan.add_argument(
+        "--refresh-catalogue",
+        action="store_true",
+        help=(
+            "Fetch an updated profile catalogue over the network before planning, "
+            "instead of using the shipped snapshot. Not yet wired to a real source "
+            "-- fails with a clear error rather than silently doing nothing."
+        ),
     )
 
     subcommands.add_parser(
@@ -939,10 +955,24 @@ def _command_plan(args: argparse.Namespace, config: StationConfig) -> int:
     whole search -- the catalogue is a curated subset by design (see
     ``core/profiles/``), so an unmatched TLE is the expected case, not
     an error.
+
+    If the catalogue directory carries a manifest (:func:`~qsorbit.core.
+    profiles.load_catalog_manifest`), prints how stale the shipped
+    snapshot is. ``--refresh-catalogue`` asks for a network refresh
+    first -- which currently always fails, loudly and specifically,
+    because no real source is wired up yet (see ``catalog_source.py``).
     """
     catalog = (
         load_profile_catalog(args.profiles_dir) if args.profiles_dir else load_profile_catalog()
     )
+    manifest = (
+        load_catalog_manifest(args.profiles_dir) if args.profiles_dir else load_catalog_manifest()
+    )
+
+    if args.refresh_catalogue:
+        # Always raises for now -- caught by main()'s ProfileError handler,
+        # same path any other catalogue-loading failure takes.
+        NotConfiguredCatalogSource().refresh()
 
     tle_dir = Path(args.tle_dir)
     if not tle_dir.is_dir():
@@ -982,6 +1012,9 @@ def _command_plan(args: argparse.Namespace, config: StationConfig) -> int:
     entries.sort(key=lambda entry: entry[1].aos.time)
 
     print(f"Searched {tle_dir} for the next {args.hours:.1f} hours, from {now.isoformat()}.")
+    if manifest is not None:
+        age_days = (now.date() - manifest.shipped).days
+        print(f"Curated catalogue shipped {manifest.shipped.isoformat()} ({age_days} d ago).")
     print()
 
     if not entries:
