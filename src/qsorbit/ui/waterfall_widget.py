@@ -42,11 +42,51 @@ docstring already argued against paying on every frame — but it is only
 paid when the zoom actually changes, not per frame, so the steady-state
 cost while nothing is being zoomed or panned is exactly what it was
 before this feature existed.
+
+**Making this panel large costs the radio samples, and nobody knows
+why.** Measured on Phil's station across twelve live runs (Session 29),
+with USB loss on the receive path as the number that matters:
+
+===========  ==========  ==========
+panel        rate        USB loss
+===========  ==========  ==========
+hidden       --          0.017%
+396x148      20 Hz       0.037%
+822x308      20 Hz       0.153%
+1162x412     20 Hz       0.610%
+1178x443     20 Hz       0.64%
+1178x443     13 Hz       0.647%
+1178x443     7.7 Hz      0.607%
+===========  ==========  ==========
+
+Read those last three together, because they are the finding. **Panel
+area drives the loss; repaint rate does not.** Cutting the rate from 20
+Hz to 7.7 -- less than half the pixel throughput -- moved the loss from
+0.667% to 0.607%, a difference smaller than the spread between repeats
+of either configuration. That refuted a pixel-throughput budget this
+module briefly shipped, and with it the memory-bandwidth story that
+justified it.
+
+Four explanations have now been measured and refuted: the upscale inside
+``paintEvent`` (worth about a second across a 100-second run), the
+desktop compositor (a maximized window with this panel hidden is clean
+at 0.017%), maximization itself (a large *windowed* panel measures the
+same 0.61%), and pixel throughput (above). Paint CPU rises only 1.5x
+between the small and large cases while loss rises 17x, so **the cost is
+not inside** ``paintEvent`` -- which is why :class:`PaintStats` exists
+and cannot answer this on its own.
+
+The honest operational guidance until someone explains it: run the shell
+windowed during a pass, not maximized. Anyone tempted to add a mitigation
+here should reproduce the table first; three of the four refuted
+hypotheses were plausible enough to write code for.
 """
 
 from __future__ import annotations
 
+import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Final, Protocol
 
 import numpy as np
@@ -106,6 +146,82 @@ _SILENT_RAW_DB: Final = -1e6
 #: conventional "zoom in" direction most spectrum tools and maps use —
 #: narrows the span; scrolling the other way is this value's reciprocal.
 WHEEL_ZOOM_FACTOR_PER_NOTCH: Final = 0.85
+
+
+@dataclass(frozen=True)
+class PaintStats:
+    """How much work this panel's repaints actually cost.
+
+    **The one thing in the whole pipeline nobody was counting.** Every
+    other layer reports its own accounting -- the stream reports dropped
+    blocks, the squelch reports quieting, the Doppler tracker reports
+    staleness -- and this project's habit is that a number nobody prints
+    is a number nobody checks. The display was the exception, and it
+    turned out to matter: opening the shell maximized cost 28x the USB
+    loss of the same shell windowed, and the only thing that changed was
+    how many pixels this widget was asked to draw into.
+
+    **Split into two halves on purpose**, because they have different
+    fixes and the arithmetic could not distinguish them from outside.
+    ``build`` is turning the row deque into a QImage -- three full copies
+    of the history, a cost that does not vary with the widget's size.
+    ``blit`` is ``drawImage`` scaling that image to the widget, which
+    varies with nothing else. Whichever dominates is the one worth
+    changing, and a proxy measurement on another platform is not
+    evidence about this one.
+
+    Args:
+        paints: Repaints completed. A repaint that stopped early on a
+            fault is not counted -- it drew a line of text, not a
+            spectrogram, and averaging it in would flatter the result.
+        build_s: Total seconds spent assembling the image.
+        blit_s: Total seconds spent drawing it to the widget.
+        total_s: Total seconds inside ``paintEvent``, including the
+            axis, the DC marker and everything else. ``total_s`` minus
+            the other two is what the trimmings cost.
+        worst_s: The slowest single repaint.
+        width: The widget's width at the last repaint, in pixels.
+        height: Its height, so a reported cost can be tied to the size
+            that produced it. A paint time with no size beside it cannot
+            be compared against another run, and **size is the variable
+            that turned out to matter** -- see this module's docstring.
+        interval_ms: The repaint interval in force. Reported beside the
+            size rather than multiplied into it: the two look like they
+            should combine into a pixel-throughput figure, and this
+            project spent a session establishing that they do not. State
+            them separately so the next reader has to notice.
+    """
+
+    paints: int
+    build_s: float
+    blit_s: float
+    total_s: float
+    worst_s: float
+    width: int
+    height: int
+    interval_ms: int
+
+    @property
+    def mean_ms(self) -> float:
+        """Mean milliseconds per repaint, or 0.0 if nothing was painted."""
+        return (self.total_s / self.paints * 1000.0) if self.paints else 0.0
+
+    def describe(self) -> str:
+        """One block, in the shape the rest of the run report uses."""
+        if not self.paints:
+            return "waterfall paint: never painted."
+        return (
+            f"waterfall paint: {self.paints:,} repaint(s) at {self.width}x{self.height} px "
+            f"({self.width * self.height / 1e6:.2f} Mpix), "
+            f"{1000.0 / self.interval_ms:.1f} Hz\n"
+            f"  mean {self.mean_ms:.2f} ms, worst {self.worst_s * 1000.0:.2f} ms\n"
+            f"  building the image: {self.build_s * 1000.0 / self.paints:.2f} ms/paint "
+            f"({self.build_s:.2f} s total)\n"
+            f"  drawing it (scales with widget size): "
+            f"{self.blit_s * 1000.0 / self.paints:.2f} ms/paint ({self.blit_s:.2f} s total)\n"
+            f"  everything else (axis, markers): "
+            f"{(self.total_s - self.build_s - self.blit_s) * 1000.0 / self.paints:.2f} ms/paint"
+        )
 
 
 class FrameSource(Protocol):
@@ -197,6 +313,13 @@ class WaterfallWidget(QWidget):
             raise ValueError(f"history_rows must be positive, got {history_rows!r}.")
         if render_width <= 0:
             raise ValueError(f"render_width must be positive, got {render_width!r}.")
+        if poll_interval_ms <= 0:
+            # Checked because PaintStats.describe divides by it, and a
+            # zero here would raise at *shutdown*, in the run report,
+            # after a pass is already over -- the worst moment to lose
+            # output. Qt would also treat 0 as "fire on every event loop
+            # pass", which is not a rate anyone means to ask for.
+            raise ValueError(f"poll_interval_ms must be positive, got {poll_interval_ms!r}.")
 
         self._source = source
         self._scale = scale if scale is not None else WaterfallScale()
@@ -242,6 +365,14 @@ class WaterfallWidget(QWidget):
         self._frames_seen = 0
         self._error: str | None = None
 
+        # Paint accounting. See PaintStats for why this exists and why
+        # it is split in two.
+        self._paints = 0
+        self._paint_build_s = 0.0
+        self._paint_blit_s = 0.0
+        self._paint_total_s = 0.0
+        self._paint_worst_s = 0.0
+
         # The *visible* edges, which move as the zoom changes — distinct
         # from band_start_hz/band_stop_hz above, which are fixed for the
         # source's whole life. Set from the zoom controller's own current
@@ -272,6 +403,20 @@ class WaterfallWidget(QWidget):
         tell a caller nothing.
         """
         return min(self._frames_seen, self._rendered_rows.maxlen or 0)
+
+    @property
+    def paint_stats(self) -> PaintStats:
+        """What this panel's repaints have cost so far. See :class:`PaintStats`."""
+        return PaintStats(
+            paints=self._paints,
+            build_s=self._paint_build_s,
+            blit_s=self._paint_blit_s,
+            total_s=self._paint_total_s,
+            worst_s=self._paint_worst_s,
+            width=self.width(),
+            height=self.height(),
+            interval_ms=self._timer.interval(),
+        )
 
     @property
     def zoom_controller(self) -> ZoomController:
@@ -356,10 +501,20 @@ class WaterfallWidget(QWidget):
         self.update()
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt's spelling
-        """Blit the history, then label the frequency axis beneath it."""
+        """Blit the history, then label the frequency axis beneath it.
+
+        Timed, in two halves. See :class:`PaintStats` -- the clock reads
+        are three ``perf_counter()`` calls on a path that already does
+        several megabytes of copying, so the measurement costs nothing
+        it could distort, and it is the only place the cost of drawing
+        is visible at all.
+        """
+        started = time.perf_counter()
         painter = QPainter(self)
         if self._error is not None:
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._error)
+            # Deliberately not counted: this drew a line of text, not a
+            # spectrogram, and averaging it in would flatter the result.
             return
         full = self.rect()
         image_rect = QRect(full.x(), full.y(), full.width(), max(1, full.height() - AXIS_HEIGHT_PX))
@@ -376,7 +531,9 @@ class WaterfallWidget(QWidget):
             self._render_width * 3,
             QImage.Format.Format_RGB888,
         ).copy()
+        built = time.perf_counter()
         painter.drawImage(image_rect, image)
+        blitted = time.perf_counter()
         if self._frames_seen == 0:
             # The dark field is already correct -- it says "nothing
             # received" -- but on startup that is indistinguishable from
@@ -397,6 +554,13 @@ class WaterfallWidget(QWidget):
             AXIS_HEIGHT_PX,
             self.palette().windowText().color(),
         )
+
+        elapsed = time.perf_counter() - started
+        self._paints += 1
+        self._paint_build_s += built - started
+        self._paint_blit_s += blitted - built
+        self._paint_total_s += elapsed
+        self._paint_worst_s = max(self._paint_worst_s, elapsed)
 
     def _paint_dc_marker(self, painter: QPainter, image_rect: QRect, marker_hz: float) -> None:
         """Mark the tuner's own zero-IF spike, per the "visual marker only"
