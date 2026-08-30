@@ -68,7 +68,9 @@ from qsorbit.core.dsp import (
 )
 from qsorbit.core.pointing import AlignmentOffset, TrackingLoop, sky_to_rotor
 from qsorbit.core.profiles import (
+    CatalogManifest,
     NotConfiguredCatalogSource,
+    ProfileCatalog,
     ProfileError,
     SatelliteProfile,
     Transmitter,
@@ -1630,7 +1632,7 @@ def _command_shell(
                 file=sys.stderr,
             )
             return 1
-        return _run_shell_alone(args)
+        return _run_shell_alone(args, config)
 
     if args.downlink is None:
         if not args.send:
@@ -1748,8 +1750,30 @@ def _exec_shell(window: object, app: object, args: argparse.Namespace) -> None:
         app.exec()
 
 
-def _run_shell_alone(args: argparse.Namespace) -> int:
-    """The shell with no hardware behind it. Every tab in placeholder."""
+def _shell_planning_catalog() -> tuple[ProfileCatalog, CatalogManifest | None]:
+    """Load the curated catalogue and its manifest for the Plan tab.
+
+    Same defaults ``qsorbit plan`` reads with no ``--profiles-dir`` --
+    ``shell`` has no such flag of its own (yet); the shipped starter set
+    is what every entry point without an override reads. Shared by all
+    three shell-launching functions below so the load happens once per
+    call path rather than being copied three times. A load failure
+    propagates as :class:`~qsorbit.core.profiles.ProfileError`, caught
+    by :func:`main`'s own handler exactly as it already is for ``plan``.
+    """
+    return load_profile_catalog(), load_catalog_manifest()
+
+
+def _run_shell_alone(args: argparse.Namespace, config: StationConfig) -> int:
+    """The shell with no hardware behind it.
+
+    Radio and Rotor open in placeholder -- there is no SDR and no rotor
+    connection at all in this mode. Plan does not: the target picker
+    needs a curated catalogue and a TLE directory, neither of which is
+    hardware, so it lights up here exactly as it would with a rotor and
+    a radio attached, using whatever ``config.planning.tle_dir`` this
+    station has set.
+    """
     from PySide6.QtWidgets import QApplication
 
     from qsorbit.ui.feed_hub import FeedHub
@@ -1761,8 +1785,17 @@ def _run_shell_alone(args: argparse.Namespace) -> int:
     print(hub.describe())
     print("Nothing attached. Pass --tle to track, and --downlink to receive.")
     custom_tab, custom_tab_error = _shell_custom_tab(args)
+    catalog, manifest = _shell_planning_catalog()
     window = ShellWindow(
-        hub, themes=themes, custom_tab=custom_tab, custom_tab_error=custom_tab_error
+        hub,
+        themes=themes,
+        custom_tab=custom_tab,
+        custom_tab_error=custom_tab_error,
+        catalog=catalog,
+        catalog_manifest=manifest,
+        tle_dir=config.planning.tle_dir,
+        observer=config.observer,
+        horizon=config.horizon,
     )
     _exec_shell(window, app, args)
     return 0
@@ -1816,11 +1849,17 @@ def _run_shell_tracking_only(
         hub = FeedHub(tracking=loop, tracking_fault=ticker.fault)
         print(hub.describe())
         custom_tab, custom_tab_error = _shell_custom_tab(args)
+        catalog, manifest = _shell_planning_catalog()
         window = ShellWindow(
             hub,
             themes=themes,
             custom_tab=custom_tab,
             custom_tab_error=custom_tab_error,
+            catalog=catalog,
+            catalog_manifest=manifest,
+            tle_dir=config.planning.tle_dir,
+            observer=config.observer,
+            horizon=config.horizon,
             title=f"QSOrbit - tracking {satellite.name}",
         )
         try:
@@ -1908,12 +1947,18 @@ def _run_shell(
     )
 
     custom_tab, custom_tab_error = _shell_custom_tab(args)
+    catalog, manifest = _shell_planning_catalog()
     window = ShellWindow(
         hub,
         themes=themes,
         nominal_hz=args.downlink * 1e6,
         custom_tab=custom_tab,
         custom_tab_error=custom_tab_error,
+        catalog=catalog,
+        catalog_manifest=manifest,
+        tle_dir=config.planning.tle_dir,
+        observer=config.observer,
+        horizon=config.horizon,
         title=f"QSOrbit - receiving {satellite.name}",
     )
     # show(), not showMaximized(), and the difference was measured

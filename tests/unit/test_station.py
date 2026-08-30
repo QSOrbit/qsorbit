@@ -17,6 +17,7 @@ from qsorbit.core.rotor import AzimuthWrap
 from qsorbit.core.station import (
     AlignmentSettings,
     ConfigError,
+    PlanningSettings,
     SdrSettings,
     SerialSettings,
     StationConfig,
@@ -465,6 +466,75 @@ class TestSdrSettings:
 
     def test_accepts_a_realistic_ppm(self):
         assert SdrSettings(ppm=-12).ppm == -12
+
+
+PLANNING_SECTION = """
+    [planning]
+    tle_dir = "C:\\\\Users\\\\phil\\\\dev\\\\qsorbit-fixtures\\\\tle"
+"""
+
+
+class TestPlanningSection:
+    """The [planning] table, optional like [sdr] and for the same reason."""
+
+    def test_absent_section_gives_working_defaults(self, tmp_path):
+        # Every config file written before Chunk D lacks this section,
+        # and pointing an antenna doesn't require knowing where any
+        # TLEs live. The Plan tab reads an unset tle_dir as "not
+        # configured yet", not an error.
+        config = load_station_config(write_config(tmp_path))
+
+        assert config.planning == PlanningSettings()
+        assert config.planning.tle_dir is None
+
+    def test_reads_tle_dir(self, tmp_path):
+        config = load_station_config(write_config(tmp_path, VALID_CONFIG + PLANNING_SECTION))
+
+        assert config.planning.tle_dir == r"C:\Users\phil\dev\qsorbit-fixtures\tle"
+
+    def test_an_empty_section_is_the_same_as_no_section(self, tmp_path):
+        config = load_station_config(write_config(tmp_path, VALID_CONFIG + "\n[planning]\n"))
+
+        assert config.planning == PlanningSettings()
+
+    def test_unknown_key_is_an_error(self, tmp_path):
+        path = write_config(tmp_path, VALID_CONFIG + '\n[planning]\ntle_directory = "x"\n')
+
+        with pytest.raises(ConfigError, match="tle_directory"):
+            load_station_config(path)
+
+    def test_a_section_that_is_not_a_table_is_an_error(self, tmp_path):
+        path = write_config(tmp_path, '\n    planning = "somewhere"' + VALID_CONFIG)
+
+        with pytest.raises(ConfigError, match=r"\[planning\] in .* must be a table"):
+            load_station_config(path)
+
+    def test_an_empty_tle_dir_is_an_error(self, tmp_path):
+        # Distinct from omitting it, same reasoning as [sdr]'s
+        # driver_dir: an empty string looks deliberate and means
+        # nothing.
+        path = write_config(tmp_path, VALID_CONFIG + '\n[planning]\ntle_dir = ""\n')
+
+        with pytest.raises(ConfigError, match="tle_dir"):
+            load_station_config(path)
+
+    def test_the_error_names_the_file(self, tmp_path):
+        path = write_config(tmp_path, VALID_CONFIG + '\n[planning]\ntle_directory = "x"\n')
+
+        with pytest.raises(ConfigError, match=str(path.name)):
+            load_station_config(path)
+
+
+class TestPlanningSettings:
+    def test_defaults(self):
+        assert PlanningSettings().tle_dir is None
+
+    def test_rejects_a_blank_tle_dir(self):
+        with pytest.raises(ValueError, match="tle_dir"):
+            PlanningSettings(tle_dir="   ")
+
+    def test_accepts_a_real_path(self):
+        assert PlanningSettings(tle_dir="/home/phil/tle").tle_dir == "/home/phil/tle"
 
 
 class TestAlignmentSection:

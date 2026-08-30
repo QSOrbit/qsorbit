@@ -73,6 +73,15 @@ def test_a_theme_names_its_own_selected_tab_in_its_accent():
     assert subject.palette.accent in selected
 
 
+def test_a_theme_names_its_own_checked_button_in_its_accent():
+    """Filter chips (Chunk D's picker) are checkable QPushButtons -- this is their "on" state."""
+    subject = theme("deep-space")
+    sheet = build_stylesheet(subject)
+    checked = sheet.split("QPushButton:checked")[1].split("}")[0]
+    assert subject.palette.accent in checked
+    assert subject.palette.bg in checked
+
+
 # ----------------------------------------------------------------------
 # Chrome
 # ----------------------------------------------------------------------

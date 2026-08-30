@@ -285,6 +285,7 @@ QPushButton, QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {{
 }}
 QPushButton:hover, QComboBox:hover {{ border-color: {p.accent}; }}
 QPushButton:pressed {{ background: {p.edge}; }}
+QPushButton:checked {{ background: {p.accent}; color: {p.bg}; border-color: {p.accent}; }}
 QPushButton:disabled, QComboBox:disabled, QLabel:disabled {{ color: {p.dim}; }}
 QComboBox QAbstractItemView {{
     background: {p.panel_alt};

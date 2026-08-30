@@ -112,6 +112,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The curated profile catalogue can now carry a catalogue-level manifest (`CATALOG.toml`, optional, beside the profile files) recording when the curated set itself was last revised, distinct from any one satellite's own alive-status date. `qsorbit plan` prints it when present.
 - `qsorbit plan --refresh-catalogue`, for fetching an updated catalogue over the network ahead of planning. No real source is wired up yet -- it fails with a clear, specific error rather than silently using the shipped snapshot -- but the interface any future source will satisfy is in place now, shared with the still-deferred TLE-catalog fetch.
 
+### Added
+
+- The Plan tab now shows a real target picker: a filterable, refreshable table of curated satellites and their next pass, matched against this station's own TLEs and horizon mask exactly as `qsorbit plan` computes them. Four filter axes -- needs a transmitter, band, modulation, and reliability class -- combine as chips above the table; a fifth, "visible from this latitude," is deliberately not here yet and lands in its own follow-up PR with its own geometry. Recompute is a manual Refresh button rather than a timer, since matching TLEs and predicting passes is real CPU work, not a cheap property read.
+- An optional `[planning]` section in station config, with a `tle_dir` key naming where the Plan tab should look for this station's TLEs. A station that hasn't set one sees a placeholder naming the config key instead of an empty table with no explanation.
+
 
 <!--
 When adding entries, group them under these headings as needed:

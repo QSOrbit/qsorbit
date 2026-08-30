@@ -196,6 +196,36 @@ class AlignmentSettings:
 
 
 @dataclass(frozen=True)
+class PlanningSettings:
+    """Where to find this station's TLEs, for the Plan tab's pass predictions.
+
+    Passes the same config-boundary test every other section here does:
+    a directory of TLEs is a property of the station, not of any one
+    satellite, and it does not change when you point at a different
+    bird -- it's the same directory whichever satellite you're
+    searching for a pass on. Optional, same reasoning as ``[sdr]``:
+    every config file written before Chunk D lacks this section, and
+    "no TLE directory set" is the honest identity state -- the Plan
+    tab shows a placeholder rather than guessing at a path.
+
+    Args:
+        tle_dir: Directory of ``*.tle`` files to search for upcoming
+            passes, same format ``qsorbit plan --tle-dir`` already
+            reads. ``None`` means unset.
+
+    Raises:
+        ValueError: If ``tle_dir`` is an empty string rather than
+            omitted entirely.
+    """
+
+    tle_dir: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.tle_dir is not None and not self.tle_dir.strip():
+            raise ValueError("tle_dir must be a path or omitted entirely, not an empty string.")
+
+
+@dataclass(frozen=True)
 class StationConfig:
     """Everything QSOrbit needs to know about one ground station.
 
@@ -219,6 +249,12 @@ class StationConfig:
             ``[[horizon]]`` entries — every station that predates
             Chunk B — stays valid, and "nobody has measured this yet"
             is the honest identity state rather than an omission.
+        planning: Where this station's TLEs live. Defaults to a plain
+            :class:`PlanningSettings` (``tle_dir=None``), so a config
+            file with no ``[planning]`` section stays valid — every
+            station that predates Chunk D has one, and the Plan tab
+            reads an unset directory as "not configured yet" rather
+            than an error.
         source_path: The file this was loaded from, or ``None`` if it
             was constructed directly. Carried so error messages and
             ``status`` output can say which config is in force — with
@@ -232,6 +268,7 @@ class StationConfig:
     sdr: SdrSettings = field(default_factory=SdrSettings)
     alignment: AlignmentSettings = field(default_factory=AlignmentSettings)
     horizon: HorizonMask = field(default_factory=HorizonMask)
+    planning: PlanningSettings = field(default_factory=PlanningSettings)
     source_path: Path | None = None
 
 
@@ -325,7 +362,10 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
         raise ConfigError(f"Could not read {resolved}: {exc}") from exc
 
     _reject_unknown_keys(
-        data, {"observer", "rotor", "sdr", "horizon"}, section="top level", path=resolved
+        data,
+        {"observer", "rotor", "sdr", "horizon", "planning"},
+        section="top level",
+        path=resolved,
     )
 
     observer_table = _require_table(data, "observer", path=resolved)
@@ -334,6 +374,10 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
     # antenna is a complete station, and every config file written
     # before Phase 2 lacks this section.
     sdr_table = _optional_table(data, "sdr", path=resolved)
+    # Optional, same reasoning as [sdr]: every config file written
+    # before Chunk D lacks this section, and "no TLE directory set" is
+    # this feature's honest identity state.
+    planning_table = _optional_table(data, "planning", path=resolved)
     capabilities_table = _require_table(rotor_table, "capabilities", path=resolved, parent="rotor")
     # Optional, same reasoning as [sdr]: every config file written
     # before Chunk I lacks this section, and "no offset recorded" is
@@ -377,6 +421,12 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
         sdr_table,
         {"driver_dir", "device_index", "ppm"},
         section="sdr",
+        path=resolved,
+    )
+    _reject_unknown_keys(
+        planning_table,
+        {"tle_dir"},
+        section="planning",
         path=resolved,
     )
     horizon_points = _require_horizon_points(data, resolved)
@@ -433,6 +483,9 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
                 alignment_table, "elevation_deg", "rotor.alignment", resolved, 0.0
             ),
         )
+        planning_settings = PlanningSettings(
+            tle_dir=_optional_str(planning_table, "tle_dir", "planning", resolved, None),
+        )
         horizon = HorizonMask(points=horizon_points)
     except ValueError as exc:
         # The value objects do the real range checking; re-raised as a
@@ -446,6 +499,7 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
         sdr=sdr_settings,
         alignment=alignment_settings,
         horizon=horizon,
+        planning=planning_settings,
         source_path=resolved,
     )
 
