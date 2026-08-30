@@ -162,6 +162,24 @@ def test_the_radio_tab_shows_every_value_in_full(themes):
     assert clipped_labels(tab) == []
 
 
+def test_the_custom_tab_shows_every_value_in_full(themes, ticked_loop):
+    """The same defect class, one PR later, in cells nobody sized by hand.
+
+    Custom-tab cells are Cards built at whatever width the grid gives
+    them -- nobody picked a column width for these, unlike the two
+    fixed-turned-minimum columns the rest of this file exists for. If a
+    real rotor's or receiver's strings can clip anywhere, it is here.
+    """
+    from qsorbit.ui.custom_tab import CustomTabConfig
+    from qsorbit.ui.tabs import CustomTab
+
+    hub = FeedHub(tracking=ticked_loop, radio=FakeRadio())
+    config = CustomTabConfig(columns=2, widgets=("rotor_readout", "frequency", "quieting"))
+    tab = CustomTab(hub, themes=themes, config=config)
+    realise(tab)
+    assert clipped_labels(tab) == []
+
+
 def test_a_tab_stays_readable_when_its_window_is_wide(themes, ticked_loop):
     """Growing the window must not be what makes text fit.
 

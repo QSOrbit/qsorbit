@@ -1,0 +1,42 @@
+# QSOrbit Custom tab — example
+#
+# Copy this file to your per-user config directory, beside config.toml
+# and the themes/ directory it also lives in:
+#
+#   Windows  %APPDATA%\qsorbit\custom_tab.toml
+#   macOS    ~/Library/Application Support/qsorbit/custom_tab.toml
+#   Linux    ~/.config/qsorbit/custom_tab.toml
+#
+# Unlike config.toml, this file is entirely optional. With no file
+# here, the Custom tab just says so and every other tab works exactly
+# as it would otherwise. And unlike config.toml, a mistake in this file
+# costs you only the Custom tab -- the shell still opens, and the error
+# is shown right there in the tab rather than only on the console.
+#
+# There is no in-app layout editing in v1: this file *is* the layout,
+# and it is read once when the shell opens.
+
+# The only layout this build knows how to draw. Reserved as its own
+# key rather than assumed, so a future "rows" or free-form layout has
+# somewhere to be named without breaking this one.
+layout = "grid"
+
+# How many widgets wide the grid is. Widgets below fill left to right,
+# top to bottom.
+columns = 2
+
+# One entry per cell, in fill order. Repeats are fine and are exactly
+# the point of a Custom tab -- a second "waterfall" here gets its own
+# independent feed and its own zoom, tuned or scrolled separately from
+# any other instance elsewhere in the shell.
+#
+# Known widgets, v1:
+#   waterfall       -- the scrolling spectrum display
+#   spectrum_line   -- the single-frame spectrum trace
+#   quieting        -- the squelch's live measurement and gate
+#   frequency       -- the tracked downlink, with the Doppler line
+#   rotor_readout   -- sky target vs. actual antenna position
+#
+# A name outside that list is a startup error for this file, naming
+# the bad entry -- not a cell that quietly goes missing.
+widgets = ["waterfall", "rotor_readout", "quieting", "frequency"]

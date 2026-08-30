@@ -45,8 +45,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from qsorbit.ui.custom_tab import CustomTabConfig
 from qsorbit.ui.feed_hub import FeedHub
-from qsorbit.ui.tabs import DecodeTab, PlanTab, RadioTab, RotorTab
+from qsorbit.ui.tabs import CustomTab, DecodeTab, PlanTab, RadioTab, RotorTab
 from qsorbit.ui.theme import Theme
 from qsorbit.ui.theme_manager import ThemeManager, glow_color, scanline_color
 from qsorbit.ui.theme_qss import chrome_structure
@@ -212,7 +213,7 @@ class TopBar(QWidget):
 
 
 class ShellWindow(QMainWindow):
-    """The tabbed shell. Radio, Rotor, Plan, Decode -- and Custom in PR3.
+    """The tabbed shell: Radio, Rotor, Plan, Decode, Custom.
 
     Args:
         hub: Where every tab's feeds come from.
@@ -222,6 +223,14 @@ class ShellWindow(QMainWindow):
             default grey chrome on a slow start.
         nominal_hz: The tracked transmitter's rest frequency, for the
             Radio tab's Doppler line.
+        custom_tab: The validated Custom-tab config, or ``None`` if
+            :func:`~qsorbit.ui.custom_tab.custom_tab_config_path` has
+            no file or it failed to load -- see ``custom_tab_error``.
+        custom_tab_error: Why ``custom_tab`` is ``None``, in words, or
+            ``None`` if there simply is no config file yet. Shown
+            verbatim in the Custom tab rather than only on the console,
+            since a typo in the file should not cost more than that one
+            tab.
         title: Window title.
     """
 
@@ -231,6 +240,8 @@ class ShellWindow(QMainWindow):
         *,
         themes: ThemeManager,
         nominal_hz: float | None = None,
+        custom_tab: CustomTabConfig | None = None,
+        custom_tab_error: str | None = None,
         title: str = "QSOrbit",
         parent: QWidget | None = None,
     ) -> None:
@@ -256,6 +267,16 @@ class ShellWindow(QMainWindow):
         self.tabs.addTab(RotorTab(hub, themes=themes), TAB_TITLES[1])
         self.tabs.addTab(PlanTab(themes=themes), TAB_TITLES[2])
         self.tabs.addTab(DecodeTab(themes=themes), TAB_TITLES[3])
+        self.tabs.addTab(
+            CustomTab(
+                hub,
+                themes=themes,
+                config=custom_tab,
+                error=custom_tab_error,
+                nominal_hz=nominal_hz,
+            ),
+            TAB_TITLES[4],
+        )
         layout.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
 
