@@ -1532,6 +1532,34 @@ def _show_instruments(
     with _quit_on_sigint(app):
         app.exec()
 
+    # After the loop, so the window still exists to be walked. The
+    # control run reports this as well: a number from the shell with
+    # nothing to compare it against would be half a measurement.
+    _print_paint_stats(window)
+
+
+def _print_paint_stats(window: object) -> None:
+    """Report what every waterfall in ``window`` spent repainting.
+
+    Walks the widget tree rather than being handed the panels, the same
+    way the shell's own shutdown does, so a window with two waterfalls
+    in it -- a Custom tab duplicating the Radio tab's, once PR3 lands --
+    reports both without this function being told they exist.
+
+    Printed beside the receive statistics because that is the only place
+    the two can be compared. A paint cost with no USB-loss figure next
+    to it, or the reverse, is what left a 28x regression invisible until
+    somebody happened to maximize the window.
+    """
+    from qsorbit.ui.waterfall_widget import WaterfallWidget
+
+    panels = window.findChildren(WaterfallWidget)
+    for panel in panels:
+        stats = panel.paint_stats
+        if stats.paints:
+            print()
+            print(stats.describe())
+
 
 def _command_shell(
     args: argparse.Namespace,
@@ -1839,6 +1867,7 @@ def _run_shell(
     print()
     print(stats.describe())
     print(f"feeds: {', '.join(hub.claimed) or 'none claimed'}")
+    _print_paint_stats(window)
     return 0
 
 

@@ -67,6 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Panels no longer subscribe to anything themselves. A feed hub owns the radio, the rotor and the spectrum, and hands each panel its own independent view - so two waterfalls can watch the same radio without taking frames from each other, which is what will make a custom tab possible.
 - A live frequency readout showing where the tracked downlink actually sits, with the Doppler shift under it. The megahertz are shown large and the hertz small, because during a pass the last three digits move continuously and the first six barely at all.
 - A tab whose hardware is absent says so in words rather than showing an empty instrument. A panel drawing nothing and a panel whose radio died look identical, and only one of them is a fault.
+- A run now reports what the waterfall spent repainting - how many repaints, at what size and rate, and how much of each went into assembling the image versus drawing it to the window - printed beside the receive statistics so the two can be compared. Every other layer already reported its own accounting; the display was the one that did not, and it turned out to matter. **A large waterfall panel costs the receive path samples**: on the bench, a maximized shell lost 0.6% of its USB samples against 0.02% for the same shell windowed. Panel area is what drives it - repainting less often was measured and does not help - so until the mechanism is understood, run the shell windowed during a pass.
 
 ### Fixed
 

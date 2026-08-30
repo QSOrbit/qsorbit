@@ -214,3 +214,139 @@ def test_a_waterfall_needs_a_theme_to_exist(manager, config):
     inside a widget -- the one thing the standing rule forbids."""
     with pytest.raises(TypeError):
         WaterfallWidget(FakeSource(config))  # type: ignore[call-arg]
+
+
+# ----------------------------------------------------------------------
+# Paint accounting
+# ----------------------------------------------------------------------
+
+
+def test_a_panel_that_has_never_painted_says_so(manager, config):
+    """Zero is a state, not a measurement.
+
+    "never painted" and "painted, cost nothing" are different facts, and
+    this project's rule is that off and broken must not look the same.
+    """
+    widget = WaterfallWidget(FakeSource(config), themes=manager)
+    stats = widget.paint_stats
+    assert stats.paints == 0
+    assert stats.mean_ms == 0.0
+    assert "never painted" in stats.describe()
+    widget.stop()
+
+
+def test_painting_accumulates_both_halves_separately(manager, config):
+    """The split is the whole point of the measurement.
+
+    Building the image and drawing it have different fixes and could not
+    be told apart from outside the widget -- the 28x maximize regression
+    was attributed to one of them by inference, which is exactly what
+    this exists to replace with a number.
+    """
+    widget = WaterfallWidget(FakeSource(config), themes=manager)
+    widget.resize(640, 400)
+    widget.show()
+    for _ in range(5):
+        widget.grab()
+
+    stats = widget.paint_stats
+    assert stats.paints == 5
+    assert stats.build_s > 0.0
+    assert stats.blit_s > 0.0
+    # The two halves plus the trimmings are the whole, never more.
+    assert stats.build_s + stats.blit_s <= stats.total_s
+    assert stats.worst_s > 0.0
+    assert stats.mean_ms > 0.0
+    widget.stop()
+
+
+def test_the_reported_size_is_the_size_that_produced_the_cost(manager, config):
+    """A paint time with no size beside it cannot be compared to another run."""
+    widget = WaterfallWidget(FakeSource(config), themes=manager)
+    widget.resize(800, 500)
+    widget.show()
+    widget.grab()
+
+    stats = widget.paint_stats
+    assert (stats.width, stats.height) == (800, 500)
+    assert "800x500" in stats.describe()
+    widget.stop()
+
+
+def test_a_faulted_panel_does_not_count_its_error_message_as_a_repaint(manager, config):
+    """It drew a line of text, not a spectrogram.
+
+    Averaging those in would make a dead panel look cheap, which is the
+    direction that hides a problem rather than revealing one.
+    """
+    widget = WaterfallWidget(FakeSource(config), themes=manager)
+    widget.resize(640, 400)
+    widget.show()
+    widget._error = "stopped: the stream went away"
+    for _ in range(3):
+        widget.grab()
+
+    assert widget.paint_stats.paints == 0
+    widget.stop()
+
+
+def test_the_panel_repaints_at_the_rate_it_was_asked_for_whatever_its_size(manager, config):
+    """A gravestone, and it is worth reading before writing a new one.
+
+    This panel briefly throttled its own repaint rate by area, under a
+    constant called ``PIXEL_BUDGET_PER_SECOND``, on the theory that
+    pixel throughput was what cost the receive path its samples. Six
+    tests pinned that arithmetic down and every one of them passed. The
+    theory was still wrong: on hardware, cutting the throughput of a
+    1178x443 panel from 10.4 to 4.0 Mpix/s moved USB loss from 0.667% to
+    0.607%, against a within-configuration spread of 0.07 -- no effect,
+    measured three times.
+
+    So the rate is the caller's, at every size, and this asserts it at
+    the two extremes rather than trusting that nobody re-adds a budget
+    on the same reasoning. **A test suite that only records what a
+    module does cannot warn the next person off what it already tried.**
+    """
+    widget = WaterfallWidget(FakeSource(config), themes=manager, poll_interval_ms=50)
+    widget.resize(396, 148)
+    assert widget._timer.interval() == 50
+    widget.resize(3000, 1600)
+    assert widget._timer.interval() == 50
+    widget.stop()
+
+
+def test_a_zero_poll_interval_is_refused_at_construction(manager, config):
+    """Because ``describe`` divides by it, and would raise at shutdown.
+
+    A crash in the run report fires *after* a pass is over, when the
+    numbers it was going to print are the only record of what happened
+    -- so this is caught where the bad value enters rather than where it
+    is finally used. The sibling checks on ``history_rows`` and
+    ``render_width`` were already here; this one was missing, and became
+    load-bearing the moment the interval became a denominator.
+
+    Not hypothetical: PR3's Custom tab builds panels from a config file,
+    which is exactly where a hand-typed zero arrives.
+    """
+    with pytest.raises(ValueError, match="poll_interval_ms"):
+        WaterfallWidget(FakeSource(config), themes=manager, poll_interval_ms=0)
+
+
+def test_the_rate_and_the_size_are_reported_separately(manager, config):
+    """Not multiplied into a throughput figure, which is the refuted axis.
+
+    ``describe`` used to print "N Hz budgeted (M Mpix/s)". The Mpix/s
+    was the number that turned out not to predict anything, and printing
+    it as the headline invited the next reader to reach the same wrong
+    conclusion from the same run report.
+    """
+    widget = WaterfallWidget(FakeSource(config), themes=manager, poll_interval_ms=50)
+    widget.resize(1162, 412)
+    widget.show()
+    widget.grab()
+
+    described = widget.paint_stats.describe()
+    assert "1162x412" in described
+    assert "Mpix/s" not in described
+    assert widget.paint_stats.interval_ms == widget._timer.interval() == 50
+    widget.stop()
