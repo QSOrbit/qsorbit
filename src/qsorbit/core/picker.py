@@ -7,12 +7,15 @@ its tier-1 alive status. No Qt here, same reasoning
 the filtering logic is worth testing without a display, and this
 module is what makes that possible.
 
-**One filter axis is deliberately absent.** The roadmap's fifth filter,
-"ever-visible-from-this-latitude", needs new orbital geometry (station
-latitude against a satellite's inclination and footprint radius) that
-this PR intentionally does not include -- see the Chunk D PR2/PR2b
-split in ``project-notes.md``. :class:`PickerFilters` has four axes,
-not five; the fifth lands in its own PR with its own tests.
+**The fifth filter axis lives on the entry, not the profile.**
+"Ever-visible-from-this-latitude" (Chunk D PR2b) is a fact about an
+orbit and this station's latitude -- see
+:mod:`qsorbit.core.orbit_geometry` -- not about a
+:class:`~qsorbit.core.profiles.profile.SatelliteProfile` itself, so it
+does not fit :func:`passes_filters`'s ``profile``-only signature.
+:func:`entry_passes_filters` wraps it around the untouched
+:func:`passes_filters` instead of reworking that already-shipped
+function.
 
 **Filtering reads permissively, display reads canonically.** A profile
 can carry more than one transmitter (RS-44's CW beacon and SSB
@@ -37,6 +40,7 @@ from enum import Enum
 from pathlib import Path
 
 from qsorbit.core.horizon import HorizonMask
+from qsorbit.core.orbit_geometry import is_ever_visible_from_latitude
 from qsorbit.core.profiles import (
     Mode,
     ProfileCatalog,
@@ -143,12 +147,12 @@ def primary_transmitter(profile: SatelliteProfile) -> Transmitter | None:
 
 @dataclass(frozen=True)
 class PickerFilters:
-    """The picker's active filter state -- four axes, all "no restriction" by default.
+    """The picker's active filter state -- five axes, all "no restriction" by default.
 
-    Every set field means "if non-empty, keep only entries matching one
-    of these; if empty, this axis restricts nothing" -- so the default,
-    all-empty ``PickerFilters()`` passes everything, and the UI layer
-    decides its own default chip states rather than this type
+    Every set (or bool) field means "if active, keep only entries
+    matching it; if not, this axis restricts nothing" -- so the
+    default, all-empty ``PickerFilters()`` passes everything, and the
+    UI layer decides its own default chip states rather than this type
     prescribing them.
 
     Args:
@@ -167,12 +171,20 @@ class PickerFilters:
             all (``best_reliability() is None``) never matches a
             non-empty set here -- pair with ``needs_transmitter=True``
             deliberately if that's not wanted.
+        require_visible_from_latitude: If ``True``, exclude entries
+            whose :attr:`PickerEntry.visible_from_latitude` is
+            ``False`` -- an orbit that geometrically never rises from
+            this station's latitude, per :mod:`qsorbit.core.
+            orbit_geometry`. Checked by :func:`entry_passes_filters`,
+            not :func:`passes_filters` -- it needs the entry, not just
+            the profile.
     """
 
     needs_transmitter: bool = False
     bands: frozenset[Band] = frozenset()
     mode_groups: frozenset[ModeGroup] = frozenset()
     reliability_classes: frozenset[ReliabilityClass] = frozenset()
+    require_visible_from_latitude: bool = False
 
 
 def passes_filters(profile: SatelliteProfile, filters: PickerFilters) -> bool:
@@ -194,6 +206,20 @@ def passes_filters(profile: SatelliteProfile, filters: PickerFilters) -> bool:
     return True
 
 
+def entry_passes_filters(entry: PickerEntry, filters: PickerFilters) -> bool:
+    """Whether ``entry`` survives every active axis of ``filters``, including the latitude axis.
+
+    Combines :func:`passes_filters` on ``entry.profile`` with the one
+    filter axis :func:`passes_filters` cannot check itself --
+    ``require_visible_from_latitude`` needs ``entry.
+    visible_from_latitude``, a fact about the matched satellite's
+    orbit and this station, not about the profile alone.
+    """
+    if filters.require_visible_from_latitude and not entry.visible_from_latitude:
+        return False
+    return passes_filters(entry.profile, filters)
+
+
 @dataclass(frozen=True)
 class PickerEntry:
     """One picker row's worth of data: a curated profile and its next pass.
@@ -208,10 +234,18 @@ class PickerEntry:
             ``None`` if this satellite has none in that window -- still
             a real entry (it has a curated profile and a matching TLE),
             just with nothing to show in the time columns.
+        visible_from_latitude: Whether this satellite's orbit can ever
+            put it above this station's flat horizon at all, per
+            :func:`~qsorbit.core.orbit_geometry.is_ever_visible_from_latitude`
+            -- a permanent fact about the orbit and this station's
+            latitude, not about the current search window. ``False``
+            means ``next_pass`` will stay ``None`` forever from here,
+            not just today.
     """
 
     profile: SatelliteProfile
     next_pass: Pass | None
+    visible_from_latitude: bool
 
 
 def build_picker_entries(
@@ -261,7 +295,16 @@ def build_picker_entries(
 
         passes = predict_passes(satellite, observer, now, end, horizon_mask=horizon)
         next_pass = min(passes, key=lambda one_pass: one_pass.aos.time) if passes else None
-        entries.append(PickerEntry(profile=profile, next_pass=next_pass))
+        visible_from_latitude = is_ever_visible_from_latitude(
+            satellite.inclination_deg, satellite.mean_altitude_km, observer.latitude
+        )
+        entries.append(
+            PickerEntry(
+                profile=profile,
+                next_pass=next_pass,
+                visible_from_latitude=visible_from_latitude,
+            )
+        )
 
     entries.sort(key=_sort_key)
     return tuple(entries)

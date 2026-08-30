@@ -111,6 +111,7 @@ class TestPickerRowText:
         entry = PickerEntry(
             profile=_profile(transmitters=(_transmitter(),)),
             next_pass=_pass(),
+            visible_from_latitude=True,
         )
 
         text = picker_row_text(entry, local_zone=_EASTERN)
@@ -126,7 +127,11 @@ class TestPickerRowText:
         )
 
     def test_no_pass_in_the_window_shows_the_placeholder(self):
-        entry = PickerEntry(profile=_profile(transmitters=(_transmitter(),)), next_pass=None)
+        entry = PickerEntry(
+            profile=_profile(transmitters=(_transmitter(),)),
+            next_pass=None,
+            visible_from_latitude=True,
+        )
 
         text = picker_row_text(entry, local_zone=_EASTERN)
 
@@ -138,7 +143,9 @@ class TestPickerRowText:
 
         See ``profile.py``'s own module docstring.
         """
-        entry = PickerEntry(profile=_profile(transmitters=()), next_pass=None)
+        entry = PickerEntry(
+            profile=_profile(transmitters=()), next_pass=None, visible_from_latitude=True
+        )
 
         text = picker_row_text(entry, local_zone=_EASTERN)
 
@@ -154,6 +161,7 @@ class TestPickerRowText:
                 alive=_alive(status=AliveStatus.INACTIVE, as_of=date(2025, 6, 12)),
             ),
             next_pass=None,
+            visible_from_latitude=True,
         )
 
         text = picker_row_text(entry, local_zone=_EASTERN)
@@ -168,6 +176,7 @@ class TestPickerRowText:
                 alive=_alive(status=AliveStatus.UNKNOWN),
             ),
             next_pass=None,
+            visible_from_latitude=True,
         )
 
         text = picker_row_text(entry, local_zone=_EASTERN)
@@ -187,6 +196,7 @@ class TestPickerRowText:
                 )
             ),
             next_pass=None,
+            visible_from_latitude=True,
         )
 
         text = picker_row_text(entry, local_zone=_EASTERN)
