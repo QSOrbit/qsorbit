@@ -1649,6 +1649,40 @@ def _shell_theme(args: argparse.Namespace) -> object:
     return themes
 
 
+def _shell_custom_tab(args: argparse.Namespace) -> tuple[object | None, str | None]:
+    """Load ``custom_tab.toml`` if present, and say what a bad one broke.
+
+    Mirrors :func:`_shell_theme`'s shape but not its severity. A bad
+    ``--theme`` still opens the shell with a sane fallback; a bad
+    Custom tab config still has to leave every *other* tab alone, so
+    the failure is not raised here at all -- it is turned into the pair
+    this returns and the caller hands straight to
+    :class:`~qsorbit.ui.shell_window.ShellWindow`, which shows it only
+    in the Custom tab. "Off" (no file yet) and "broken" (a file that
+    failed to load) are kept distinguishable the whole way down, per
+    this project's standing rule.
+
+    Returns:
+        ``(config, None)`` if a valid file was found, ``(None, None)``
+        if there is no file at :func:`~qsorbit.ui.custom_tab.custom_tab_config_path`,
+        or ``(None, message)`` if a file was found but failed to load.
+    """
+    from qsorbit.ui.custom_tab import (
+        CustomTabConfigError,
+        custom_tab_config_path,
+        load_custom_tab_config,
+    )
+
+    path = custom_tab_config_path()
+    if not path.is_file():
+        return None, None
+    try:
+        return load_custom_tab_config(path), None
+    except CustomTabConfigError as exc:
+        print(f"shell: {exc}", file=sys.stderr)
+        return None, str(exc)
+
+
 def _exec_shell(window: object, app: object, args: argparse.Namespace) -> None:
     """Show the window, honour ``--seconds``, and run Qt's loop.
 
@@ -1693,7 +1727,10 @@ def _run_shell_alone(args: argparse.Namespace) -> int:
     hub = FeedHub()
     print(hub.describe())
     print("Nothing attached. Pass --tle to track, and --downlink to receive.")
-    window = ShellWindow(hub, themes=themes)
+    custom_tab, custom_tab_error = _shell_custom_tab(args)
+    window = ShellWindow(
+        hub, themes=themes, custom_tab=custom_tab, custom_tab_error=custom_tab_error
+    )
     _exec_shell(window, app, args)
     return 0
 
@@ -1745,7 +1782,14 @@ def _run_shell_tracking_only(
         ticker = _GuiThreadTicker(loop, interval_s=args.interval)
         hub = FeedHub(tracking=loop, tracking_fault=ticker.fault)
         print(hub.describe())
-        window = ShellWindow(hub, themes=themes, title=f"QSOrbit - tracking {satellite.name}")
+        custom_tab, custom_tab_error = _shell_custom_tab(args)
+        window = ShellWindow(
+            hub,
+            themes=themes,
+            custom_tab=custom_tab,
+            custom_tab_error=custom_tab_error,
+            title=f"QSOrbit - tracking {satellite.name}",
+        )
         try:
             _exec_shell(window, app, args)
         finally:
@@ -1830,10 +1874,13 @@ def _run_shell(
         else f"Receiving for {args.seconds:.0f}s."
     )
 
+    custom_tab, custom_tab_error = _shell_custom_tab(args)
     window = ShellWindow(
         hub,
         themes=themes,
         nominal_hz=args.downlink * 1e6,
+        custom_tab=custom_tab,
+        custom_tab_error=custom_tab_error,
         title=f"QSOrbit - receiving {satellite.name}",
     )
     # show(), not showMaximized(), and the difference was measured

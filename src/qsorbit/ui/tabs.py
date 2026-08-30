@@ -33,10 +33,15 @@ from __future__ import annotations
 
 from typing import Final
 
-from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QGridLayout, QHBoxLayout, QVBoxLayout, QWidget
 
 from qsorbit.core.dsp.spectrum import frequency_axis_hz
 from qsorbit.ui.cards import Card, Placeholder
+from qsorbit.ui.custom_tab import (
+    KNOWN_WIDGETS,
+    CustomTabConfig,
+    custom_tab_config_path,
+)
 from qsorbit.ui.feed_hub import FeedHub
 from qsorbit.ui.frequency_widget import FrequencyWidget
 from qsorbit.ui.quieting_widget import QuietingWidget
@@ -333,3 +338,186 @@ class DecodeTab(QWidget):
             ),
             1,
         )
+
+
+class CustomTab(QWidget):
+    """A grid of widgets named by a config file, not by code.
+
+    Built the same way every other tab in this module is built --
+    feeds are claimed here, one call per cell, so a config asking for
+    ``"waterfall"`` twice gets two independent instances through
+    :meth:`~qsorbit.ui.feed_hub.FeedHub.spectrum`'s own ``-2``, ``-3``
+    suffixing. Nothing about *how* a cell is built differs from
+    :class:`RadioTab` or :class:`RotorTab`; what differs is that the
+    list of cells comes from a file instead of from this module's own
+    code -- this class is the thing every other tab's docstring has
+    been promising exists.
+
+    **Every cell is independent**, deliberately unlike the Radio tab's
+    waterfall and spectrum line, which share one
+    :class:`~qsorbit.ui.zoom_controller.ZoomController` so a gesture on
+    one moves the other. A config-driven grid has no guarantee two
+    spectrum cells are even related to each other -- a user might ask
+    for two waterfalls, or a waterfall with no spectrum line anywhere
+    in the tab -- so nothing here invents a pairing nobody asked for.
+    Each spectrum cell gets its own controller and its own zoom
+    controls beneath it, same as a lone waterfall on the Radio tab
+    would if the Radio tab ever built one alone.
+
+    **A missing config and a broken one read differently.**
+    ``config=None`` with ``error=None`` means nobody has written a
+    :func:`~qsorbit.ui.custom_tab.custom_tab_config_path` file yet --
+    the normal state for a fresh install. ``config=None`` with
+    ``error`` set means one exists and failed to load, and ``error``
+    is shown verbatim: the caller already ran it through
+    :func:`~qsorbit.ui.custom_tab.load_custom_tab_config` and caught
+    :class:`~qsorbit.ui.custom_tab.CustomTabConfigError`. "Off" and
+    "broken" must still read differently even for a tab that is
+    entirely optional.
+
+    Args:
+        hub: Where every cell's feed comes from.
+        themes: Passed to every widget that draws its own pixels.
+        config: The validated config, or ``None`` if it is missing or
+            broken.
+        error: Why ``config`` is ``None``, in words. ``None`` means
+            there simply is no file yet, rather than a load failure.
+        nominal_hz: Threaded through to any ``frequency`` cell, same
+            meaning as :class:`RadioTab`'s own parameter.
+    """
+
+    def __init__(
+        self,
+        hub: FeedHub,
+        *,
+        themes: ThemeManager,
+        config: CustomTabConfig | None,
+        error: str | None = None,
+        nominal_hz: float | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        if config is None:
+            if error is not None:
+                message = error
+            else:
+                path = custom_tab_config_path()
+                message = (
+                    f"No {path.name} found at {path}. Create one to build a "
+                    "grid from named widgets: "
+                    f"{', '.join(sorted(KNOWN_WIDGETS))}. See "
+                    "custom_tab.example.toml in the repo for the format."
+                )
+            layout.addWidget(
+                Card("Custom", Placeholder(message), themes=themes, index=0, stretch=True), 1
+            )
+            return
+
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        for cell_index, name in enumerate(config.widgets):
+            row, column = divmod(cell_index, config.columns)
+            grid.addWidget(
+                self._build_cell(name, cell_index, hub=hub, themes=themes, nominal_hz=nominal_hz),
+                row,
+                column,
+            )
+        grid_host = QWidget(self)
+        grid_host.setLayout(grid)
+        layout.addWidget(grid_host)
+        layout.addStretch(1)
+
+    def _build_cell(
+        self,
+        name: str,
+        index: int,
+        *,
+        hub: FeedHub,
+        themes: ThemeManager,
+        nominal_hz: float | None,
+    ) -> Card:
+        """One grid cell: a card wrapping one named widget.
+
+        Mirrors the per-widget placeholder logic :class:`RadioTab` and
+        :class:`RotorTab` already use for a missing feed -- an empty
+        cell and a cell whose hardware died must not look the same, so
+        an absent feed is always a placeholder naming what is missing
+        rather than a blank space in the grid.
+
+        ``name`` is guaranteed to be a member of
+        :data:`~qsorbit.ui.custom_tab.KNOWN_WIDGETS` --
+        :func:`~qsorbit.ui.custom_tab.load_custom_tab_config` already
+        rejected anything outside that set, so the fall-through branch
+        below is only ever reached for ``"rotor_readout"``.
+        """
+        title = name.replace("_", " ").title()
+
+        if name in ("waterfall", "spectrum_line"):
+            if not hub.has_spectrum:
+                return Card(
+                    title,
+                    Placeholder("No SDR attached, so there is no spectrum to draw.", compact=True),
+                    themes=themes,
+                    index=index,
+                )
+            feed_name = WATERFALL_FEED if name == "waterfall" else SPECTRUM_LINE_FEED
+            feed = hub.spectrum(feed_name)
+            axis = frequency_axis_hz(feed.config)
+            zoom = ZoomController(
+                float(axis[0]),
+                float(axis[-1]),
+                tracked_frequency_source=hub.tracked_frequency,
+                parent=self,
+            )
+            scale = WaterfallScale()
+            body, body_layout = _column(spacing=8)
+            if name == "waterfall":
+                body_layout.addWidget(
+                    WaterfallWidget(feed, themes=themes, zoom=zoom, scale=scale), 1
+                )
+            else:
+                body_layout.addWidget(
+                    SpectrumLineWidget(feed, themes=themes, zoom=zoom, scale=scale)
+                )
+            body_layout.addWidget(ZoomControlsWidget(zoom))
+            return Card(title, body, themes=themes, index=index, stretch=(name == "waterfall"))
+
+        if name == "quieting":
+            quieting = hub.quieting
+            if quieting is None:
+                return Card(
+                    title,
+                    Placeholder("Nothing is being received.", compact=True),
+                    themes=themes,
+                    index=index,
+                )
+            return Card(title, QuietingWidget(quieting), themes=themes, index=index)
+
+        if name == "frequency":
+            tracked = hub.tracked_frequency
+            if tracked is None:
+                return Card(
+                    title,
+                    Placeholder("Nothing is being received.", compact=True),
+                    themes=themes,
+                    index=index,
+                )
+            return Card(
+                title,
+                FrequencyWidget(tracked, nominal_hz=nominal_hz),
+                themes=themes,
+                index=index,
+            )
+
+        rotor = hub.rotor
+        if rotor is None:
+            return Card(
+                title,
+                Placeholder("No rotor connected.", compact=True),
+                themes=themes,
+                index=index,
+            )
+        return Card(title, ReadoutWidget(rotor.loop, fault=rotor.fault), themes=themes, index=index)

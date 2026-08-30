@@ -103,6 +103,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A reply that arrives incomplete is now treated as a timeout instead of being parsed. A truncated "EL 3." reads as a perfectly plausible 3.0 degrees rather than as the 3.8 it was going to say, and nothing downstream could have noticed.
 - A single corrupted reply from the rotor no longer ends a pass. One bad reading used to abort the track, and passes are ten-minute appointments that do not come back. The position is now read a second time, and the track stops only if the second reading agrees that something is wrong — which a transient does not. How often this happened is reported, since the rate is worth knowing.
 
+### Added
+
+- A Custom tab: a grid of widgets built from a config file (`custom_tab.toml`) rather than from code -- the same widgets the built-in tabs already show, in whatever combination and repetition you list, each cell getting its own independent feed. With no file present the tab says so and every other tab works exactly as it would otherwise; a bad file costs only this one tab, with the specific problem named right there rather than only on the console.
+
 
 <!--
 When adding entries, group them under these headings as needed:

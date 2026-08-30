@@ -29,6 +29,7 @@ from qsorbit.core.dsp.iq import IQ_ZERO_OFFSET  # noqa: E402
 from qsorbit.core.dsp.spectrum import SpectrumConfig  # noqa: E402
 from qsorbit.core.dsp.spectrum_stream import SpectrumStream  # noqa: E402
 from qsorbit.ui.cards import Card, Placeholder  # noqa: E402
+from qsorbit.ui.custom_tab import CustomTabConfig  # noqa: E402
 from qsorbit.ui.feed_hub import FeedHub  # noqa: E402
 from qsorbit.ui.frequency_widget import FrequencyWidget  # noqa: E402
 from qsorbit.ui.quieting_widget import QuietingWidget  # noqa: E402
@@ -103,10 +104,7 @@ def running_timers(widget) -> int:
 def test_the_shell_has_the_tabs_the_roadmap_names(themes, full_hub):
     window = ShellWindow(full_hub, themes=themes)
     titles = [window.tabs.tabText(i) for i in range(window.tabs.count())]
-    assert titles == list(TAB_TITLES[:4])
-    # Custom is PR3; the title constant already reserves its place so the
-    # order cannot drift when it lands.
-    assert TAB_TITLES[4] == "Custom"
+    assert titles == list(TAB_TITLES)
 
 
 def test_every_existing_widget_lives_in_a_hub_fed_tab(themes, full_hub):
@@ -184,10 +182,11 @@ def test_a_shell_with_nothing_attached_still_opens(themes):
 
     Not a crash and not an empty window: the roadmap's own asymmetry is
     that a rotor fault costs the antenna pointing and nothing else, and
-    the shell inherits it.
+    the shell inherits it. The Custom tab is no exception -- with no
+    hub feeds *and* no custom_tab.toml, it is placeholder twice over.
     """
     window = ShellWindow(FeedHub(), themes=themes)
-    assert window.tabs.count() == 4
+    assert window.tabs.count() == 5
     assert window.findChildren(Placeholder)
 
 
@@ -210,6 +209,120 @@ def test_a_spectrum_only_shell_draws_spectrum_and_names_the_missing_rest(themes)
     assert not window.findChildren(QuietingWidget)
     text = " ".join(p.text() for p in window.findChildren(Placeholder))
     assert "no live levels" in text
+
+
+# ----------------------------------------------------------------------
+# Custom tab: config-driven, not hand-wired
+# ----------------------------------------------------------------------
+
+
+def test_the_custom_tab_says_so_when_there_is_no_config(themes, full_hub):
+    """No custom_tab.toml is the normal state for a fresh install."""
+    window = ShellWindow(full_hub, themes=themes)
+    custom = window.tabs.widget(4)
+    text = " ".join(p.text() for p in custom.findChildren(Placeholder))
+    assert "No custom_tab.toml found" in text
+
+
+def test_the_custom_tab_shows_the_specific_load_error(themes, full_hub):
+    """A broken config costs the Custom tab, in its own words -- not the shell."""
+    window = ShellWindow(
+        full_hub,
+        themes=themes,
+        custom_tab_error=(
+            "widgets[0] in custom_tab.toml names 'nonsense', which this build "
+            "does not know how to draw."
+        ),
+    )
+    custom = window.tabs.widget(4)
+    text = " ".join(p.text() for p in custom.findChildren(Placeholder))
+    assert "nonsense" in text
+    # Every other tab is unaffected -- the whole point of scoping the
+    # failure to one tab rather than raising it at ShellWindow's door.
+    assert window.tabs.count() == 5
+    assert not any(
+        "nonsense" in p.text()
+        for i in range(4)
+        for p in window.tabs.widget(i).findChildren(Placeholder)
+    )
+
+
+def test_the_custom_tab_builds_a_grid_from_config(themes):
+    """The done-when clause this PR exists for, as an assertion.
+
+    Two waterfalls in one config get two independent feeds -- proof by
+    the same arithmetic Session 25 used for the built-in tabs: distinct
+    names in ``hub.claimed`` mean distinct subscriptions, not one
+    stream two panels are quietly racing to drain.
+    """
+    stream = make_stream(blocks=6)
+    hub = FeedHub(spectrum=stream, radio=FakeRadio())
+    config = CustomTabConfig(columns=2, widgets=("waterfall", "waterfall", "quieting"))
+
+    window = ShellWindow(hub, themes=themes, custom_tab=config)
+    custom = window.tabs.widget(4)
+
+    assert len(custom.findChildren(WaterfallWidget)) == 2
+    assert len(custom.findChildren(QuietingWidget)) == 1
+    # The shell's own Radio tab claims "spectrum-line" and "waterfall"
+    # first -- it is built before the Custom tab in every ShellWindow.
+    # The two waterfalls this config asks for still get two independent
+    # feeds, just numbered from there rather than from zero.
+    assert hub.claimed == ("spectrum-line", "waterfall", "waterfall-2", "waterfall-3")
+
+
+def test_custom_tab_spectrum_cells_do_not_share_a_zoom_controller(themes):
+    """Unlike the Radio tab's paired waterfall and spectrum line.
+
+    A Custom-tab grid is a flat list from a file with no guarantee two
+    spectrum cells are related, so nothing here should invent a pairing
+    -- each cell gets its own controller, checked by identity rather
+    than by behaviour.
+    """
+    from qsorbit.ui.zoom_controller import ZoomController
+
+    stream = make_stream(blocks=6)
+    hub = FeedHub(spectrum=stream)
+    config = CustomTabConfig(columns=2, widgets=("waterfall", "spectrum_line"))
+
+    window = ShellWindow(hub, themes=themes, custom_tab=config)
+    custom = window.tabs.widget(4)
+
+    controllers = custom.findChildren(ZoomController)
+    assert len(controllers) == 2
+    assert controllers[0] is not controllers[1]
+
+
+def test_a_custom_tab_widget_works_as_a_second_instance_of_a_built_in_one(themes):
+    """The standing Phase 3 rule, checked end to end.
+
+    "Every widget must work as a second instance in the Custom tab, or
+    the design is wrong." The shell's own Radio tab claims the first
+    waterfall; a Custom tab asking for one more gets a second,
+    independent instance through the same hub -- the identical proof
+    PR2's own second-RadioTab test used, one PR later, against the
+    actual Custom tab rather than a stand-in for it.
+    """
+    stream = make_stream(blocks=6)
+    hub = FeedHub(spectrum=stream, radio=FakeRadio())
+    config = CustomTabConfig(columns=1, widgets=("waterfall",))
+
+    window = ShellWindow(hub, themes=themes, custom_tab=config)
+    assert hub.claimed == ("spectrum-line", "waterfall", "waterfall-2")
+
+    stream.start()
+    thread = stream._thread
+    assert thread is not None
+    thread.join(5.0)
+    assert not thread.is_alive()
+
+    stats = {sub.name: sub for sub in stream._subscribers}
+    for name in hub.claimed:
+        assert stats[name].stats.frames_offered == 6, name
+        assert stats[name].stats.frames_dropped == 0, name
+
+    for timer in window.findChildren(QTimer):
+        timer.stop()
 
 
 # ----------------------------------------------------------------------
