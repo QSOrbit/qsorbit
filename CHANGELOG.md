@@ -72,6 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - The Rotor tab no longer cuts its own readings off mid-word. With a rotor connected, four of the six rows were clipped by a column that had been given a fixed width - the range row read "39131 km, approaching at 0." with the rate itself missing, which is a readout dropping the number it exists to show. Columns now size to what they are actually holding.
+- The Plan tab's ground-track map is no longer squeezed to a sliver. The card showed its flat/globe toggle above a few pixels of map: the map never stated how much room it needs, and a card that sizes itself to its contents obliged by giving it almost none. It now asks for the size the design intends, and declares a floor below which a coastline stops being a coastline.
 
 ### Changed
 
