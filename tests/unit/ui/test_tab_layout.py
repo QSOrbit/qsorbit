@@ -19,27 +19,49 @@ That generalises past the two columns being fixed today. PR3's Custom
 tab builds widgets from a config file into grid cells nobody has sized
 by hand, and Chunk D adds a picker and a map; any of those can squeeze a
 label, and this will say so.
+
+**And Chunk D's map did exactly that, in the other direction.** The
+prediction above was right about the tab and wrong about the mechanism:
+nothing clipped a *label*, the Plan tab starved a *canvas*. A widget
+that only implements ``paintEvent`` states no size, so
+``minimumSizeHint()`` comes back empty and a non-stretch
+:class:`~qsorbit.ui.cards.Card` -- policy ``(Preferred, Minimum)`` --
+gave it nothing: a titled card with a working flat/globe toggle above a
+sliver of map, on a real screen, while twenty ``test_map_widget.py``
+tests passed because they ``grab()`` the widget standalone and supply
+its size themselves. So this file now carries a second check with the
+same shape as the first: **a widget is starved when it is given less
+than its own stated minimum.**
 """
 
 from __future__ import annotations
 
+from datetime import date
 from unittest.mock import MagicMock
 
 import pytest
 
 pytest.importorskip("PySide6.QtWidgets")
 
-from PySide6.QtWidgets import QLabel  # noqa: E402
+from PySide6.QtWidgets import QLabel, QWidget  # noqa: E402
 
+from qsorbit.core.horizon import HorizonMask  # noqa: E402
 from qsorbit.core.pointing import AlignmentOffset, TrackingLoop  # noqa: E402
+from qsorbit.core.profiles import (  # noqa: E402
+    AliveRecord,
+    AliveStatus,
+    ProfileCatalog,
+    SatelliteProfile,
+)
 from qsorbit.core.rotor import Rotor  # noqa: E402
 from qsorbit.core.rotor.capabilities import AzimuthWrap, RotorCapabilities  # noqa: E402
 from qsorbit.core.rotor.position import Position  # noqa: E402
 from qsorbit.core.tracker.observer import ObserverLocation  # noqa: E402
 from qsorbit.core.tracker.satellite import Satellite  # noqa: E402
 from qsorbit.ui.feed_hub import FeedHub  # noqa: E402
+from qsorbit.ui.map_widget import _MapCanvas  # noqa: E402
 from qsorbit.ui.readout_widget import ReadoutWidget  # noqa: E402
-from qsorbit.ui.tabs import RadioTab, RotorTab  # noqa: E402
+from qsorbit.ui.tabs import PlanTab, RadioTab, RotorTab  # noqa: E402
 from qsorbit.ui.theme import DEFAULT_THEMES_DIR, discover_themes  # noqa: E402
 from qsorbit.ui.theme_manager import ThemeManager  # noqa: E402
 
@@ -249,3 +271,146 @@ def test_the_check_can_actually_fail(qapp):
     label.setFixedWidth(wanted + 20)
     qapp.processEvents()
     assert clipped_labels(host) == []
+
+
+def starved_canvases(widget) -> list[tuple[str, int, int]]:
+    """Every visible widget given less height than its own minimum asks for.
+
+    Deliberately narrower than "every widget that paints". Four other
+    widgets in :mod:`qsorbit.ui` implement ``paintEvent`` and state no
+    size either, and none of them is defective today -- they all live in
+    ``stretch=True`` cards that hand them the slack. Flagging them here
+    would be scope creep dressed as a finding.
+
+    What this enforces is the contract that matters: **a widget that
+    does state a minimum must actually be given it.** The map's fix is
+    to state one; this is what keeps it honest afterwards, and what will
+    fire if some future container starves it again.
+
+    **Stock Qt widgets are excluded, and that is a finding rather than a
+    convenience.** The first version of this helper checked every child
+    and reported ``QHeaderView`` at 39 px against a 62 px minimum -- the
+    picker table's own header, given less than it asks for by the table
+    that owns it, working exactly as intended. A stock widget's
+    internals are its own business and this project neither controls nor
+    should police them. So the check covers widgets defined outside
+    PySide6: ours, and anything a test defines to prove this helper
+    still bites.
+    """
+    found = []
+    for child in widget.findChildren(QWidget):
+        if type(child).__module__.startswith("PySide6"):
+            continue
+        wanted = child.minimumSizeHint().height()
+        if wanted > 0 and child.isVisible() and child.height() < wanted:
+            found.append((type(child).__name__, child.height(), wanted))
+    return found
+
+
+@pytest.fixture
+def plan_tab_parts(tmp_path):
+    """A TLE directory and a catalogue that actually match each other.
+
+    Matched on purpose, for the same reason ``ticked_loop`` ticks: a
+    picker with no rows would emit no entries, the map would draw no
+    tracks, and the tab would lay out around content that isn't there --
+    reproducing the blind spot rather than the bug.
+    """
+    tle_dir = tmp_path / "tle"
+    tle_dir.mkdir()
+    (tle_dir / "geo.tle").write_text(GEO_TLE, encoding="utf-8")
+
+    catalog = ProfileCatalog(
+        (
+            SatelliteProfile(
+                norad_id=19548,
+                name="TDRS 3",
+                transmitters=(),
+                alive=AliveRecord(
+                    status=AliveStatus.ACTIVE,
+                    as_of=date(2026, 8, 28),
+                    source="test",
+                ),
+            ),
+        )
+    )
+    return str(tle_dir), catalog
+
+
+def test_the_plan_tab_gives_its_map_room_to_be_a_map(themes, plan_tab_parts):
+    """The defect, as an assertion.
+
+    Before the fix the canvas came out a handful of pixels tall inside a
+    full-width card, because it asked for nothing and the card's
+    ``Minimum`` policy obliged. The assertion is against the canvas's
+    own declared floor rather than a number typed here, so the two
+    cannot drift apart.
+    """
+    tle_dir, catalog = plan_tab_parts
+    tab = PlanTab(
+        themes=themes,
+        catalog=catalog,
+        catalog_manifest=None,
+        tle_dir=tle_dir,
+        observer=ObserverLocation(latitude=43.0, longitude=-79.0),
+        horizon=HorizonMask(points=()),
+    )
+    realise(tab)
+
+    canvas = tab.findChild(_MapCanvas)
+    assert canvas is not None, "the Plan tab built no map canvas at all"
+    assert canvas.height() >= _MapCanvas.MINIMUM_SIZE.height()
+    assert canvas.width() >= _MapCanvas.MINIMUM_SIZE.width()
+    assert starved_canvases(tab) == []
+
+
+def test_the_plan_tab_clips_no_labels_either(themes, plan_tab_parts):
+    """The original check, pointed at the tab this file predicted in writing."""
+    tle_dir, catalog = plan_tab_parts
+    tab = PlanTab(
+        themes=themes,
+        catalog=catalog,
+        catalog_manifest=None,
+        tle_dir=tle_dir,
+        observer=ObserverLocation(latitude=43.0, longitude=-79.0),
+        horizon=HorizonMask(points=()),
+    )
+    realise(tab)
+    assert clipped_labels(tab) == []
+
+
+def test_the_starvation_check_can_actually_fail(qapp):
+    """Canary, aimed at the helper.
+
+    ``test_no_hardcoded_colours`` shipped once as a check too narrow to
+    see its own defect, so every helper in this file gets one of these.
+    A canvas squeezed below its stated minimum must be reported, and a
+    canvas with room must not be.
+    """
+    from PySide6.QtWidgets import QVBoxLayout
+
+    host = QWidget()
+    QVBoxLayout(host)
+
+    class _Starved(QWidget):
+        def minimumSizeHint(self):  # noqa: N802 - Qt's spelling
+            from PySide6.QtCore import QSize
+
+            return QSize(360, 180)
+
+    victim = _Starved(host)
+    host.layout().addWidget(victim)
+    victim.setFixedHeight(9)
+    host.resize(800, 400)
+    host.show()
+    qapp.processEvents()
+
+    found = starved_canvases(host)
+    assert found, "a 9 px canvas declaring a 180 px minimum was not reported"
+    name, height, wanted = found[0]
+    assert height == 9
+    assert wanted == 180
+
+    victim.setFixedHeight(200)
+    qapp.processEvents()
+    assert starved_canvases(host) == []

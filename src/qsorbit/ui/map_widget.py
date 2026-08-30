@@ -53,8 +53,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Final
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QButtonGroup, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
@@ -291,11 +292,50 @@ class _MapCanvas(QWidget):
     :class:`~qsorbit.ui.waterfall_widget.WaterfallWidget` are two widgets rather
     than one, just composed one level further in here because the toggle is
     this map's own state and nothing else's.
+
+    **This canvas states its own size, and that is not decoration.**
+    A ``QWidget`` that only implements ``paintEvent`` has no opinion
+    about how big it needs to be, so ``minimumSizeHint()`` comes back
+    empty and a layout is free to give it nothing at all. Inside a
+    non-stretch :class:`~qsorbit.ui.cards.Card` -- whose size policy is
+    ``(Preferred, Minimum)`` -- "nothing at all" is exactly what
+    happened: the Plan tab rendered a titled card with a working
+    flat/globe toggle above a map squeezed to a sliver, on a real
+    screen, while twenty passing tests said nothing (they call
+    ``grab()`` on the widget standalone, where the *test* supplies the
+    size).
+
+    Same defect class as the Rotor tab's clipped readouts fixed in #42:
+    a widget's size is the widget's own business, and the container has
+    no way to know it. So the numbers live here rather than in
+    :class:`~qsorbit.ui.tabs.PlanTab`.
     """
+
+    #: The map's preferred size, and the figures are not invented:
+    #: ``qsorbit-shell-mockup.html`` draws this panel as
+    #: ``viewBox="0 0 720 360"``, so the widget's stated size and the
+    #: reference design agree by construction rather than by
+    #: coincidence. 2:1 is also equirectangular's natural ratio.
+    PREFERRED_SIZE: Final = QSize(720, 360)
+
+    #: The floor. Small enough that a cramped window still lays out,
+    #: large enough that a coastline is still recognisably a coastline
+    #: -- the Natural Earth 110m data is trimmed to two decimal places,
+    #: so below roughly this size its points start landing on the same
+    #: pixel and the outline stops meaning anything.
+    MINIMUM_SIZE: Final = QSize(360, 180)
 
     def __init__(self, owner: MapWidget) -> None:
         super().__init__(owner)
         self._owner = owner
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt's spelling
+        """The size this canvas would like, absent other constraints."""
+        return QSize(self.PREFERRED_SIZE)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt's spelling
+        """The size below which this canvas stops being a map."""
+        return QSize(self.MINIMUM_SIZE)
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt's spelling
         theme = self._owner._themes.current
