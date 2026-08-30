@@ -1,0 +1,6 @@
+# Catalogue-level metadata for this directory's curated profile set --
+# distinct from any one satellite's own `alive.as_of` field. Update
+# `shipped` when the curated set itself changes (a profile added,
+# removed, or materially revised), not on every commit that touches
+# this directory. Read by qsorbit.core.profiles.catalog.load_catalog_manifest.
+shipped = 2026-08-28

@@ -28,6 +28,7 @@ from qsorbit.__main__ import (
 )
 from qsorbit.core.dsp.spectrum import SpectrumConfig
 from qsorbit.core.dsp.spectrum_stream import SpectrumStream
+from qsorbit.core.profiles import CATALOG_MANIFEST_FILENAME
 from qsorbit.core.rotor import Arrival, HomingError, Position, Rotor, RotorErrorCode, RotorStatus
 from qsorbit.core.sdr import AppliedSettings, DeviceError, DeviceInfo, TunerType
 from qsorbit.ui.theme import DEFAULT_THEME_NAME, DEFAULT_THEMES_DIR, discover_themes
@@ -131,6 +132,15 @@ def profiles_dir_path(tmp_path):
     directory.mkdir()
     (directory / "teme.toml").write_text(textwrap.dedent(PLAN_PROFILE), encoding="utf-8")
     return directory
+
+
+@pytest.fixture
+def profiles_dir_with_manifest_path(profiles_dir_path):
+    """profiles_dir_path, plus a CATALOG.toml shipped 2026-08-25."""
+    (profiles_dir_path / CATALOG_MANIFEST_FILENAME).write_text(
+        "shipped = 2026-08-25\n", encoding="utf-8"
+    )
+    return profiles_dir_path
 
 
 @pytest.fixture
@@ -536,6 +546,10 @@ class TestPlanParser:
         args = build_parser().parse_args(["plan", "--tle-dir", "x"])
         assert args.profiles_dir is None
 
+    def test_refresh_catalogue_defaults_to_off(self):
+        args = build_parser().parse_args(["plan", "--tle-dir", "x"])
+        assert args.refresh_catalogue is False
+
 
 class TestPlan:
     def test_lists_a_pass_with_its_transmitter(
@@ -709,6 +723,70 @@ class TestPlan:
 
         assert code == 0
         assert "Could not read" in capsys.readouterr().err
+
+    def test_prints_catalogue_staleness_when_a_manifest_is_present(
+        self, plan_config_path, tle_dir_path, profiles_dir_with_manifest_path, capsys
+    ):
+        code = run_plan(
+            [
+                "plan",
+                "--tle-dir",
+                str(tle_dir_path),
+                "--profiles-dir",
+                str(profiles_dir_with_manifest_path),
+                "--at",
+                "2026-08-28T00:00:00+00:00",
+                "--hours",
+                "48",
+            ],
+            plan_config_path,
+        )
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "Curated catalogue shipped 2026-08-25 (3 d ago)." in out
+
+    def test_no_staleness_line_when_no_manifest_present(
+        self, plan_config_path, tle_dir_path, profiles_dir_path, capsys
+    ):
+        code = run_plan(
+            [
+                "plan",
+                "--tle-dir",
+                str(tle_dir_path),
+                "--profiles-dir",
+                str(profiles_dir_path),
+                "--at",
+                "2026-08-28T00:00:00+00:00",
+                "--hours",
+                "48",
+            ],
+            plan_config_path,
+        )
+
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "shipped" not in out
+
+    def test_refresh_catalogue_fails_with_a_clear_error(
+        self, plan_config_path, tle_dir_path, profiles_dir_path, capsys
+    ):
+        code = run_plan(
+            [
+                "plan",
+                "--tle-dir",
+                str(tle_dir_path),
+                "--profiles-dir",
+                str(profiles_dir_path),
+                "--refresh-catalogue",
+            ],
+            plan_config_path,
+        )
+
+        err = capsys.readouterr().err
+        assert code == 1
+        assert err.startswith("Error:")
+        assert "no network source configured" in err
 
     def test_missing_tle_dir_is_an_error(self, plan_config_path, tmp_path, capsys):
         missing = tmp_path / "does-not-exist"
