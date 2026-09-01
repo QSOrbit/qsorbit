@@ -55,6 +55,7 @@ from enum import Enum
 
 from qsorbit.core.geometry import AzEl
 from qsorbit.core.rotor import Position, Rotor, format_set_position
+from qsorbit.core.stall_guard import StallDetector, StallGuard
 from qsorbit.core.tracker import ObserverLocation, Target
 from qsorbit.core.tracking_profile import DEFAULT_INTERVAL_S, check_cadence
 
@@ -111,6 +112,14 @@ class TickOutcome(Enum):
     #: rather than exceptional: with pass prediction deferred, a track is
     #: started by hand and usually starts before the target rises.
     BELOW_HORIZON = "below_horizon"
+
+    #: An axis stopped following its setpoint, so the setpoint was
+    #: frozen and nothing was sent. Distinct from
+    #: :attr:`WITHIN_DEADBAND` on purpose: both send no command, and
+    #: from outside they would otherwise look identical — one is the
+    #: normal state of a healthy track and the other is a jammed
+    #: antenna. See :mod:`qsorbit.core.stall_guard`.
+    STALLED = "stalled"
 
 
 @dataclass(frozen=True)
@@ -449,6 +458,16 @@ class TrackingLoop:
             makes. Defaults to :data:`IDENTITY_ALIGNMENT_OFFSET`, i.e.
             no correction — today's behaviour for a station whose
             config carries none.
+        stall_guard: How much evidence counts as a stalled axis.
+            Defaults to :class:`~qsorbit.core.stall_guard.StallGuard`'s
+            own derived policy.
+        on_stall: Optional callback, invoked once with the names of the
+            stuck axes each time a stall is declared. A stall the
+            operator is not told about is the silent failure this guard
+            exists to end — and unlike most of what this loop reports,
+            it is *actionable while the pass is running*: somebody can
+            go and free the boom. Same shape as
+            :class:`~qsorbit.core.rotor.Rotor`'s ``on_homing_wait``.
         now: Returns the current instant, timezone-aware. Injected for
             testing.
         sleep: Injected for testing; defaults to :func:`time.sleep`.
@@ -471,6 +490,8 @@ class TrackingLoop:
         interval_s: float = DEFAULT_TICK_INTERVAL_S,
         deadband_deg: float,
         alignment_offset: AlignmentOffset = IDENTITY_ALIGNMENT_OFFSET,
+        stall_guard: StallGuard | None = None,
+        on_stall: Callable[[tuple[str, ...]], None] | None = None,
         now: Callable[[], datetime] = _utc_now,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
@@ -493,6 +514,8 @@ class TrackingLoop:
         self._last_commanded: Position | None = None
         self._latest_sample: TrackSample | None = None
         self._guard_rereads = 0
+        self._stall = StallDetector(stall_guard)
+        self._on_stall = on_stall
 
     # ------------------------------------------------------------------
     # Properties
@@ -566,10 +589,22 @@ class TrackingLoop:
         rotor_position = self._read_guarded_position()
 
         rotor_target = sky_to_rotor(state.sky_position, self._alignment_offset)
-        outcome = self._decide(state.sky_position, rotor_target)
-        if outcome is TickOutcome.COMMANDED:
-            self._rotor.move_to(rotor_target)
-            self._last_commanded = rotor_target
+        stalls_before = self._stall.events
+        if self._stall.observe(self._last_commanded, rotor_position):
+            # Freezing the setpoint is the response, and it is the whole
+            # point: it bounds the firmware's Kp x error as well as any
+            # integral, it takes effect this instant, and unlike a
+            # serial write it cannot itself fail. The axis is jammed;
+            # continuing to walk the target away from it only decides
+            # how hard it slams when it frees.
+            outcome = TickOutcome.STALLED
+            if self._on_stall is not None and self._stall.events > stalls_before:
+                self._on_stall(self._stall.stalled_axes)
+        else:
+            outcome = self._decide(state.sky_position, rotor_target)
+            if outcome is TickOutcome.COMMANDED:
+                self._rotor.move_to(rotor_target)
+                self._last_commanded = rotor_target
 
         sample = TrackSample(
             time=now,
@@ -649,6 +684,25 @@ class TrackingLoop:
         if moved < self._deadband_deg:
             return TickOutcome.WITHIN_DEADBAND
         return TickOutcome.COMMANDED
+
+    @property
+    def is_stalled(self) -> bool:
+        """Whether an axis is currently failing to follow its setpoint.
+
+        While this is true the loop commands nothing, so the antenna is
+        not being driven further from where it actually is.
+        """
+        return self._stall.is_stalled
+
+    @property
+    def stall_events(self) -> int:
+        """How many distinct stalls this run has declared."""
+        return self._stall.events
+
+    @property
+    def stalled_axes(self) -> tuple[str, ...]:
+        """Which axes are currently stuck, empty when none are."""
+        return self._stall.stalled_axes
 
     @property
     def guard_rereads(self) -> int:

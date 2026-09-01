@@ -147,6 +147,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **This can refuse a config file that loaded yesterday.** If your `acceptance_window_deg` is a whole number of degrees, the deadband it was silently supplying sat on that knife edge and your station has been commanding doubled steps for as long as it has had that value. The error says so, and gives you the two lines to add. Your acceptance window is a separate measurement and is not what needs changing.
 
+### Fixed
+
+- **A jammed rotor axis no longer has its target walked away from it.** The tracking loop compares each new target against the last position it *commanded*, never against what the rotor reports -- deliberately, because comparing against the reading would chase the rotor's stiction shortfall forever. The cost of that, until now, was that an axis which stopped moving kept being told to go further: a snagged cable or a fouled boom would accumulate pointing error for the rest of the pass, and the controller drives on that error. On this hardware the firmware reaches full motor power at about 22 degrees of azimuth error, which a satellite near overhead produces in roughly twenty seconds -- so an axis freed by hand after a minute would have slammed round at full speed. QSOrbit now notices an axis that has stopped following, freezes the commanded position where it is, and says so on the console naming the axis. Tracking resumes by itself the moment the axis moves again; a stall does not end the pass.
+- Each axis is judged on its own. Pooling them would have let a healthy azimuth hide a jammed elevation, which is the more likely failure of the two -- elevation carries the weight of the boom and needs more push to break friction in the first place.
+
 <!--
 When adding entries, group them under these headings as needed:
 

@@ -42,6 +42,7 @@ from qsorbit.core.rotor import (
     Rotor,
     RotorCapabilities,
 )
+from qsorbit.core.stall_guard import StallGuard
 from qsorbit.core.tracker import ObserverLocation, TopocentricState
 from qsorbit.core.tracking_profile import CadenceError
 
@@ -830,3 +831,160 @@ class TestRotorToSky:
         for azimuth in (-1080.0, -400.0, 0.0, 400.0, 1080.0):
             for elevation in (-1080.0, -95.0, 0.0, 95.0, 1080.0):
                 rotor_to_sky(Position(azimuth, elevation))
+
+
+# ---------------------------------------------------------------------------
+# Stalled axes (Chunk H PR2a)
+# ---------------------------------------------------------------------------
+
+
+class TestStall:
+    """A jammed axis, seen through the loop rather than the detector.
+
+    The hazard these guard against is not primarily integral windup: the
+    loop compares each target against the *last commanded* position, so
+    a jammed axis keeps having its setpoint walked away from it, and the
+    firmware's ``Kp x error`` reaches full PWM in about twenty seconds at
+    stock gains with no gain profile involved at all.
+    """
+
+    def moving_states(self, count: int, step: float = 3.0):
+        # Each state moves further than the 2.5 deg deadband, so the
+        # loop commands on every tick and the setpoint really is
+        # advancing.
+        return [state(100.0 + step * n, 45.0) for n in range(count)]
+
+    def test_a_jammed_axis_stops_being_commanded(self):
+        loop, rotor, _ = make_loop(self.moving_states(14), reported=Position(0.0, 0.0))
+        outcomes = [loop.tick().outcome for _ in range(14)]
+
+        assert TickOutcome.STALLED in outcomes
+        # Once stalled, nothing further is sent: every later tick is
+        # STALLED rather than COMMANDED.
+        first_stall = outcomes.index(TickOutcome.STALLED)
+        assert all(o is TickOutcome.STALLED for o in outcomes[first_stall:])
+        assert rotor.move_to.call_count == first_stall
+
+    def test_the_setpoint_stops_advancing(self):
+        # The whole point. A frozen setpoint bounds Kp x error as well
+        # as any integral, and it costs no serial round trip.
+        loop, rotor, _ = make_loop(self.moving_states(14), reported=Position(0.0, 0.0))
+        for _ in range(14):
+            loop.tick()
+
+        assert loop.is_stalled
+        last = loop.last_commanded
+        for _ in range(10):
+            loop.tick()
+        assert loop.last_commanded == last
+
+    def test_the_stall_is_counted(self):
+        loop, _, _ = make_loop(self.moving_states(14), reported=Position(0.0, 0.0))
+        for _ in range(14):
+            loop.tick()
+        assert loop.stall_events == 1
+
+    def test_a_healthy_track_never_stalls(self):
+        # The rotor follows: each reading lands within the stiction
+        # residual of what was last commanded.
+        states = self.moving_states(30)
+        reported = [Position(100.0 + 3.0 * n - 1.5, 45.0) for n in range(30)]
+        loop, _, _ = make_loop(states, reported=reported)
+        outcomes = [loop.tick().outcome for _ in range(30)]
+
+        assert TickOutcome.STALLED not in outcomes
+        assert loop.stall_events == 0
+        assert not loop.is_stalled
+
+    def test_a_freed_axis_resumes_being_commanded(self):
+        # A stall is not fatal and does not end the pass -- the same
+        # reasoning that stopped a single bad reading aborting a track
+        # in Chunk A. Passes are ten-minute appointments.
+        jammed = [Position(0.0, 0.0)] * 14
+        # Freed and following again, a stiction residual behind the
+        # target -- not merely reporting one new number and then
+        # freezing, which would be a second stall and rightly detected
+        # as one.
+        freed = [Position(100.0 + 3.0 * n - 1.5, 45.0) for n in range(14, 24)]
+        loop, rotor, _ = make_loop(self.moving_states(24), reported=jammed + freed)
+        for _ in range(14):
+            loop.tick()
+        assert loop.is_stalled
+        commanded_while_stalled = rotor.move_to.call_count
+
+        for _ in range(10):
+            loop.tick()
+        assert not loop.is_stalled
+        assert rotor.move_to.call_count > commanded_while_stalled
+        assert loop.stall_events == 1
+
+    def test_a_below_horizon_track_never_stalls(self):
+        # Nothing is commanded, so nothing can fail to follow. This is
+        # the case an "error exceeds the acceptance window" formulation
+        # of the test would have got wrong.
+        loop, _, _ = make_loop(
+            [state(100.0 + 3.0 * n, -5.0) for n in range(20)], reported=Position(0.0, 0.0)
+        )
+        outcomes = [loop.tick().outcome for _ in range(20)]
+
+        assert set(outcomes) == {TickOutcome.BELOW_HORIZON}
+        assert loop.stall_events == 0
+
+    def test_a_stationary_target_never_stalls(self):
+        # Inside the deadband: the loop commands once and then nothing,
+        # so the setpoint is not advancing and a motionless axis is
+        # simply an arrived one.
+        loop, _, _ = make_loop([state(180.0, 45.0)] * 30, reported=Position(178.5, 44.0))
+        outcomes = [loop.tick().outcome for _ in range(30)]
+
+        assert TickOutcome.STALLED not in outcomes
+        assert outcomes.count(TickOutcome.COMMANDED) == 1
+
+    def test_the_guard_policy_can_be_supplied(self):
+        loop, rotor, _ = make_loop(
+            self.moving_states(10),
+            reported=Position(0.0, 0.0),
+            stall_guard=StallGuard(ticks=2),
+        )
+        outcomes = [loop.tick().outcome for _ in range(10)]
+        # A tighter guard declares the stall sooner than the default six.
+        assert outcomes.index(TickOutcome.STALLED) < 6
+
+    def test_stalled_is_distinguishable_from_within_deadband(self):
+        # Both command nothing. Off and broken should never look the
+        # same, and from outside they otherwise would.
+        assert TickOutcome.STALLED is not TickOutcome.WITHIN_DEADBAND
+        loop, _, _ = make_loop(self.moving_states(14), reported=Position(0.0, 0.0))
+        samples = [loop.tick() for _ in range(14)]
+        assert samples[-1].outcome is TickOutcome.STALLED
+
+    def test_the_operator_is_told_once_per_stall(self):
+        # Once, not once per tick: a warning repeated every half second
+        # for the rest of a pass is a warning nobody reads.
+        seen: list[tuple[str, ...]] = []
+        loop, _, _ = make_loop(
+            self.moving_states(20),
+            reported=Position(0.0, 0.0),
+            on_stall=seen.append,
+        )
+        for _ in range(20):
+            loop.tick()
+
+        assert seen == [("azimuth",)]
+
+    def test_the_callback_names_the_stuck_axis(self):
+        seen: list[tuple[str, ...]] = []
+        # Elevation climbs while azimuth holds, so elevation is the axis
+        # whose setpoint advances and whose reading does not follow.
+        states = [state(180.0, 10.0 + 3.0 * n) for n in range(14)]
+        loop, _, _ = make_loop(states, reported=Position(180.0, 0.0), on_stall=seen.append)
+        for _ in range(14):
+            loop.tick()
+
+        assert seen == [("elevation",)]
+
+    def test_no_callback_is_fine(self):
+        loop, _, _ = make_loop(self.moving_states(14), reported=Position(0.0, 0.0))
+        for _ in range(14):
+            loop.tick()
+        assert loop.is_stalled
