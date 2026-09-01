@@ -1332,6 +1332,7 @@ def _command_receive(
                 interval_s=profile.interval_s,
                 deadband_deg=profile.deadband_deg,
                 alignment_offset=_alignment_offset(config),
+                on_stall=_report_stall,
             )
             return run(args, config, satellite, applied, nbfm, doppler, squelch, sdr, loop=loop)
 
@@ -1359,6 +1360,25 @@ def _range_rate_interval(args: argparse.Namespace) -> float:
     if args.interval is not None:
         return args.interval
     return DEFAULT_TRACKING_INTERVAL_S
+
+
+def _report_stall(axes: tuple[str, ...]) -> None:
+    """Tell the operator an axis has stopped following, while it matters.
+
+    Printed rather than counted quietly, because unlike most of what a
+    track reports this one is **actionable during the pass**: somebody
+    can walk out and free the boom, and the track picks up by itself
+    when the axis moves. A stall nobody is told about is the silent
+    failure the guard exists to end.
+    """
+    which = " and ".join(axes) if axes else "an axis"
+    verb = "are" if len(axes) > 1 else "is"
+    print(
+        f"STALL:     {which} {verb} not following the commanded position. The "
+        "setpoint is frozen, so the antenna is not being driven further from "
+        "where it actually is. Check for an obstruction or a cable snag — "
+        "tracking resumes on its own once the axis moves."
+    )
 
 
 def _describe_cadence(profile: TrackingProfile) -> str:
@@ -1932,6 +1952,7 @@ def _run_shell_tracking_only(
             interval_s=profile.interval_s,
             deadband_deg=profile.deadband_deg,
             alignment_offset=_alignment_offset(config),
+            on_stall=_report_stall,
         )
         # The ticker is built BEFORE the hub, because the hub needs its
         # fault callable. A readout left showing its last plausible
