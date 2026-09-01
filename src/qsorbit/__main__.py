@@ -47,6 +47,7 @@ import contextlib
 import signal
 import sys
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
@@ -104,6 +105,10 @@ from qsorbit.core.sdr import (
 )
 from qsorbit.core.station import ConfigError, StationConfig, load_station_config
 from qsorbit.core.tracker import Pass, Satellite, TrackerError, predict_passes
+from qsorbit.core.tracking_profile import (
+    NOMINAL_TRACKING_RATE_DEG_S,
+    TrackingProfile,
+)
 from qsorbit.ui.theme import DEFAULT_THEME_NAME
 
 #: How long ``point --send`` waits for the rotor to settle, in seconds.
@@ -610,9 +615,22 @@ def _add_radio_arguments(parser: argparse.ArgumentParser, *, required: bool) -> 
     parser.add_argument(
         "--interval",
         type=float,
-        default=DEFAULT_TRACKING_INTERVAL_S,
+        default=None,
         metavar="S",
-        help=f"Seconds between tracking updates (default {DEFAULT_TRACKING_INTERVAL_S:.0f}).",
+        help=(
+            "Seconds between tracking updates. Overrides the active tracking "
+            "profile's own interval; without it the profile decides, and a "
+            f"station with no profiles uses {DEFAULT_TRACKING_INTERVAL_S:.0f}."
+        ),
+    )
+    parser.add_argument(
+        "--rotor-profile",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Which [rotor.profiles.NAME] tracking profile to run. Overrides "
+            "the config's own `profile` key for this run."
+        ),
     )
     parser.add_argument(
         "--send",
@@ -1118,6 +1136,12 @@ def _command_status(config: StationConfig, factory: RotorFactory) -> int:
         )
         print(f"Wrap:      {capabilities.azimuth_wrap.value}")
         print(f"Window:    {capabilities.acceptance_window_deg:.1f} degrees acceptance")
+        print(_describe_cadence(config.tracking_profile))
+        declared = [entry.name for entry in config.tracking.profiles]
+        if declared:
+            print(f"Profiles:  {', '.join(declared)}")
+        else:
+            print("Profiles:  none declared (see [rotor.profiles] in config.example.toml)")
         offset = _alignment_offset(config)
         if offset.is_identity:
             print("Alignment: none recorded (see [rotor.alignment] in config.example.toml)")
@@ -1299,14 +1323,80 @@ def _command_receive(
 
         with _Connected(config, rotor_factory) as rotor:
             print(f"Rotor:     connected, {rotor.firmware_version}")
+            profile = _tracking_profile(args, config)
+            print(_describe_cadence(profile))
             loop = TrackingLoop(
                 satellite,
                 config.observer,
                 rotor,
-                interval_s=args.interval,
+                interval_s=profile.interval_s,
+                deadband_deg=profile.deadband_deg,
                 alignment_offset=_alignment_offset(config),
             )
             return run(args, config, satellite, applied, nbfm, doppler, squelch, sdr, loop=loop)
+
+
+def _range_rate_interval(args: argparse.Namespace) -> float:
+    """Seconds between Doppler range-rate samples.
+
+    **Deliberately not the tracking profile's interval**, even though
+    both were ``--interval`` before profiles existed and the two look
+    interchangeable. A tracking profile says how hard to drive the
+    *rotor*; this paces :class:`~qsorbit.core.receive.ReceiveSession`'s
+    range-rate loop, which runs whether or not a rotor is connected and
+    sits on the receive path — where Session 29 established that CPU
+    turns directly into lost USB samples.
+
+    Letting a profile move it would mean selecting the tracking profile
+    silently doubled the Doppler sampling rate on a run with no rotor
+    attached, and that the Rotor tab's live toggle changed the receive
+    path mid-pass. Both would land inside Chunk E's combined-versus-
+    single comparison as an unmeasured variable.
+
+    ``--interval`` still moves both, because an operator asking for a
+    specific tick has asked for exactly that.
+    """
+    if args.interval is not None:
+        return args.interval
+    return DEFAULT_TRACKING_INTERVAL_S
+
+
+def _describe_cadence(profile: TrackingProfile) -> str:
+    """One line saying what this cadence will really command.
+
+    The step is reported, not just the deadband, because they are not
+    the same number and the difference is the whole point: the shipped
+    2.5 deg deadband at a 1 s tick commands 3.0 deg steps against a
+    1 deg/s target, which is a thing an operator should be able to read
+    off the screen rather than off a logic analyser.
+    """
+    return (
+        f"Cadence:   {profile.name} profile, {profile.deadband_deg:g} deg deadband "
+        f"at {profile.interval_s:g} s -> {profile.commanded_step_deg:g} deg steps "
+        f"at {NOMINAL_TRACKING_RATE_DEG_S:g} deg/s"
+    )
+
+
+def _tracking_profile(args: argparse.Namespace, config: StationConfig) -> TrackingProfile:
+    """The tracking profile in force, after command-line overrides.
+
+    The single place cadence is resolved, so ``receive``, ``shell`` and
+    ``status`` cannot disagree about what this run is actually doing.
+
+    Both overrides go through :func:`dataclasses.replace`, which re-runs
+    the value object's own validation — so ``--rotor-profile`` naming a
+    profile that isn't declared, and an ``--interval`` that lands the
+    cadence on the knife edge, are both refused here exactly as they
+    would be in the config file. A check that only guards the config
+    file is a check with a command-line-shaped hole in it.
+    """
+    tracking = config.tracking
+    if args.rotor_profile is not None:
+        tracking = replace(tracking, active=args.rotor_profile)
+    profile = tracking.active_profile(config.capabilities.acceptance_window_deg)
+    if args.interval is not None:
+        profile = replace(profile, interval_s=args.interval)
+    return profile
 
 
 def _run_receive(
@@ -1347,7 +1437,7 @@ def _run_receive(
         # _squelch_status_line.
         mute_squelch=args.squelch,
         spectrum_factory=_spectrum_factory(args.window, spectrum_config),
-        tracking_interval_s=args.interval,
+        tracking_interval_s=_range_rate_interval(args),
     )
 
     print(
@@ -1833,11 +1923,14 @@ def _run_shell_tracking_only(
 
     with _Connected(config, rotor_factory) as rotor:
         print(f"Rotor:     connected, {rotor.firmware_version}")
+        profile = _tracking_profile(args, config)
+        print(_describe_cadence(profile))
         loop = TrackingLoop(
             satellite,
             config.observer,
             rotor,
-            interval_s=args.interval,
+            interval_s=profile.interval_s,
+            deadband_deg=profile.deadband_deg,
             alignment_offset=_alignment_offset(config),
         )
         # The ticker is built BEFORE the hub, because the hub needs its
@@ -1845,7 +1938,7 @@ def _run_shell_tracking_only(
         # numbers under a dead rotor is the exact silent failure Chunk A
         # PR2 added `tracking_error` to prevent, and it would be a poor
         # joke to reintroduce it in the shell.
-        ticker = _GuiThreadTicker(loop, interval_s=args.interval)
+        ticker = _GuiThreadTicker(loop, interval_s=profile.interval_s)
         hub = FeedHub(tracking=loop, tracking_fault=ticker.fault)
         print(hub.describe())
         custom_tab, custom_tab_error = _shell_custom_tab(args)
@@ -1928,7 +2021,7 @@ def _run_shell(
         # --window: a shell always has a Radio tab, so there is always
         # something that would drain the frames.
         spectrum_factory=_spectrum_factory(True, spectrum_config),
-        tracking_interval_s=args.interval,
+        tracking_interval_s=_range_rate_interval(args),
     )
 
     app = QApplication.instance() or QApplication([])

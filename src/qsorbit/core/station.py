@@ -50,6 +50,12 @@ from qsorbit.core.horizon import HorizonMask, HorizonPoint
 from qsorbit.core.rotor import AzimuthWrap, RotorCapabilities
 from qsorbit.core.sdr import MAX_PPM
 from qsorbit.core.tracker import ObserverLocation
+from qsorbit.core.tracking_profile import (
+    DEFAULT_INTERVAL_S,
+    DEFAULT_PROFILE_NAME,
+    CadenceError,
+    TrackingProfile,
+)
 
 #: Name of the config file looked for in the current working directory.
 LOCAL_CONFIG_FILENAME = "qsorbit.toml"
@@ -226,6 +232,105 @@ class PlanningSettings:
 
 
 @dataclass(frozen=True)
+class TrackingSettings:
+    """Which tracking profiles this station has, and which one is active.
+
+    Optional, same reasoning as ``[sdr]`` and ``[rotor.alignment]``:
+    every config file written before Chunk H lacks this section, and
+    "nobody has defined a profile" is the honest identity state rather
+    than an omission. A station with no profiles tracks exactly the way
+    it did before this section existed — see :meth:`active_profile`.
+
+    Args:
+        active: The profile to start on. Must name one of ``profiles``
+            when any are defined.
+        profiles: Every profile this station declares, in the order the
+            config file names them.
+
+    Raises:
+        ValueError: If ``active`` is blank, if two profiles share a
+            name, if ``active`` names a profile that is not defined, or
+            if ``active`` is not the default name when no profiles are
+            defined at all.
+    """
+
+    active: str = DEFAULT_PROFILE_NAME
+    profiles: tuple[TrackingProfile, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.active.strip():
+            raise ValueError("The active tracking profile needs a name.")
+
+        names = [profile.name for profile in self.profiles]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(
+                f"Two tracking profiles share a name: {', '.join(duplicates)}. "
+                "Profile names are how the toggle refers to them, so they must be unique."
+            )
+
+        if not self.profiles:
+            # Not a silent fallback: a station that asks for a profile
+            # it never defined has a typo, and quietly handing it the
+            # synthesized stock profile would hide that.
+            if self.active != DEFAULT_PROFILE_NAME:
+                raise ValueError(
+                    f"The active tracking profile is {self.active!r}, but no "
+                    "[rotor.profiles] section defines any profiles."
+                )
+        elif self.active not in names:
+            raise ValueError(
+                f"The active tracking profile {self.active!r} is not defined. "
+                f"Defined profiles: {', '.join(sorted(names))}."
+            )
+
+    def active_profile(self, acceptance_window_deg: float) -> TrackingProfile:
+        """The profile in force, synthesizing the historical one if needed.
+
+        When no profiles are declared, this returns the cadence QSOrbit
+        used before profiles existed: a deadband equal to the rotor's
+        acceptance window, at the one-second tick. That is a faithful
+        reproduction of the old coupling rather than an endorsement of
+        it — the point of the profile system is that the coupling is now
+        a stated default someone can see and change, instead of a line
+        buried in :class:`~qsorbit.core.pointing.TrackingLoop`.
+
+        Args:
+            acceptance_window_deg: The rotor's declared acceptance
+                window, used only for that synthesized profile.
+        """
+        for profile in self.profiles:
+            if profile.name == self.active:
+                return profile
+        try:
+            return TrackingProfile(
+                name=DEFAULT_PROFILE_NAME,
+                deadband_deg=acceptance_window_deg,
+                interval_s=DEFAULT_INTERVAL_S,
+            )
+        except CadenceError as exc:
+            # The inherited deadband landed on the knife edge. The
+            # hazard is real -- this station has been commanding doubled
+            # steps for as long as it has had this acceptance window --
+            # but the profile's own advice ("move the deadband") names a
+            # key that is not in this operator's config file, because
+            # they never wrote a profile at all. Say where the number
+            # actually came from.
+            raise CadenceError(
+                f"{exc}\n\n"
+                "This station declares no [rotor.profiles], so the deadband was "
+                f"inherited from acceptance_window_deg ({acceptance_window_deg:g}) at "
+                f"the default {DEFAULT_INTERVAL_S:g} s tick — which is why there is no "
+                "deadband_deg in your config file to change. Declare one explicitly:\n\n"
+                "    [rotor.profiles.stock]\n"
+                f"    deadband_deg = {acceptance_window_deg / 2.0:g}\n"
+                f"    interval_s = {DEFAULT_INTERVAL_S:g}\n\n"
+                "Leaving acceptance_window_deg alone: it is a separate measurement, "
+                "and it is not what was wrong here."
+            ) from exc
+
+
+@dataclass(frozen=True)
 class StationConfig:
     """Everything QSOrbit needs to know about one ground station.
 
@@ -255,6 +360,11 @@ class StationConfig:
             station that predates Chunk D has one, and the Plan tab
             reads an unset directory as "not configured yet" rather
             than an error.
+        tracking: This station's named tracking profiles and which one
+            is active. Defaults to a plain :class:`TrackingSettings` (no
+            profiles), so a config file with no ``[rotor.profiles]``
+            section — every station that predates Chunk H — stays valid
+            and tracks exactly as it did before.
         source_path: The file this was loaded from, or ``None`` if it
             was constructed directly. Carried so error messages and
             ``status`` output can say which config is in force — with
@@ -269,7 +379,19 @@ class StationConfig:
     alignment: AlignmentSettings = field(default_factory=AlignmentSettings)
     horizon: HorizonMask = field(default_factory=HorizonMask)
     planning: PlanningSettings = field(default_factory=PlanningSettings)
+    tracking: TrackingSettings = field(default_factory=TrackingSettings)
     source_path: Path | None = None
+
+    @property
+    def tracking_profile(self) -> TrackingProfile:
+        """The tracking profile in force for this station.
+
+        The single place anything should ask what cadence to run:
+        it resolves the active profile against the capability
+        record, so no caller has to know that an undeclared profile
+        falls back to the acceptance window.
+        """
+        return self.tracking.active_profile(self.capabilities.acceptance_window_deg)
 
 
 def user_config_dir() -> Path:
@@ -383,6 +505,10 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
     # before Chunk I lacks this section, and "no offset recorded" is
     # this feature's honest identity state, not an omission.
     alignment_table = _optional_table(rotor_table, "alignment", path=resolved, parent="rotor")
+    # Optional, same reasoning as [rotor.alignment]: every config file
+    # written before Chunk H lacks this section, and a station with no
+    # declared profiles tracks exactly as it did before they existed.
+    profiles_table = _optional_table(rotor_table, "profiles", path=resolved, parent="rotor")
 
     _reject_unknown_keys(
         observer_table,
@@ -392,7 +518,7 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
     )
     _reject_unknown_keys(
         rotor_table,
-        {"port", "baudrate", "timeout_s", "capabilities", "alignment"},
+        {"port", "baudrate", "timeout_s", "capabilities", "alignment", "profile", "profiles"},
         section="rotor",
         path=resolved,
     )
@@ -486,6 +612,11 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
         planning_settings = PlanningSettings(
             tle_dir=_optional_str(planning_table, "tle_dir", "planning", resolved, None),
         )
+        tracking_settings = TrackingSettings(
+            active=_optional_str(rotor_table, "profile", "rotor", resolved, DEFAULT_PROFILE_NAME)
+            or DEFAULT_PROFILE_NAME,
+            profiles=_require_tracking_profiles(profiles_table, resolved),
+        )
         horizon = HorizonMask(points=horizon_points)
     except ValueError as exc:
         # The value objects do the real range checking; re-raised as a
@@ -500,6 +631,7 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
         alignment=alignment_settings,
         horizon=horizon,
         planning=planning_settings,
+        tracking=tracking_settings,
         source_path=resolved,
     )
 
@@ -621,6 +753,45 @@ def _require_azimuth_wrap(table: dict[str, Any], path: Path) -> AzimuthWrap:
             "commanding 380 degrees means a full extra rotation against the cable, "
             "while on one with extended travel it means 20 degrees more travel."
         ) from exc
+
+
+def _require_tracking_profiles(
+    profiles_table: dict[str, Any], path: Path
+) -> tuple[TrackingProfile, ...]:
+    """Build every profile declared under ``[rotor.profiles]``.
+
+    Each key of the table is a profile name and each value is its own
+    table, so ``[rotor.profiles.tracking]`` declares a profile called
+    ``tracking``. Order is preserved from the file, which is what the
+    Rotor tab's toggle will present them in.
+    """
+    profiles: list[TrackingProfile] = []
+    for name, entry in profiles_table.items():
+        section = f"rotor.profiles.{name}"
+        if not isinstance(entry, dict):
+            raise ConfigError(
+                f"[{section}] in {path} must be a table of settings, got {type(entry).__name__}."
+            )
+        _reject_unknown_keys(
+            entry,
+            {"deadband_deg", "interval_s", "arrival_window_deg"},
+            section=section,
+            path=path,
+        )
+        raw_window = entry.get("arrival_window_deg")
+        profiles.append(
+            TrackingProfile(
+                name=name,
+                deadband_deg=_require_float(entry, "deadband_deg", section, path),
+                interval_s=_require_float(entry, "interval_s", section, path),
+                arrival_window_deg=(
+                    None
+                    if raw_window is None
+                    else _as_float(raw_window, "arrival_window_deg", section, path)
+                ),
+            )
+        )
+    return tuple(profiles)
 
 
 def _require_horizon_points(data: dict[str, Any], path: Path) -> tuple[HorizonPoint, ...]:

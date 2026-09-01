@@ -43,6 +43,7 @@ from qsorbit.core.rotor import (
     RotorCapabilities,
 )
 from qsorbit.core.tracker import ObserverLocation, TopocentricState
+from qsorbit.core.tracking_profile import CadenceError
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -148,6 +149,11 @@ def make_loop(
         rotor.read_position.return_value = reported or Position(0.0, 0.0)
 
     clock = FakeClock()
+    # The deadband used to default to the acceptance window inside
+    # TrackingLoop. That coupling is gone (Chunk H), so the helper states
+    # it instead: every test below was written against a 2.5 deg deadband
+    # and still means what it meant, but the number is now visible.
+    kwargs.setdefault("deadband_deg", rotor.capabilities.acceptance_window_deg)
     loop = TrackingLoop(
         StubTarget(states),
         OBSERVER,
@@ -171,20 +177,42 @@ def commanded_positions(rotor: MagicMock) -> list[Position]:
 
 
 class TestConstruction:
-    def test_deadband_defaults_to_the_acceptance_window(self):
-        # Not the firmware dead-zone: below the acceptance window the
-        # rotor already counts itself as arrived, so a command there asks
-        # the motors to chatter over a move QSOrbit calls done.
-        loop, _, _ = make_loop([state(180.0, 45.0)])
-        assert loop.deadband_deg == 2.5
+    def test_deadband_must_be_stated(self):
+        # It used to default to the rotor's acceptance window. Session 32
+        # measured a 0.25 deg deadband beating that 2.5 deg default on
+        # every metric that matters, so how hard to drive the rotor is a
+        # choice, not a fact about where it settles -- and a choice has
+        # to be made rather than inherited.
+        rotor = MagicMock(spec=Rotor)
+        rotor.capabilities = capabilities()
+        with pytest.raises(TypeError, match="deadband_deg"):
+            TrackingLoop(StubTarget([state(180.0, 45.0)]), OBSERVER, rotor)
 
-    def test_deadband_default_follows_the_capability_record(self):
-        loop, _, _ = make_loop([state(180.0, 45.0)], caps=capabilities(acceptance_window_deg=3.0))
-        assert loop.deadband_deg == 3.0
+    def test_deadband_no_longer_follows_the_capability_record(self):
+        # The window moves, the deadband does not: they are separate
+        # concepts now and nothing should re-link them.
+        loop, _, _ = make_loop(
+            [state(180.0, 45.0)],
+            caps=capabilities(acceptance_window_deg=3.0),
+            deadband_deg=0.5,
+        )
+        assert loop.deadband_deg == 0.5
 
-    def test_deadband_can_be_overridden(self):
+    def test_deadband_can_be_set(self):
         loop, _, _ = make_loop([state(180.0, 45.0)], deadband_deg=0.5)
         assert loop.deadband_deg == 0.5
+
+    def test_a_knife_edge_cadence_is_refused(self):
+        # deadband == rate x interval: which tick commands is decided by
+        # timing jitter, and the step silently doubles. Measured on
+        # hardware as 1.15, 2.00, 1.97, 1.95 where 1.0 was configured.
+        with pytest.raises(CadenceError, match="knife edge"):
+            make_loop([state(180.0, 45.0)], deadband_deg=1.0, interval_s=1.0)
+
+    def test_the_validated_cadence_is_not_a_knife_edge(self):
+        # Session 32's set must survive its own guard.
+        loop, _, _ = make_loop([state(180.0, 45.0)], deadband_deg=0.25, interval_s=0.5)
+        assert loop.deadband_deg == 0.25
 
     def test_negative_deadband_is_refused(self):
         with pytest.raises(ValueError, match="deadband_deg"):

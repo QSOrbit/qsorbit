@@ -21,11 +21,13 @@ from qsorbit.core.station import (
     SdrSettings,
     SerialSettings,
     StationConfig,
+    TrackingSettings,
     candidate_config_paths,
     find_config_path,
     load_station_config,
     user_config_dir,
 )
+from qsorbit.core.tracking_profile import CadenceError, TrackingProfile
 
 VALID_CONFIG = """
     [observer]
@@ -719,3 +721,175 @@ class TestHorizonSection:
 
         with pytest.raises(ConfigError, match=r"'horizon' in .* must be an array"):
             load_station_config(path)
+
+
+# ---------------------------------------------------------------------------
+# Tracking profiles (Chunk H)
+# ---------------------------------------------------------------------------
+
+
+PROFILES = """
+    [rotor.profiles.stock]
+    deadband_deg = 2.5
+    interval_s = 1.0
+
+    [rotor.profiles.tracking]
+    deadband_deg = 0.25
+    interval_s = 0.5
+    arrival_window_deg = 1.0
+"""
+
+
+class TestTrackingProfiles:
+    def test_a_config_without_the_section_still_loads(self, tmp_path):
+        # Every config file written before Chunk H lacks it. "Nobody has
+        # declared a profile" is the honest identity state.
+        config = load_station_config(write_config(tmp_path))
+        assert config.tracking == TrackingSettings()
+        assert config.tracking.profiles == ()
+
+    def test_the_synthesized_profile_reproduces_the_old_behaviour(self, tmp_path):
+        # Before this section existed, TrackingLoop defaulted its
+        # deadband to the acceptance window at a one-second tick. A
+        # station that upgrades and changes nothing must track
+        # identically -- the coupling is now stated, not removed.
+        config = load_station_config(write_config(tmp_path))
+        profile = config.tracking_profile
+        assert profile.name == "stock"
+        assert profile.deadband_deg == 2.5
+        assert profile.interval_s == 1.0
+
+    def test_the_synthesized_profile_reports_the_real_step(self, tmp_path):
+        # The behaviour is unchanged; what is new is that the 3.0 deg
+        # step it has always commanded is now visible.
+        config = load_station_config(write_config(tmp_path))
+        assert config.tracking_profile.commanded_step_deg == pytest.approx(3.0)
+
+    def test_declared_profiles_are_parsed_in_file_order(self, tmp_path):
+        config = load_station_config(write_config(tmp_path, VALID_CONFIG + PROFILES))
+        assert [entry.name for entry in config.tracking.profiles] == ["stock", "tracking"]
+
+    def test_the_default_active_profile_is_stock(self, tmp_path):
+        config = load_station_config(write_config(tmp_path, VALID_CONFIG + PROFILES))
+        assert config.tracking.active == "stock"
+        assert config.tracking_profile.deadband_deg == 2.5
+
+    def test_the_profile_key_selects_one(self, tmp_path):
+        text = VALID_CONFIG.replace('port = "COM5"', 'port = "COM5"\n    profile = "tracking"')
+        config = load_station_config(write_config(tmp_path, text + PROFILES))
+        profile = config.tracking_profile
+        assert profile.name == "tracking"
+        assert profile.deadband_deg == 0.25
+        assert profile.interval_s == 0.5
+        assert profile.commanded_step_deg == pytest.approx(0.5)
+
+    def test_an_arrival_window_overrides_the_capability_record(self, tmp_path):
+        # 2.5 deg is a stock-gains fact. The validated set settles at
+        # 0.64-0.81, so a station running it against a 2.5 deg window
+        # would report arrival long before it had arrived.
+        text = VALID_CONFIG.replace('port = "COM5"', 'port = "COM5"\n    profile = "tracking"')
+        config = load_station_config(write_config(tmp_path, text + PROFILES))
+        window = config.tracking_profile.window_against(config.capabilities.acceptance_window_deg)
+        assert window == 1.0
+
+    def test_a_profile_without_an_arrival_window_uses_the_record(self, tmp_path):
+        config = load_station_config(write_config(tmp_path, VALID_CONFIG + PROFILES))
+        window = config.tracking_profile.window_against(config.capabilities.acceptance_window_deg)
+        assert window == 2.5
+
+    def test_a_misspelled_active_profile_is_refused(self, tmp_path):
+        text = VALID_CONFIG.replace('port = "COM5"', 'port = "COM5"\n    profile = "traking"')
+        with pytest.raises(ConfigError, match="not defined"):
+            load_station_config(write_config(tmp_path, text + PROFILES))
+
+    def test_naming_a_profile_without_declaring_any_is_refused(self, tmp_path):
+        # Not a silent fallback to stock: that would hide the typo.
+        text = VALID_CONFIG.replace('port = "COM5"', 'port = "COM5"\n    profile = "tracking"')
+        with pytest.raises(ConfigError, match="no \\[rotor.profiles\\] section"):
+            load_station_config(write_config(tmp_path, text))
+
+    def test_a_knife_edge_profile_is_refused_with_the_file_name(self, tmp_path):
+        text = (
+            VALID_CONFIG
+            + """
+    [rotor.profiles.stock]
+    deadband_deg = 1.0
+    interval_s = 1.0
+"""
+        )
+        path = write_config(tmp_path, text)
+        with pytest.raises(ConfigError) as exc:
+            load_station_config(path)
+        assert "knife edge" in str(exc.value)
+        assert str(path) in str(exc.value)
+
+    def test_an_unknown_key_in_a_profile_names_the_file_and_key(self, tmp_path):
+        # Forward compatibility with the gain registers: a config that
+        # declares gains before they are implemented fails loudly rather
+        # than silently doing nothing.
+        text = (
+            VALID_CONFIG
+            + """
+    [rotor.profiles.stock]
+    deadband_deg = 2.5
+    interval_s = 1.0
+    gains = 3
+"""
+        )
+        with pytest.raises(ConfigError, match="gains"):
+            load_station_config(write_config(tmp_path, text))
+
+    @pytest.mark.parametrize("missing", ["deadband_deg", "interval_s"])
+    def test_a_profile_missing_a_required_key_is_refused(self, tmp_path, missing):
+        text = VALID_CONFIG + PROFILES
+        text = "\n".join(line for line in text.splitlines() if not line.strip().startswith(missing))
+        with pytest.raises(ConfigError, match=missing):
+            load_station_config(write_config(tmp_path, text))
+
+    def test_a_profile_that_is_not_a_table_is_refused(self, tmp_path):
+        text = (
+            VALID_CONFIG
+            + """
+    [rotor.profiles]
+    stock = 2.5
+"""
+        )
+        with pytest.raises(ConfigError, match="must be a table"):
+            load_station_config(write_config(tmp_path, text))
+
+
+class TestTrackingSettings:
+    def test_duplicate_profile_names_are_refused(self):
+        # Unreachable through TOML, which rejects a repeated table, but
+        # the value object is constructible directly and the toggle
+        # refers to profiles by name.
+        duplicate = TrackingProfile(name="stock", deadband_deg=2.5, interval_s=1.0)
+        with pytest.raises(ValueError, match="share a name"):
+            TrackingSettings(profiles=(duplicate, duplicate))
+
+    def test_a_blank_active_name_is_refused(self):
+        with pytest.raises(ValueError, match="needs a name"):
+            TrackingSettings(active="  ")
+
+    def test_the_synthesized_profile_follows_the_window_it_is_given(self):
+        assert TrackingSettings().active_profile(2.5).deadband_deg == 2.5
+        assert TrackingSettings().active_profile(1.5).deadband_deg == 1.5
+
+    def test_an_inherited_knife_edge_says_where_the_number_came_from(self):
+        # A station whose acceptance window is a whole multiple of the
+        # tick has been commanding doubled steps all along. Refusing is
+        # right, but the profile's own advice names a key this operator
+        # does not have, because they never wrote a profile.
+        with pytest.raises(CadenceError) as exc:
+            TrackingSettings().active_profile(3.0)
+        message = str(exc.value)
+        assert "acceptance_window_deg" in message
+        assert "[rotor.profiles.stock]" in message
+        assert "deadband_deg = 1.5" in message
+
+    def test_the_inherited_knife_edge_does_not_blame_the_window(self):
+        # acceptance_window_deg is a separate measurement and changing
+        # it would be the wrong fix.
+        with pytest.raises(CadenceError) as exc:
+            TrackingSettings().active_profile(2.0)
+        assert "not what was wrong" in str(exc.value)
