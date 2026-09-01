@@ -129,6 +129,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - This PR closes out Chunk D: the target picker now answers "what should I point at right now" from live pass prediction filtered through the real horizon and the curated catalogue, says how stale its data is, and the map shows tracks and footprints for exactly what the picker currently has selected.
 
 
+### Added
+
+- Tracking profiles: a named `[rotor.profiles.NAME]` section in station config saying how hard this station drives its rotor -- how far the target must move before a new position is commanded, and how often to look. `--rotor-profile` picks one for a single run. A station with no profiles section tracks exactly as it did before, so nothing needs changing to upgrade.
+- QSOrbit now tells you the step size your configuration will actually command, which is not the deadband you set. The loop can only command in whole ticks, so a 2.5 degree deadband at a one-second tick commands **3.0 degree steps** against a satellite moving a degree a second -- measured off the controller's own command timestamps on the bench, and previously invisible from anywhere in the application. `qsorbit status` prints it, and so does the start of a tracking run.
+- A profile can override the acceptance window while it is active. Where the rotor settles is a property of the gains it is running, not of the mechanism: the shipped 2.5 degrees is a stock-gains figure, and the bench-validated tracking set settles inside a degree. A station running tight gains against a loose window would report the antenna as arrived long before it was.
+- The shipped `config.example.toml` now carries both profiles -- the stock behaviour stated explicitly rather than inherited, and the bench-validated set ready to switch to.
+
+### Changed
+
+- **The tracking deadband is no longer the acceptance window.** They were the same value, which hid the fact that the deadband was never configurable at all -- nothing in the application ever set it. They are separate now: the window says where the rotor settles, the deadband says how often you bother telling it to move. On this station's hardware the validated 0.25 degree deadband at a half-second tick took mean azimuth lag from 3.57 degrees to 0.64 and made the tracking five to seventeen times more repeatable, which is not a difference a single value doing both jobs could ever have expressed.
+- `--interval` now defers to the active profile instead of always defaulting to one second. Passing it explicitly still overrides, for a single run.
+
+### Fixed
+
+- A tracking cadence where the deadband lands on a whole multiple of the per-tick movement is now refused rather than silently doubling every step. When the two are equal, whether a command fires on this tick or the next is decided by timing jitter rather than by geometry: a run configured for 1.0 degree steps was measured producing 1.15, 2.00, 1.97, 1.95. Nothing warned, and the doubled step is exactly the oversized lunge that makes the antenna hop.
+
+  **This can refuse a config file that loaded yesterday.** If your `acceptance_window_deg` is a whole number of degrees, the deadband it was silently supplying sat on that knife edge and your station has been commanding doubled steps for as long as it has had that value. The error says so, and gives you the two lines to add. Your acceptance window is a separate measurement and is not what needs changing.
+
 <!--
 When adding entries, group them under these headings as needed:
 

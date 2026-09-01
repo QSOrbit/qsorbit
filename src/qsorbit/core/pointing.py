@@ -56,6 +56,7 @@ from enum import Enum
 from qsorbit.core.geometry import AzEl
 from qsorbit.core.rotor import Position, Rotor, format_set_position
 from qsorbit.core.tracker import ObserverLocation, Target
+from qsorbit.core.tracking_profile import DEFAULT_INTERVAL_S, check_cadence
 
 #: How often :meth:`TrackingLoop.run` samples the target, in seconds.
 #:
@@ -64,7 +65,7 @@ from qsorbit.core.tracker import ObserverLocation, Target
 #: sampling alone below the rotor's own steady-state shortfall. It is
 #: also fast enough for live Doppler correction to read range rate off
 #: the same samples, and it matches the rate a readout display polls at.
-DEFAULT_TICK_INTERVAL_S = 1.0
+DEFAULT_TICK_INTERVAL_S = DEFAULT_INTERVAL_S
 
 #: The controller firmware's own position dead-zone, in degrees.
 #:
@@ -361,17 +362,35 @@ class TrackingLoop:
     pass. Each tick samples the target, reads the rotor, decides whether
     the change is worth a command, and sends one if it is.
 
-    **The deadband is the acceptance window, not the firmware's
-    dead-zone.** The firmware stops driving an axis below
-    :data:`FIRMWARE_DEADZONE_DEG` (0.2°), so a smaller software deadband
-    cannot change what the hardware does. But the real floor is higher:
-    with stock gains an axis settles one to two degrees short of target
-    as a matter of course, and
-    :attr:`~qsorbit.core.rotor.RotorCapabilities.acceptance_window_deg`
-    is the distance within which the rotor is already considered to have
-    arrived. Commanding a change smaller than that asks the motors to
-    chatter over a move QSOrbit itself would call arrived, so the
-    acceptance window is the default deadband.
+    **The deadband is cadence policy, not the acceptance window.** It
+    used to default to
+    :attr:`~qsorbit.core.rotor.RotorCapabilities.acceptance_window_deg`,
+    on the argument that commanding a change smaller than the distance
+    QSOrbit already calls "arrived" only asks the motors to chatter over
+    a move it would not call a move. That argument was sound for stock
+    gains and wrong as a *coupling*: Session 32 measured a 0.25° deadband
+    at a 0.5 s tick beating the shipped 2.5° on every metric that
+    matters, five of six of them without overlap. How far the target must
+    move before re-commanding is a choice about how hard to drive the
+    rotor; where the rotor settles is a fact about its gains. The two are
+    separate now, and the deadband is stated rather than inherited — see
+    :mod:`qsorbit.core.tracking_profile`.
+
+    The firmware's :data:`FIRMWARE_DEADZONE_DEG` (0.2°) is still a floor
+    in the other direction: below it the controller stops driving the
+    axis at all, so a smaller software deadband cannot change what the
+    hardware does.
+
+    **The commanded step is not the deadband.** The loop can only command
+    in whole ticks, so the real step is ``rate x interval`` rounded up to
+    the deadband — 3.0° for the shipped 2.5° at a 1 s tick against a 1°/s
+    target. When the deadband lands on a whole multiple of that per-tick
+    movement, timing jitter rather than geometry decides which tick
+    commands and the step silently doubles;
+    :func:`~qsorbit.core.tracking_profile.check_cadence` refuses that
+    configuration here as well as in station config, so a cadence
+    arriving from ``--interval`` cannot slip past the check the config
+    file would have applied.
 
     The comparison is against the **last commanded position**, not
     against what the rotor reports. Comparing against the reading would
@@ -419,10 +438,12 @@ class TrackingLoop:
         rotor: A connected rotor. The loop neither connects nor closes
             it; whoever owns the connection owns its lifecycle.
         interval_s: Seconds between ticks in :meth:`run`.
-        deadband_deg: Minimum change, in degrees on either axis, before a
-            new position is sent. Defaults to the rotor's declared
-            acceptance window. Values below
-            :data:`FIRMWARE_DEADZONE_DEG` are accepted but pointless.
+        deadband_deg: Minimum change, in degrees on either axis, before
+            a new position is sent. Required: it used to default to the
+            rotor's acceptance window, and that coupling is what this
+            parameter exists to break. Zero commands on every tick.
+            Values below :data:`FIRMWARE_DEADZONE_DEG` are accepted but
+            pointless.
         alignment_offset: The station's measured alignment correction,
             applied to every :func:`sky_to_rotor` conversion this loop
             makes. Defaults to :data:`IDENTITY_ALIGNMENT_OFFSET`, i.e.
@@ -437,6 +458,8 @@ class TrackingLoop:
     Raises:
         ValueError: If ``interval_s`` is not positive, or if
             ``deadband_deg`` is negative.
+        CadenceError: If ``deadband_deg`` and ``interval_s`` land on the
+            knife edge described above.
     """
 
     def __init__(
@@ -446,7 +469,7 @@ class TrackingLoop:
         rotor: Rotor,
         *,
         interval_s: float = DEFAULT_TICK_INTERVAL_S,
-        deadband_deg: float | None = None,
+        deadband_deg: float,
         alignment_offset: AlignmentOffset = IDENTITY_ALIGNMENT_OFFSET,
         now: Callable[[], datetime] = _utc_now,
         sleep: Callable[[float], None] = time.sleep,
@@ -454,10 +477,9 @@ class TrackingLoop:
     ) -> None:
         if interval_s <= 0.0:
             raise ValueError(f"interval_s must be positive, got {interval_s}.")
-        if deadband_deg is None:
-            deadband_deg = rotor.capabilities.acceptance_window_deg
         if deadband_deg < 0.0:
             raise ValueError(f"deadband_deg must not be negative, got {deadband_deg}.")
+        check_cadence(deadband_deg, interval_s)
 
         self._target = target
         self._observer = observer

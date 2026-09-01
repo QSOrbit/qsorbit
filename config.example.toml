@@ -50,6 +50,10 @@ baudrate = 19200
 # the gap between writing a command and reading its reply.
 timeout_s = 1.0
 
+# Optional. Which [rotor.profiles.NAME] table below to track with.
+# Defaults to "stock". Override for one run with --rotor-profile.
+profile = "stock"
+
 
 # ---------------------------------------------------------------------
 # What your rotator may safely be told to do
@@ -131,6 +135,62 @@ rs485_turnaround_s = 0.15
 # and warns on a mismatch. It is never used to infer any of the values
 # above.
 firmware_version = "SatNOGS-v2.2.1"
+
+
+# ---------------------------------------------------------------------
+# Tracking profiles
+# ---------------------------------------------------------------------
+#
+# This whole section is optional. Without it QSOrbit tracks exactly as
+# it always has: a deadband equal to acceptance_window_deg above, at a
+# one-second tick.
+#
+# A profile is how hard this station drives its rotor. Two numbers:
+#
+#   deadband_deg   How far the target must move before a new position
+#                  is commanded. This is NOT the acceptance window.
+#                  The window says where the rotor settles; the
+#                  deadband says how often you bother telling it to
+#                  move. They used to be the same value, and that
+#                  coupling hid the fact that the deadband was never
+#                  configurable at all.
+#
+#   interval_s     Seconds between tracking ticks.
+#
+# THE STEP YOU GET IS NOT THE DEADBAND. The loop can only command in
+# whole ticks, so the real step is (rate x interval_s) rounded up to
+# the deadband. Against a satellite moving 1 deg/s near zenith, a
+# 2.5 deg deadband at a 1 s tick commands 3.0 deg steps — measured on
+# hardware, not calculated after the fact. `qsorbit status` prints the
+# step this configuration will actually command.
+#
+# AND THE KNIFE EDGE: if deadband_deg lands on a whole multiple of
+# (rate x interval_s), whether a command fires on this tick or the next
+# is decided by timing jitter rather than geometry, and the step
+# silently doubles. A run configured for 1.0 deg steps was measured
+# producing 1.15, 2.00, 1.97, 1.95. QSOrbit refuses that configuration
+# rather than letting it be written by accident.
+
+# The shipped behaviour, stated explicitly rather than inherited.
+[rotor.profiles.stock]
+deadband_deg = 2.5
+interval_s = 1.0
+
+# The bench-validated set: 0.5 deg steps at a half-second tick. On this
+# station it took azimuth mean lag from 3.57 to 0.64 degrees and made
+# the tracking 5-17x more repeatable, and it is markedly more robust to
+# wind. It wants the matching controller gains to be worth running —
+# without them this is cadence alone, which flattens out at the rotor's
+# stiction floor.
+#
+# arrival_window_deg is optional and overrides acceptance_window_deg
+# while this profile is active, because where the rotor settles is a
+# property of the gains it is running: 2.5 deg is a stock-gains fact,
+# and this set settles inside a degree.
+[rotor.profiles.tracking]
+deadband_deg = 0.25
+interval_s = 0.5
+arrival_window_deg = 1.0
 
 
 # ---------------------------------------------------------------------

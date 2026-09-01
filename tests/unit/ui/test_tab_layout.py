@@ -125,6 +125,7 @@ def ticked_loop(tmp_path) -> TrackingLoop:
         ObserverLocation(latitude=43.0, longitude=-79.0),
         rotor,
         interval_s=1.0,
+        deadband_deg=2.5,
         alignment_offset=AlignmentOffset(),
     )
     loop.tick()

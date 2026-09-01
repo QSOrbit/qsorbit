@@ -8,6 +8,7 @@ Nothing here opens a serial port, and the tests that don't use --send
 assert that no rotor is built at all.
 """
 
+import argparse
 import json
 import signal
 import textwrap
@@ -21,6 +22,7 @@ from qsorbit.__main__ import (
     DEFAULT_TUNING_OFFSET_KHZ,
     _parse_audio_device,
     _quit_on_sigint,
+    _range_rate_interval,
     _spectrum_factory,
     _squelch_status_line,
     build_parser,
@@ -29,6 +31,7 @@ from qsorbit.__main__ import (
 from qsorbit.core.dsp.spectrum import SpectrumConfig
 from qsorbit.core.dsp.spectrum_stream import SpectrumStream
 from qsorbit.core.profiles import CATALOG_MANIFEST_FILENAME
+from qsorbit.core.receive import DEFAULT_TRACKING_INTERVAL_S
 from qsorbit.core.rotor import Arrival, HomingError, Position, Rotor, RotorErrorCode, RotorStatus
 from qsorbit.core.sdr import AppliedSettings, DeviceError, DeviceInfo, TunerType
 from qsorbit.ui.theme import DEFAULT_THEME_NAME, DEFAULT_THEMES_DIR, discover_themes
@@ -812,6 +815,65 @@ class TestStatus:
         assert "COM5" in out
         assert str(config_path) in out
         assert "Error:     none" in out
+
+    def test_reports_the_step_the_cadence_will_actually_command(self, config_path, factory, capsys):
+        # The deadband is 2.5 and the step is 3.0, because the loop can
+        # only command in whole ticks. Measured on hardware in Session
+        # 32; invisible from anywhere in the application until now.
+        run(["status"], config_path, factory)
+
+        out = capsys.readouterr().out
+        assert "Cadence:" in out
+        assert "2.5 deg deadband" in out
+        assert "3 deg steps" in out
+
+    def test_reports_when_no_profiles_are_declared(self, config_path, factory, capsys):
+        run(["status"], config_path, factory)
+
+        out = capsys.readouterr().out
+        assert "Profiles:  none declared" in out
+        assert "[rotor.profiles]" in out
+
+    def test_reports_declared_profiles_and_the_active_one(self, tmp_path, factory, capsys):
+        path = tmp_path / "profiled.toml"
+        path.write_text(
+            textwrap.dedent(CONFIG).replace('port = "COM5"', 'port = "COM5"\nprofile = "tracking"')
+            + textwrap.dedent(
+                """
+                [rotor.profiles.stock]
+                deadband_deg = 2.5
+                interval_s = 1.0
+
+                [rotor.profiles.tracking]
+                deadband_deg = 0.25
+                interval_s = 0.5
+                arrival_window_deg = 1.0
+                """
+            ),
+            encoding="utf-8",
+        )
+        run(["status"], path, factory)
+
+        out = capsys.readouterr().out
+        assert "Profiles:  stock, tracking" in out
+        assert "tracking profile" in out
+        assert "0.5 deg steps" in out
+
+    def test_a_rotor_profile_does_not_move_the_doppler_sampler(self):
+        # The two ticks look interchangeable and were the same value
+        # before profiles existed. They are different concepts: the
+        # profile drives the rotor, this paces the range-rate loop on
+        # the receive path, which runs with no rotor attached at all.
+        # A profile moving it would put an unmeasured variable inside
+        # Chunk E's combined-versus-single comparison.
+        args = argparse.Namespace(interval=None, rotor_profile="tracking")
+        assert _range_rate_interval(args) == DEFAULT_TRACKING_INTERVAL_S
+
+    def test_an_explicit_interval_still_moves_the_doppler_sampler(self):
+        # An operator who asked for a specific tick asked for exactly
+        # that, on both.
+        args = argparse.Namespace(interval=0.25, rotor_profile=None)
+        assert _range_rate_interval(args) == 0.25
 
     def test_reports_no_alignment_recorded_by_default(self, config_path, factory, capsys):
         run(["status"], config_path, factory)
