@@ -1373,10 +1373,14 @@ def _report_stall(axes: tuple[str, ...]) -> None:
     """
     which = " and ".join(axes) if axes else "an axis"
     verb = "are" if len(axes) > 1 else "is"
+    # ASCII only. This reaches a Windows console, where the code page
+    # turned an em dash into a stray "u" on the bench -- cosmetic, but
+    # the one line an operator reads while deciding whether to walk out
+    # to the rotor should not look like it has been corrupted.
     print(
         f"STALL:     {which} {verb} not following the commanded position. The "
         "setpoint is frozen, so the antenna is not being driven further from "
-        "where it actually is. Check for an obstruction or a cable snag — "
+        "where it actually is. Check for an obstruction or a cable snag - "
         "tracking resumes on its own once the axis moves."
     )
 
