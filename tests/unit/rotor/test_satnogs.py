@@ -4,15 +4,19 @@ import pytest
 
 from qsorbit.core.rotor import (
     Command,
+    GainRegister,
     Position,
     ProtocolError,
     RotorErrorCode,
     format_get_error,
+    format_get_gain,
     format_get_position,
     format_get_version,
+    format_set_gain,
     format_set_position,
     format_stop,
     parse_error,
+    parse_gain,
     parse_position,
     parse_version,
 )
@@ -223,3 +227,96 @@ class TestRotorErrorCode:
         # Pinned because it is the code with an operational consequence:
         # nothing sent over serial clears it, only a power cycle.
         assert RotorErrorCode.HOMING_ERROR.value == 4
+
+
+# ---------------------------------------------------------------------------
+# Gain registers (Chunk H PR2b)
+# ---------------------------------------------------------------------------
+
+
+class TestGainCommands:
+    """The read and write forms are not symmetric, and that is upstream.
+
+    ``CW`` tests ``buffer[2]`` and ``CR`` tests ``buffer[3]``, so the
+    write takes no space and the read requires one. ``CR1`` parses as
+    nothing and the controller answers nothing at all — which reads as a
+    dead link rather than a malformed command, and cost bench time once.
+    """
+
+    def test_a_write_has_no_space(self):
+        assert bytes(format_set_gain(GainRegister.AZIMUTH_KP, 8.0)) == b"CW1,8.00\n"
+
+    def test_a_read_has_a_space(self):
+        assert bytes(format_get_gain(GainRegister.AZIMUTH_KP)) == b"CR 1\n"
+
+    def test_a_write_expects_no_reply(self):
+        # The firmware answers a gain write with nothing. A caller that
+        # read a line here would shift every later reply by one.
+        assert format_set_gain(GainRegister.AZIMUTH_KI, 1.0).expects_reply is False
+
+    def test_a_read_expects_a_reply(self):
+        assert format_get_gain(GainRegister.AZIMUTH_KI).expects_reply is True
+
+    def test_values_carry_two_decimals(self):
+        # Matching what the firmware parses and what CR reports back, so
+        # a written value and its read-back are comparable without
+        # worrying about how either was rounded.
+        assert bytes(format_set_gain(GainRegister.ELEVATION_KD, 0.3)) == b"CW6,0.30\n"
+        assert bytes(format_set_gain(GainRegister.AZIMUTH_KI, 1.0)) == b"CW2,1.00\n"
+
+    @pytest.mark.parametrize(
+        ("register", "index"),
+        [
+            (GainRegister.AZIMUTH_KP, 1),
+            (GainRegister.AZIMUTH_KI, 2),
+            (GainRegister.AZIMUTH_KD, 3),
+            (GainRegister.ELEVATION_KP, 4),
+            (GainRegister.ELEVATION_KI, 5),
+            (GainRegister.ELEVATION_KD, 6),
+        ],
+    )
+    def test_the_register_numbering(self, register, index):
+        # 7 and 8 are park positions and 9 is the read-only control
+        # mode. Getting an index wrong writes one of those.
+        assert int(register) == index
+
+    def test_the_dangerous_neighbours_are_not_reachable(self):
+        # There is deliberately no enum member for 7, 8 or 9.
+        assert max(int(r) for r in GainRegister) == 6
+
+
+class TestParseGain:
+    def test_parses_a_reply(self):
+        assert parse_gain(b"2,1.00\n", GainRegister.AZIMUTH_KI) == 1.0
+
+    def test_parses_stock_values(self):
+        assert parse_gain(b"1,8.00\n", GainRegister.AZIMUTH_KP) == 8.0
+        assert parse_gain(b"6,0.30\n", GainRegister.ELEVATION_KD) == 0.3
+
+    def test_tolerates_surrounding_whitespace(self):
+        assert parse_gain(b"  2,1.00  \n", GainRegister.AZIMUTH_KI) == 1.0
+
+    def test_a_reply_for_another_register_is_refused(self):
+        # Silently accepting it would attribute a Kd figure to a Ki slot
+        # with nothing on screen to show for it, and every later read
+        # would be off by the same shift.
+        with pytest.raises(ProtocolError, match="answered for register"):
+            parse_gain(b"3,0.50\n", GainRegister.AZIMUTH_KI)
+
+    def test_the_mismatch_message_names_both_registers(self):
+        with pytest.raises(ProtocolError) as exc:
+            parse_gain(b"3,0.50\n", GainRegister.AZIMUTH_KI)
+        assert "AZIMUTH_KI" in str(exc.value)
+        assert "register 3" in str(exc.value)
+
+    @pytest.mark.parametrize(
+        "line", [b"\n", b"CR 2\n", b"2\n", b"2,\n", b"two,1.00\n", b"AZ1.0 EL2.0\n"]
+    )
+    def test_unparseable_replies_are_refused(self, line):
+        with pytest.raises(ProtocolError, match="Could not parse gain reply"):
+            parse_gain(line, GainRegister.AZIMUTH_KI)
+
+    def test_a_negative_gain_parses(self):
+        # Not a value QSOrbit would write, but the firmware would report
+        # one and refusing to parse it would hide the fact.
+        assert parse_gain(b"3,-0.50\n", GainRegister.AZIMUTH_KD) == -0.5

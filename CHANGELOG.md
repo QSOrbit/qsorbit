@@ -159,6 +159,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The check asks how far an axis has **fallen behind** its target, rather than how far it has moved. A first attempt compared movement against the slack figure directly, and a live pass caught it reporting a stuck elevation axis 53 seconds before anything was touched, on a rotator that was tracking perfectly: at the shipped update rate the target position moves in roughly three-degree jumps, which is the same size as the slack, so a normally-lagging axis could satisfy both halves of the test at once. Measuring the shortfall instead removes it -- steady tracking carries a constant lag rather than a growing one, however long the pass runs.
 - The watch period is now stated as a length of time rather than a number of tracking updates, so it is the same amount of evidence however often the rotor is being commanded. Previously the same setting meant six seconds of watching at one update per second and only three at the faster bench-validated rate -- half the evidence for what looked like the same configuration.
 
+### Added
+
+- QSOrbit can now read and write the rotator's PID gain registers. Nothing uses them yet -- this is the protocol layer that a tracking profile will sit on -- but the awkward part is done: the controller's read and write forms disagree about spacing (`CW1,8.00` to write, `CR 1` to read), an upstream quirk where the read form silently answers nothing if you get it wrong, and that asymmetry is now impossible to get wrong from application code. The six gain registers are named rather than numbered, so a slip cannot write to the park positions or the read-only control mode sitting next to them.
+- Writing gains verifies every register by reading it back, and refuses to continue if any disagrees. There is no memory behind these settings -- a power cycle restores the controller's built-in values and any tuning has to be re-sent each time it connects -- so a write that quietly failed would leave the rotator running settings nobody chose while the application believed otherwise. Every measurement taken afterwards would then be filed under the wrong configuration, which is worse than not adjusting anything at all.
+- A gain read that comes back for the wrong register is refused rather than accepted, since that means replies have slipped out of step with commands and every later reading would be attributed to the wrong setting.
+
 <!--
 When adding entries, group them under these headings as needed:
 

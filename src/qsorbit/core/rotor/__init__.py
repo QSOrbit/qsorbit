@@ -13,6 +13,7 @@ implements a subset with SatNOGS-specific extensions. See
 from qsorbit.core.rotor.capabilities import AzimuthWrap, RotorCapabilities
 from qsorbit.core.rotor.controller import Arrival, Rotor, RotorStatus
 from qsorbit.core.rotor.exceptions import (
+    GainVerificationError,
     HomingError,
     PositionLimitError,
     ProtocolError,
@@ -23,13 +24,17 @@ from qsorbit.core.rotor.exceptions import (
 from qsorbit.core.rotor.position import MAX_AXIS_DEGREES, Position
 from qsorbit.core.rotor.satnogs import (
     Command,
+    GainRegister,
     RotorErrorCode,
     format_get_error,
+    format_get_gain,
     format_get_position,
     format_get_version,
+    format_set_gain,
     format_set_position,
     format_stop,
     parse_error,
+    parse_gain,
     parse_position,
     parse_version,
 )
@@ -40,6 +45,8 @@ __all__ = [
     "Arrival",
     "AzimuthWrap",
     "Command",
+    "GainRegister",
+    "GainVerificationError",
     "HomingError",
     "Position",
     "PositionLimitError",
@@ -53,11 +60,14 @@ __all__ = [
     "SerialPort",
     "SerialTimeoutError",
     "format_get_error",
+    "format_get_gain",
     "format_get_position",
     "format_get_version",
+    "format_set_gain",
     "format_set_position",
     "format_stop",
     "parse_error",
+    "parse_gain",
     "parse_position",
     "parse_version",
 ]

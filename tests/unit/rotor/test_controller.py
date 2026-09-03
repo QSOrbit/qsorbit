@@ -11,6 +11,8 @@ import pytest
 from qsorbit.core.rotor import (
     Arrival,
     AzimuthWrap,
+    GainRegister,
+    GainVerificationError,
     HomingError,
     Position,
     PositionLimitError,
@@ -21,6 +23,7 @@ from qsorbit.core.rotor import (
     SerialConnectionError,
     SerialTimeoutError,
 )
+from qsorbit.core.rotor.controller import DEFAULT_GAIN_SETTLE_S
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -466,3 +469,138 @@ class TestContextManager:
         rotor.connect()
         rotor.close()
         rotor.close()
+
+
+# ---------------------------------------------------------------------------
+# Gain registers (Chunk H PR2b)
+# ---------------------------------------------------------------------------
+
+
+class TestReadGain:
+    def test_reads_a_register(self):
+        rotor, port, _ = make_rotor([*HEALTHY_CONNECT, b"2,1.00\n"])
+        rotor.connect()
+        assert rotor.read_gain(GainRegister.AZIMUTH_KI) == 1.0
+        assert port.writes[-1] == b"CR 2\n"
+
+    def test_a_reply_for_another_register_raises(self):
+        rotor, _, _ = make_rotor([*HEALTHY_CONNECT, b"3,0.50\n"])
+        rotor.connect()
+        with pytest.raises(ProtocolError, match="answered for register"):
+            rotor.read_gain(GainRegister.AZIMUTH_KI)
+
+    def test_silence_times_out(self):
+        rotor, _, _ = make_rotor([*HEALTHY_CONNECT, SILENCE])
+        rotor.connect()
+        with pytest.raises(SerialTimeoutError):
+            rotor.read_gain(GainRegister.AZIMUTH_KI)
+
+
+class TestWriteGain:
+    def test_writes_the_register(self):
+        rotor, port, _ = make_rotor(HEALTHY_CONNECT)
+        rotor.connect()
+        rotor.write_gain(GainRegister.AZIMUTH_KI, 1.0)
+        assert port.writes[-1] == b"CW2,1.00\n"
+
+    def test_reads_nothing_back(self):
+        # The firmware answers a write with nothing. Reading here would
+        # shift every later reply by one message.
+        rotor, port, _ = make_rotor([*HEALTHY_CONNECT, b"2,1.00\n"])
+        rotor.connect()
+        rotor.write_gain(GainRegister.AZIMUTH_KI, 1.0)
+        # The scripted reply is still queued, unconsumed.
+        assert port.replies == [b"2,1.00\n"]
+
+
+class TestPushGains:
+    """Every register is verified, not a sample.
+
+    Gains are RAM-only and re-pushed at every connect, so a write that
+    silently fails leaves the rotor on compiled defaults while the
+    application believes it is running a tuned set -- and every metric
+    measured afterwards is attributed to the wrong configuration.
+    """
+
+    TRACKING = {GainRegister.AZIMUTH_KI: 1.0, GainRegister.ELEVATION_KI: 1.0}
+
+    def test_writes_then_reads_every_register(self):
+        rotor, port, _ = make_rotor([*HEALTHY_CONNECT, b"2,1.00\n", b"5,1.00\n"])
+        rotor.connect()
+        result = rotor.push_gains(self.TRACKING)
+
+        assert result == {GainRegister.AZIMUTH_KI: 1.0, GainRegister.ELEVATION_KI: 1.0}
+        assert port.writes[-4:] == [b"CW2,1.00\n", b"CW5,1.00\n", b"CR 2\n", b"CR 5\n"]
+
+    def test_writes_all_before_reading_any(self):
+        # One settle wait for the whole set rather than one per register.
+        rotor, port, _ = make_rotor([*HEALTHY_CONNECT, b"2,1.00\n", b"5,1.00\n"])
+        rotor.connect()
+        rotor.push_gains(self.TRACKING)
+
+        written = [w for w in port.writes if w.startswith(b"CW")]
+        read = [w for w in port.writes if w.startswith(b"CR")]
+        assert port.writes.index(written[-1]) < port.writes.index(read[0])
+
+    def test_waits_for_the_firmware_to_apply_the_write(self):
+        # SetTunings() runs on the control loop's 100 ms gate, so an
+        # immediate read-back would race a value that was about to be
+        # correct and report a mismatch that is not one.
+        # The turnaround is deliberately set to something other than
+        # the settle, because every exchange sleeps the turnaround --
+        # with both at 0.15 this assertion would pass whether or not the
+        # settle happened at all.
+        rotor, _, clock = make_rotor(
+            [*HEALTHY_CONNECT, b"2,1.00\n", b"5,1.00\n"],
+            caps=capabilities(rs485_turnaround_s=0.05),
+        )
+        rotor.connect()
+        before = list(clock.sleeps)
+        rotor.push_gains(self.TRACKING)
+        added = clock.sleeps[len(before) :]
+
+        assert DEFAULT_GAIN_SETTLE_S in added
+        assert DEFAULT_GAIN_SETTLE_S not in before
+        # It has to clear the firmware's 100 ms control-loop gate.
+        assert DEFAULT_GAIN_SETTLE_S > 0.1
+
+    def test_a_register_that_did_not_take_raises(self):
+        rotor, _, _ = make_rotor([*HEALTHY_CONNECT, b"2,0.00\n", b"5,1.00\n"])
+        rotor.connect()
+        with pytest.raises(GainVerificationError, match="AZIMUTH_KI asked 1.00 got 0.00"):
+            rotor.push_gains(self.TRACKING)
+
+    def test_the_message_names_every_register_that_disagreed(self):
+        # One wrong register and six wrong registers are different
+        # faults: one is a dropped byte, six is a controller that took
+        # nothing at all.
+        rotor, _, _ = make_rotor([*HEALTHY_CONNECT, b"2,0.00\n", b"5,0.00\n"])
+        rotor.connect()
+        with pytest.raises(GainVerificationError) as exc:
+            rotor.push_gains(self.TRACKING)
+        message = str(exc.value)
+        assert "2 of 2" in message
+        assert "AZIMUTH_KI" in message
+        assert "ELEVATION_KI" in message
+
+    def test_rounding_at_the_last_digit_is_not_a_mismatch(self):
+        # Both directions carry two decimals, so anything inside half of
+        # the last digit is the format, not a disagreement.
+        rotor, _, _ = make_rotor([*HEALTHY_CONNECT, b"2,1.00\n", b"5,1.00\n"])
+        rotor.connect()
+        rotor.push_gains({GainRegister.AZIMUTH_KI: 1.001, GainRegister.ELEVATION_KI: 0.999})
+
+    def test_an_empty_set_writes_nothing_and_does_not_wait(self):
+        # The `stock` profile pushes nothing at all, and must not cost a
+        # settle delay on every connect to do it.
+        rotor, port, clock = make_rotor(HEALTHY_CONNECT)
+        rotor.connect()
+        writes_before = len(port.writes)
+        sleeps_before = len(clock.sleeps)
+
+        assert rotor.push_gains({}) == {}
+        assert len(port.writes) == writes_before
+        # Not `clock.sleeps == []`: connecting sleeps the RS-485
+        # turnaround on every exchange. What must not happen is a *new*
+        # sleep for a push that pushed nothing.
+        assert len(clock.sleeps) == sleeps_before

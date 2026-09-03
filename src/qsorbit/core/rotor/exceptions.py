@@ -48,3 +48,20 @@ class PositionLimitError(RotorError):
     number is real and well-formed, but this particular hardware must
     not be sent there.
     """
+
+
+class GainVerificationError(RotorError):
+    """A gain register did not read back as the value that was written.
+
+    Not a :class:`ProtocolError`: the reply parsed perfectly, it just
+    said something other than what was asked for. The distinction
+    matters because the responses differ — a parse failure is a link or
+    firmware-version problem, while this means the controller is running
+    gains nobody chose.
+
+    Gains are RAM-only and re-pushed at every connect (integration rule
+    2.12), so a write that silently fails leaves the rotor tracking on
+    its compiled defaults while the application believes otherwise.
+    Every metric measured afterwards would be attributed to the wrong
+    configuration, which is worse than not pushing gains at all.
+    """
