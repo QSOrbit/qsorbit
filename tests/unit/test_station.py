@@ -942,6 +942,30 @@ class TestRotorMechanics:
         with pytest.raises(ConfigError, match="azimuth_freeplay_deg"):
             load_station_config(write_config(tmp_path, text))
 
+    def test_the_shipped_example_configs_gains_pass_their_own_clamp(self, tmp_path):
+        # config.example.toml is documentation people copy, and it now
+        # ships live gains rather than commented-out ones. If anybody
+        # edits a gain or a measurement in it without redoing the
+        # arithmetic, this is what says so -- load_station_config runs
+        # the clamp, so an unsafe example would fail to load at all.
+        config = load_station_config(Path("config.example.toml"))
+        tracking = next(p for p in config.tracking.profiles if p.name == "tracking")
+        assert tracking.gains is not None
+        tracking.check_against(config.capabilities)
+
+    def test_the_shipped_example_keeps_azimuth_below_elevation(self, tmp_path):
+        # The asymmetry is deliberate and easy to "tidy" back to a
+        # matching pair: azimuth has the lower breakaway and the larger
+        # free play, so it is the binding axis. A future editor who
+        # makes them equal should have to delete this test to do it.
+        from qsorbit.core.rotor import GainRegister
+
+        config = load_station_config(Path("config.example.toml"))
+        tracking = next(p for p in config.tracking.profiles if p.name == "tracking")
+        gains = tracking.gains
+        assert gains is not None
+        assert gains[GainRegister.AZIMUTH_KI] < gains[GainRegister.ELEVATION_KI]
+
     def test_the_shipped_example_config_declares_them(self, tmp_path):
         # config.example.toml is documentation people copy, so the
         # measured fields being present and parseable is part of the
