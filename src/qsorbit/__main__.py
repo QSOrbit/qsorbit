@@ -89,6 +89,7 @@ from qsorbit.core.rotor import (
     Position,
     PositionLimitError,
     Rotor,
+    RotorCapabilities,
     RotorError,
     RotorErrorCode,
     SerialPort,
@@ -103,11 +104,14 @@ from qsorbit.core.sdr import (
     SdrError,
     capture_to_file,
 )
+from qsorbit.core.stall_guard import StallGuard
 from qsorbit.core.station import ConfigError, StationConfig, load_station_config
 from qsorbit.core.tracker import Pass, Satellite, TrackerError, predict_passes
 from qsorbit.core.tracking_profile import (
+    DESIGN_RATE_DEG_S,
     NOMINAL_TRACKING_RATE_DEG_S,
     TrackingProfile,
+    max_safe_ki,
 )
 from qsorbit.ui.theme import DEFAULT_THEME_NAME
 
@@ -1142,6 +1146,8 @@ def _command_status(config: StationConfig, factory: RotorFactory) -> int:
             print(f"Profiles:  {', '.join(declared)}")
         else:
             print("Profiles:  none declared (see [rotor.profiles] in config.example.toml)")
+        for line in _describe_mechanics(capabilities):
+            print(line)
         offset = _alignment_offset(config)
         if offset.is_identity:
             print("Alignment: none recorded (see [rotor.alignment] in config.example.toml)")
@@ -1325,6 +1331,7 @@ def _command_receive(
             print(f"Rotor:     connected, {rotor.firmware_version}")
             profile = _tracking_profile(args, config)
             print(_describe_cadence(profile))
+            _push_profile_gains(rotor, profile, config)
             loop = TrackingLoop(
                 satellite,
                 config.observer,
@@ -1332,6 +1339,7 @@ def _command_receive(
                 interval_s=profile.interval_s,
                 deadband_deg=profile.deadband_deg,
                 alignment_offset=_alignment_offset(config),
+                stall_guard=_stall_guard(config),
                 on_stall=_report_stall,
             )
             return run(args, config, satellite, applied, nbfm, doppler, squelch, sdr, loop=loop)
@@ -1398,6 +1406,95 @@ def _describe_cadence(profile: TrackingProfile) -> str:
         f"Cadence:   {profile.name} profile, {profile.deadband_deg:g} deg deadband "
         f"at {profile.interval_s:g} s -> {profile.commanded_step_deg:g} deg steps "
         f"at {NOMINAL_TRACKING_RATE_DEG_S:g} deg/s"
+    )
+
+
+def _describe_mechanics(capabilities: RotorCapabilities) -> list[str]:
+    """What this rotor's measured mechanics allow, as status lines.
+
+    Reports the **headroom** rather than only the measurements, because
+    the measurements alone do not answer the question an operator has.
+    "Azimuth free play 2.95 deg" is a fact; "the most integral gain this
+    axis can safely take is 0.98" is the fact they can act on, and it is
+    the difference between reading a number and knowing what it costs.
+
+    Empty when nothing is measured, with a line saying so — an absent
+    measurement is a state to report, not a blank to skip past.
+    """
+    if not capabilities.mechanics_measured:
+        return [
+            "Mechanics: not measured (see [rotor.capabilities] in config.example.toml). "
+            "No profile may run a non-zero Ki until they are."
+        ]
+    lines = []
+    for axis in ("azimuth", "elevation"):
+        free_play, breakaway = capabilities.mechanics_for(axis)
+        safe_ki = max_safe_ki(free_play, breakaway)
+        label = "Mechanics:" if axis == "azimuth" else " " * 10
+        lines.append(
+            f"{label} {axis[:2].upper()} free play {free_play:.2f} deg, "
+            f"breakaway {breakaway:g} PWM -> max safe Ki {safe_ki:.2f} "
+            f"at {DESIGN_RATE_DEG_S:g} deg/s"
+        )
+    return lines
+
+
+def _stall_guard(config: StationConfig) -> StallGuard:
+    """The stall detector, sized to this rotor's measured free play.
+
+    The detector's gate and the gain clamp are the same physical
+    number, so it is read from the same place. Leaving the guard on its
+    compiled default while the clamp read config would be two constants
+    that must agree, written down twice — which
+    :mod:`qsorbit.core.tracking_profile` already warns is two constants
+    that will eventually disagree.
+
+    **The larger axis wins.** The guard carries one figure for both
+    axes, and a gate sized to the tighter axis would call the sloppier
+    one stalled every time it took up its own slack.
+    """
+    capabilities = config.capabilities
+    if not capabilities.mechanics_measured:
+        return StallGuard()
+    azimuth, _ = capabilities.mechanics_for("azimuth")
+    elevation, _ = capabilities.mechanics_for("elevation")
+    return StallGuard(free_play_deg=max(azimuth, elevation))
+
+
+def _push_profile_gains(rotor: Rotor, profile: TrackingProfile, config: StationConfig) -> None:
+    """Write this profile's gains to the controller, verified, and say so.
+
+    **Called when a track starts, not when the port opens.** Gains are
+    RAM-only, so re-pushing at every connect is tempting — it would
+    guarantee the controller always matched config. It would also mean
+    ``qsorbit status`` writes tuning to a motor controller, and a
+    read-only command that quietly changes the hardware is a thing
+    nobody should have to remember. The accepted cost is that a power
+    cycle mid-session reverts the controller to its compiled defaults
+    with nothing noticing until the next track — which is exactly why
+    :meth:`~qsorbit.core.rotor.Rotor.push_gains` verifies every register
+    rather than writing blind.
+
+    The clamp is re-checked here even though
+    :func:`~qsorbit.core.station.load_station_config` already checked
+    it, for the same reason the cadence check runs at both ends: a
+    profile can reach this point from ``--rotor-profile`` or from a
+    direct construction, and this is the last place before the wire.
+    """
+    gains = profile.gains
+    if gains is None:
+        print(
+            f"Gains:     {profile.name} profile writes none, "
+            "so the controller keeps its compiled defaults"
+        )
+        return
+    profile.check_against(config.capabilities)
+    rotor.push_gains(gains)
+    written = ", ".join(f"{register.name.lower()} {value:g}" for register, value in gains.items())
+    print(f"Gains:     {profile.name} profile pushed and verified - {written}")
+    print(
+        f"           RAM only: a power cycle reverts these, and they are checked "
+        f"against this rotor's breakaway at {DESIGN_RATE_DEG_S:g} deg/s"
     )
 
 
@@ -1949,6 +2046,7 @@ def _run_shell_tracking_only(
         print(f"Rotor:     connected, {rotor.firmware_version}")
         profile = _tracking_profile(args, config)
         print(_describe_cadence(profile))
+        _push_profile_gains(rotor, profile, config)
         loop = TrackingLoop(
             satellite,
             config.observer,
@@ -1956,6 +2054,7 @@ def _run_shell_tracking_only(
             interval_s=profile.interval_s,
             deadband_deg=profile.deadband_deg,
             alignment_offset=_alignment_offset(config),
+            stall_guard=_stall_guard(config),
             on_stall=_report_stall,
         )
         # The ticker is built BEFORE the hub, because the hub needs its

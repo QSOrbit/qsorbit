@@ -183,3 +183,100 @@ class TestIsArrived:
         assert phils_rotator(acceptance_window_deg=10.0).is_arrived(
             Position(180.0, 45.0), Position(174.0, 45.0)
         )
+
+
+MEASURED_MECHANICS = {
+    "azimuth_free_play_deg": 2.95,
+    "azimuth_breakaway_pwm": 17.0,
+    "elevation_free_play_deg": 2.55,
+    "elevation_breakaway_pwm": 21.0,
+}
+
+
+class TestMechanics:
+    """Free play and breakaway: the two measurements the gain clamp needs.
+
+    Both are properties of a *build*, not of a design, which is why they
+    are declared rather than inferred. Numbers here are Phil's rotator,
+    measured 2026-09-02.
+    """
+
+    def test_absent_by_default(self):
+        # Every config file written before Chunk H lacks these, and
+        # "nobody has measured this rotator" is the honest identity
+        # state rather than an omission.
+        caps = phils_rotator()
+        assert caps.mechanics_measured is False
+        assert caps.azimuth_free_play_deg is None
+
+    def test_declared_together(self):
+        caps = phils_rotator(**MEASURED_MECHANICS)
+        assert caps.mechanics_measured is True
+        assert caps.mechanics_for("azimuth") == (2.95, 17.0)
+        assert caps.mechanics_for("elevation") == (2.55, 21.0)
+
+    @pytest.mark.parametrize("declared", sorted(MEASURED_MECHANICS))
+    def test_a_partial_record_is_refused(self, declared):
+        # A half-declared record would let one axis be checked while the
+        # other ran unguarded, which is the failure PR2a already fixed
+        # once in the stall detector.
+        with pytest.raises(ValueError, match="all-or-nothing"):
+            phils_rotator(**{declared: MEASURED_MECHANICS[declared]})
+
+    @pytest.mark.parametrize("field", sorted(MEASURED_MECHANICS))
+    def test_zero_is_refused(self, field):
+        # Zero free play means a rigid drivetrain, which no geared
+        # rotator has; zero breakaway means a motor that moves on no
+        # current. Both would silently disable the clamp -- zero free
+        # play makes the windup zero, and zero breakaway makes every
+        # gain unsafe.
+        overrides = dict(MEASURED_MECHANICS)
+        overrides[field] = 0.0
+        with pytest.raises(ValueError, match="must be positive"):
+            phils_rotator(**overrides)
+
+    @pytest.mark.parametrize("field", sorted(MEASURED_MECHANICS))
+    def test_negative_is_refused(self, field):
+        overrides = dict(MEASURED_MECHANICS)
+        overrides[field] = -1.0
+        with pytest.raises(ValueError, match="must be positive"):
+            phils_rotator(**overrides)
+
+    def test_non_finite_is_refused(self):
+        overrides = dict(MEASURED_MECHANICS)
+        overrides["azimuth_free_play_deg"] = float("inf")
+        with pytest.raises(ValueError, match="must be a finite number"):
+            phils_rotator(**overrides)
+
+    def test_an_unknown_axis_is_refused(self):
+        caps = phils_rotator(**MEASURED_MECHANICS)
+        with pytest.raises(ValueError, match="azimuth' or 'elevation"):
+            caps.mechanics_for("tilt")
+
+    def test_reading_mechanics_off_an_unmeasured_rotor_raises(self):
+        # Rather than returning None and letting the caller do
+        # arithmetic on it.
+        with pytest.raises(ValueError, match="declares no mechanical measurements"):
+            phils_rotator().mechanics_for("azimuth")
+
+    def test_mechanics_do_not_affect_travel_or_arrival(self):
+        # They are a new, separate concern; nothing about the existing
+        # record should shift because they were added.
+        plain = phils_rotator()
+        measured = phils_rotator(**MEASURED_MECHANICS)
+        target = Position(azimuth=100.0, elevation=30.0)
+        actual = Position(azimuth=101.0, elevation=31.0)
+        assert plain.is_arrived(target, actual) == measured.is_arrived(target, actual)
+        measured.check_setpoint(target)
+
+    def test_elevation_free_play_is_the_smaller_and_breakaway_the_larger(self):
+        # The physical asymmetry that makes the clamp per-axis worth
+        # having: the boom's weight takes up elevation's backlash and
+        # has to be lifted to move it. Predicted before it was measured,
+        # and the prediction was right in direction and wrong in
+        # magnitude -- 14% rather than "markedly" smaller.
+        caps = phils_rotator(**MEASURED_MECHANICS)
+        az_play, az_break = caps.mechanics_for("azimuth")
+        el_play, el_break = caps.mechanics_for("elevation")
+        assert el_play < az_play
+        assert el_break > az_break

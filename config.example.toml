@@ -136,6 +136,31 @@ rs485_turnaround_s = 0.15
 # above.
 firmware_version = "SatNOGS-v2.2.1"
 
+# Optional, and all four together or none at all: the two mechanical
+# measurements QSOrbit needs before it will let a profile run a non-zero
+# integral gain. Measure them, do not copy these -- two builds of the
+# same design differ, and these are one rotator's numbers.
+# See bench-procedure-mechanical-slop.md for the protocol.
+#
+# free_play_deg is peak-to-peak movement of the boom with the motors
+# holding, in degrees. It sets how long a jam takes to notice: the stall
+# detector cannot open its gate until the commanded setpoint has
+# advanced past the slop.
+#
+# breakaway_pwm is the drive count at which that axis starts moving from
+# rest. It is the ceiling a frozen integral term must stay under -- below
+# it, a wound-up integral is harmless; above it, the axis drives itself
+# with nothing commanding it, and stock firmware has no way to discharge
+# an integral over serial.
+#
+# The two combine as  0.5 x Ki x free_play^2 / rate  PWM, validated at
+# 0.25 deg/s. Note the square: halving the free play quarters the
+# exposure. `qsorbit status` prints the maximum safe Ki for each axis.
+azimuth_free_play_deg = 2.95
+azimuth_breakaway_pwm = 17.0
+elevation_free_play_deg = 2.55
+elevation_breakaway_pwm = 21.0
+
 
 # ---------------------------------------------------------------------
 # Tracking profiles
@@ -191,6 +216,39 @@ interval_s = 1.0
 deadband_deg = 0.25
 interval_s = 0.5
 arrival_window_deg = 1.0
+
+# The gains half of the validated set, and it ships COMMENTED OUT.
+#
+# All six or none: whatever you leave out keeps the firmware's compiled
+# default, so a partial set runs a mixture nobody chose.
+#
+# Session 32 validated Ki 1.0 on both axes, Kp and Kd left at stock.
+# Uncommenting these as they stand will be REFUSED on the rotator whose
+# measurements are above, and the refusal is correct:
+#
+#   azimuth:  0.5 x 1.0 x 2.95^2 / 0.25 = 17.4 PWM  vs  17 breakaway
+#
+# A 2% miss, on azimuth only. The way through is not to trim Ki to fit
+# the clamp -- 0.98 would pass, but the sweep only ever measured Ki at
+# 0, 1.0 and 3.0, so 0.98 would be a number chosen to satisfy a
+# validator rather than because a bench run said so. The way through is
+# to measure free_play_deg against the disturbance the guard actually
+# has to tolerate. 2.95 is a hard human push on a boom; still air
+# measures 0.00 over 15 seconds. Anything at or under 2.91 clears
+# Ki 1.0 outright.
+#
+# Kd is listed for completeness, not as a knob worth turning: raising it
+# was measured and REFUTED. Derivative control closes a velocity loop
+# around a spring, and the boom's torsional ring-back is that spring, so
+# the term pumps the oscillation it is meant to damp. Every number got
+# worse.
+#
+# azimuth_kp = 8.0
+# azimuth_ki = 1.0
+# azimuth_kd = 0.5
+# elevation_kp = 10.0
+# elevation_ki = 1.0
+# elevation_kd = 0.3
 
 
 # ---------------------------------------------------------------------

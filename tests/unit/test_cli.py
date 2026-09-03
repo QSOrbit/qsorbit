@@ -20,11 +20,14 @@ from qsorbit import __version__
 from qsorbit.__main__ import (
     DEFAULT_PLAN_HOURS,
     DEFAULT_TUNING_OFFSET_KHZ,
+    _describe_mechanics,
     _parse_audio_device,
+    _push_profile_gains,
     _quit_on_sigint,
     _range_rate_interval,
     _spectrum_factory,
     _squelch_status_line,
+    _stall_guard,
     build_parser,
     main,
 )
@@ -1592,3 +1595,186 @@ class TestReceiveTheme:
             ]
         )
         assert args.theme == "hologram"
+
+
+# ---------------------------------------------------------------------------
+# Gain policy at the command line (Chunk H, PR2c)
+# ---------------------------------------------------------------------------
+
+
+class _GainRecordingRotor:
+    """A rotor that records what gains were pushed to it.
+
+    Deliberately minimal: nothing here needs a serial port, and the
+    question under test is whether the CLI decides to push at all.
+    """
+
+    def __init__(self, raises: Exception | None = None):
+        self.pushed: list[dict] = []
+        self._raises = raises
+
+    def push_gains(self, gains):
+        if self._raises is not None:
+            raise self._raises
+        self.pushed.append(dict(gains))
+        return dict(gains)
+
+
+def _station(mechanics: bool = True):
+    from qsorbit.core.rotor import AzimuthWrap, RotorCapabilities
+    from qsorbit.core.station import StationConfig, TrackingSettings
+    from qsorbit.core.tracker import ObserverLocation
+
+    measured = (
+        {
+            "azimuth_free_play_deg": 2.95,
+            "azimuth_breakaway_pwm": 17.0,
+            "elevation_free_play_deg": 2.55,
+            "elevation_breakaway_pwm": 21.0,
+        }
+        if mechanics
+        else {}
+    )
+    return StationConfig(
+        observer=ObserverLocation(latitude=40.5, longitude=-83.25, altitude_m=250.0),
+        serial=__import__("qsorbit.core.station", fromlist=["SerialSettings"]).SerialSettings(
+            port="COM5"
+        ),
+        capabilities=RotorCapabilities(
+            azimuth_min_deg=0.0,
+            azimuth_max_deg=360.0,
+            elevation_min_deg=0.0,
+            elevation_max_deg=180.0,
+            azimuth_wrap=AzimuthWrap.EXTRA_ROTATION,
+            acceptance_window_deg=2.5,
+            rs485_turnaround_s=0.15,
+            **measured,
+        ),
+        tracking=TrackingSettings(),
+    )
+
+
+def _profile(**overrides):
+    from qsorbit.core.tracking_profile import TrackingProfile
+
+    fields = {
+        "name": "tracking",
+        "deadband_deg": 0.25,
+        "interval_s": 0.5,
+        "azimuth_kp": 8.0,
+        "azimuth_ki": 0.5,
+        "azimuth_kd": 0.5,
+        "elevation_kp": 10.0,
+        "elevation_ki": 0.5,
+        "elevation_kd": 0.3,
+    }
+    fields.update(overrides)
+    return TrackingProfile(**fields)
+
+
+class TestPushProfileGains:
+    def test_a_stock_profile_writes_nothing_at_all(self, capsys):
+        from qsorbit.core.tracking_profile import TrackingProfile
+
+        rotor = _GainRecordingRotor()
+        stock = TrackingProfile(name="stock", deadband_deg=2.5, interval_s=1.0)
+        _push_profile_gains(rotor, stock, _station())
+        assert rotor.pushed == []
+        assert "writes none" in capsys.readouterr().out
+
+    def test_a_gain_profile_pushes_all_six(self, capsys):
+        from qsorbit.core.rotor import GainRegister
+
+        rotor = _GainRecordingRotor()
+        _push_profile_gains(rotor, _profile(), _station())
+        assert list(rotor.pushed[0]) == list(GainRegister)
+
+    def test_the_clamp_is_rechecked_before_the_wire(self):
+        # Config already checks this, but a profile can arrive here from
+        # --rotor-profile or a direct construction. A check that only
+        # guards the config file has a command-line-shaped hole in it.
+        from qsorbit.core.tracking_profile import GainClampError
+
+        rotor = _GainRecordingRotor()
+        with pytest.raises(GainClampError):
+            _push_profile_gains(rotor, _profile(azimuth_ki=1.0), _station())
+        assert rotor.pushed == []
+
+    def test_nothing_is_pushed_to_an_unmeasured_rotor(self):
+        from qsorbit.core.tracking_profile import UnmeasuredMechanicsError
+
+        rotor = _GainRecordingRotor()
+        with pytest.raises(UnmeasuredMechanicsError):
+            _push_profile_gains(rotor, _profile(), _station(mechanics=False))
+        assert rotor.pushed == []
+
+    def test_a_verification_failure_propagates(self):
+        # Rather than warning and tracking on gains nobody chose, which
+        # would attribute every later measurement to the wrong setup.
+        from qsorbit.core.rotor import GainVerificationError
+
+        rotor = _GainRecordingRotor(raises=GainVerificationError("register 2 disagreed"))
+        with pytest.raises(GainVerificationError):
+            _push_profile_gains(rotor, _profile(), _station())
+
+    def test_the_console_output_is_ascii(self, capsys):
+        # Session 34's em dash rendered as a stray glyph on Windows.
+        _push_profile_gains(_GainRecordingRotor(), _profile(), _station())
+        capsys.readouterr().out.encode("ascii")
+
+    def test_the_output_says_the_gains_are_ram_only(self, capsys):
+        # The one thing an operator has to remember about this feature:
+        # a power cycle silently reverts it.
+        _push_profile_gains(_GainRecordingRotor(), _profile(), _station())
+        assert "RAM only" in capsys.readouterr().out
+
+
+class TestStallGuardFromConfig:
+    def test_falls_back_to_the_compiled_default_when_unmeasured(self):
+        from qsorbit.core.stall_guard import DEFAULT_FREE_PLAY_DEG
+
+        assert _stall_guard(_station(mechanics=False)).free_play_deg == DEFAULT_FREE_PLAY_DEG
+
+    def test_uses_the_measured_value_when_present(self):
+        # The detector's gate and the gain clamp are the same physical
+        # number, so they read from the same place.
+        assert _stall_guard(_station()).free_play_deg == pytest.approx(2.95)
+
+    def test_the_larger_axis_wins(self):
+        # One figure covers both axes, and a gate sized to the tighter
+        # one would call the sloppier axis stalled every time it took up
+        # its own slack.
+        from dataclasses import replace
+
+        config = _station()
+        loose = replace(
+            config,
+            capabilities=replace(config.capabilities, elevation_free_play_deg=4.0),
+        )
+        assert _stall_guard(loose).free_play_deg == pytest.approx(4.0)
+
+
+class TestDescribeMechanics:
+    def test_says_so_when_nothing_is_measured(self):
+        lines = _describe_mechanics(_station(mechanics=False).capabilities)
+        assert len(lines) == 1
+        assert "not measured" in lines[0]
+
+    def test_reports_the_headroom_not_just_the_measurement(self):
+        # "Free play 2.95 deg" is a fact; "max safe Ki 0.97" is the fact
+        # an operator can act on. 0.97 and not 0.98: the figure is
+        # floored, because a status line advertising a Ki the clamp
+        # would then refuse is worse than printing nothing.
+        lines = _describe_mechanics(_station().capabilities)
+        assert any("0.97" in line for line in lines)
+        assert not any("0.98" in line for line in lines)
+
+    def test_reports_both_axes(self):
+        lines = _describe_mechanics(_station().capabilities)
+        assert len(lines) == 2
+        assert "AZ" in lines[0]
+        assert "EL" in lines[1]
+
+    def test_the_lines_are_ascii(self):
+        for line in _describe_mechanics(_station().capabilities):
+            line.encode("ascii")
