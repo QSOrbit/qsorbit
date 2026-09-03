@@ -893,3 +893,145 @@ class TestTrackingSettings:
         with pytest.raises(CadenceError) as exc:
             TrackingSettings().active_profile(2.0)
         assert "not what was wrong" in str(exc.value)
+
+
+MECHANICS_TOML = """
+    azimuth_free_play_deg = 2.95
+    azimuth_breakaway_pwm = 17.0
+    elevation_free_play_deg = 2.55
+    elevation_breakaway_pwm = 21.0
+"""
+
+SAFE_GAINS_TOML = """
+    [rotor.profiles.stock]
+    deadband_deg = 2.5
+    interval_s = 1.0
+
+    [rotor.profiles.tracking]
+    deadband_deg = 0.25
+    interval_s = 0.5
+    azimuth_kp = 8.0
+    azimuth_ki = 0.5
+    azimuth_kd = 0.5
+    elevation_kp = 10.0
+    elevation_ki = 0.5
+    elevation_kd = 0.3
+"""
+
+
+class TestRotorMechanics:
+    def test_absent_by_default(self, tmp_path):
+        config = load_station_config(write_config(tmp_path))
+        assert config.capabilities.mechanics_measured is False
+
+    def test_parsed_when_present(self, tmp_path):
+        config = load_station_config(write_config(tmp_path, VALID_CONFIG + MECHANICS_TOML))
+        assert config.capabilities.mechanics_for("azimuth") == (2.95, 17.0)
+        assert config.capabilities.mechanics_for("elevation") == (2.55, 21.0)
+
+    def test_a_partial_record_is_refused_with_the_file_name(self, tmp_path):
+        text = VALID_CONFIG + "    azimuth_free_play_deg = 2.95\n"
+        with pytest.raises(ConfigError, match="all-or-nothing"):
+            load_station_config(write_config(tmp_path, text))
+
+    def test_a_misspelled_key_is_refused(self, tmp_path):
+        # The allow-list is what makes a typo an error rather than a
+        # silently ignored line -- and a silently ignored free_play_deg
+        # would leave the clamp checking against nothing.
+        text = VALID_CONFIG + "    azimuth_freeplay_deg = 2.95\n"
+        with pytest.raises(ConfigError, match="azimuth_freeplay_deg"):
+            load_station_config(write_config(tmp_path, text))
+
+    def test_the_shipped_example_config_declares_them(self, tmp_path):
+        # config.example.toml is documentation people copy, so the
+        # measured fields being present and parseable is part of the
+        # deliverable rather than an extra.
+        config = load_station_config(Path("config.example.toml"))
+        assert config.capabilities.mechanics_measured is True
+
+
+class TestProfileGains:
+    def test_gains_are_parsed_onto_the_profile(self, tmp_path):
+        config = load_station_config(
+            write_config(tmp_path, VALID_CONFIG + MECHANICS_TOML + SAFE_GAINS_TOML)
+        )
+        tracking = next(p for p in config.tracking.profiles if p.name == "tracking")
+        assert tracking.azimuth_kp == 8.0
+        assert tracking.elevation_kd == 0.3
+        assert tracking.gains is not None
+
+    def test_a_profile_without_gains_still_loads(self, tmp_path):
+        text = (
+            VALID_CONFIG
+            + """
+    [rotor.profiles.stock]
+    deadband_deg = 2.5
+    interval_s = 1.0
+"""
+        )
+        config = load_station_config(write_config(tmp_path, text))
+        assert config.tracking.profiles[0].gains is None
+
+    def test_a_partial_gain_set_is_refused_with_the_file_name(self, tmp_path):
+        text = (
+            VALID_CONFIG
+            + MECHANICS_TOML
+            + """
+    [rotor.profiles.tracking]
+    deadband_deg = 0.25
+    interval_s = 0.5
+    azimuth_ki = 1.0
+"""
+        )
+        with pytest.raises(ConfigError, match="all six or none"):
+            load_station_config(write_config(tmp_path, text))
+
+    def test_a_misspelled_gain_key_is_refused(self, tmp_path):
+        text = (
+            VALID_CONFIG
+            + MECHANICS_TOML
+            + """
+    [rotor.profiles.tracking]
+    deadband_deg = 0.25
+    interval_s = 0.5
+    azimuth_ki_gain = 1.0
+"""
+        )
+        with pytest.raises(ConfigError, match="azimuth_ki_gain"):
+            load_station_config(write_config(tmp_path, text))
+
+    def test_the_clamp_refuses_an_unsafe_profile_at_load(self, tmp_path):
+        # The point of checking here as well as at the push site: this
+        # fails at the desk, in daylight, rather than at the rotor.
+        text = (VALID_CONFIG + MECHANICS_TOML + SAFE_GAINS_TOML).replace(
+            "azimuth_ki = 0.5", "azimuth_ki = 1.0"
+        )
+        with pytest.raises(ConfigError) as caught:
+            load_station_config(write_config(tmp_path, text))
+        assert "breakaway" in str(caught.value)
+        assert "qsorbit.toml" in str(caught.value)
+
+    def test_integral_gain_without_measurements_is_refused_at_load(self, tmp_path):
+        text = VALID_CONFIG + SAFE_GAINS_TOML
+        with pytest.raises(ConfigError, match="no free_play_deg or breakaway_pwm"):
+            load_station_config(write_config(tmp_path, text))
+
+    def test_zero_integral_gain_loads_without_measurements(self, tmp_path):
+        # Nothing that can accumulate, so nothing to check against.
+        text = (VALID_CONFIG + SAFE_GAINS_TOML).replace("ki = 0.5", "ki = 0.0")
+        config = load_station_config(write_config(tmp_path, text))
+        tracking = next(p for p in config.tracking.profiles if p.name == "tracking")
+        assert tracking.gains is not None
+
+    def test_an_inactive_profile_is_checked_too(self, tmp_path):
+        # A profile nobody has selected yet is one keystroke from being
+        # selected, and --rotor-profile is that keystroke. Refusing only
+        # the active one would move the failure to mid-pass.
+        text = (VALID_CONFIG + MECHANICS_TOML + SAFE_GAINS_TOML).replace(
+            "azimuth_ki = 0.5", "azimuth_ki = 1.0"
+        )
+        # Left on the default active profile: the unsafe one is not
+        # selected.
+        assert "profile = " not in text
+        with pytest.raises(ConfigError, match="breakaway"):
+            load_station_config(write_config(tmp_path, text))

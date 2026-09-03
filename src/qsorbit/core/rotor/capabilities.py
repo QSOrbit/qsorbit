@@ -93,6 +93,28 @@ class RotorCapabilities:
             more often a too-short turnaround than a real fault. 0.15 s
             was reliable on Phil's link, 0.3-0.5 s is safer on longer
             cable.
+        azimuth_free_play_deg: Mechanical free play in the azimuth
+            axis, degrees peak-to-peak, or ``None`` if never measured.
+            **Measured, never assumed** — see
+            ``bench-procedure-mechanical-slop.md`` for the protocol.
+            Two numbers depend on it: the stall detector cannot declare
+            a jam until the setpoint has advanced past the slop, and
+            that latency is what sets how far an integral gain can wind
+            up before anything notices. Declaring it is therefore the
+            price of being allowed to run a non-zero ``Ki`` — see
+            :func:`~qsorbit.core.tracking_profile.check_axis_gain`.
+        azimuth_breakaway_pwm: The PWM count at which the azimuth motor
+            breaks static friction, or ``None`` if never measured. ~17
+            on Phil's rotator. This is the ceiling the wound-up integral
+            must stay under: below it a frozen integral is harmless,
+            above it the axis drives on its own.
+        elevation_free_play_deg: The same for elevation. Usually the
+            smaller of the two, because the boom's own weight takes up
+            the backlash.
+        elevation_breakaway_pwm: The same for elevation. Usually the
+            larger, because that weight has to be lifted — ~21-26 on
+            Phil's rotator, and the conservative end is the one to
+            declare.
         firmware_version: The version string this configuration was
             verified against, e.g. ``"SatNOGS-v2.2.1"``, or ``None`` if
             unrecorded. The controller compares the live ``VE`` reply
@@ -116,6 +138,10 @@ class RotorCapabilities:
     acceptance_window_deg: float
     rs485_turnaround_s: float
     firmware_version: str | None = None
+    azimuth_free_play_deg: float | None = None
+    azimuth_breakaway_pwm: float | None = None
+    elevation_free_play_deg: float | None = None
+    elevation_breakaway_pwm: float | None = None
 
     def __post_init__(self) -> None:
         numeric = (
@@ -160,6 +186,32 @@ class RotorCapabilities:
                 f"rs485_turnaround_s must not be negative, got {self.rs485_turnaround_s}."
             )
 
+        measured = {
+            "azimuth_free_play_deg": self.azimuth_free_play_deg,
+            "azimuth_breakaway_pwm": self.azimuth_breakaway_pwm,
+            "elevation_free_play_deg": self.elevation_free_play_deg,
+            "elevation_breakaway_pwm": self.elevation_breakaway_pwm,
+        }
+        for name, value in measured.items():
+            if value is None:
+                continue
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number, got {value!r}.")
+            if value <= 0.0:
+                raise ValueError(f"{name} must be positive, got {value}.")
+
+        declared = {name for name, value in measured.items() if value is not None}
+        if declared and len(declared) != len(measured):
+            missing = sorted(set(measured) - declared)
+            raise ValueError(
+                f"This rotor declares {', '.join(sorted(declared))} but not "
+                f"{', '.join(missing)}. The mechanical measurements are all-or-nothing: "
+                "the gain clamp needs free play and breakaway together on both axes, and "
+                "a partial record would let one axis be checked while the other ran "
+                "unguarded. Measure the rest (bench-procedure-mechanical-slop.md) or "
+                "declare none of them."
+            )
+
         if self.azimuth_wrap is AzimuthWrap.EXTRA_ROTATION and self.azimuth_max_deg > 360.0:
             raise ValueError(
                 f"azimuth_max_deg is {self.azimuth_max_deg}, but this rotor is declared "
@@ -168,6 +220,37 @@ class RotorCapabilities:
                 "limit to 360 or declare EXTENDED_TRAVEL if the axis really does have the "
                 "extra travel."
             )
+
+    @property
+    def mechanics_measured(self) -> bool:
+        """Whether this rotor's free play and breakaway are on record.
+
+        All four values are present or none are, so any one of them
+        answers the question.
+        """
+        return self.azimuth_free_play_deg is not None
+
+    def mechanics_for(self, axis: str) -> tuple[float, float]:
+        """One axis's ``(free_play_deg, breakaway_pwm)``.
+
+        Args:
+            axis: ``"azimuth"`` or ``"elevation"``.
+
+        Raises:
+            ValueError: If this rotor declares no mechanics, or the axis
+                name is not one of the two.
+        """
+        if axis not in ("azimuth", "elevation"):
+            raise ValueError(f"axis must be 'azimuth' or 'elevation', got {axis!r}.")
+        if not self.mechanics_measured:
+            raise ValueError(
+                "This rotor declares no mechanical measurements, so its free play and "
+                "breakaway are unknown. Nothing may be derived from them."
+            )
+        free_play = getattr(self, f"{axis}_free_play_deg")
+        breakaway = getattr(self, f"{axis}_breakaway_pwm")
+        assert free_play is not None and breakaway is not None  # noqa: S101
+        return (free_play, breakaway)
 
     def check_setpoint(self, position: Position) -> None:
         """Raise if ``position`` is outside this rotor's declared travel.

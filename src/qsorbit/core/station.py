@@ -44,7 +44,7 @@ import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from qsorbit.core.horizon import HorizonMask, HorizonPoint
 from qsorbit.core.rotor import AzimuthWrap, RotorCapabilities
@@ -539,6 +539,10 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
             "acceptance_window_deg",
             "rs485_turnaround_s",
             "firmware_version",
+            "azimuth_free_play_deg",
+            "azimuth_breakaway_pwm",
+            "elevation_free_play_deg",
+            "elevation_breakaway_pwm",
         },
         section="rotor.capabilities",
         path=resolved,
@@ -593,6 +597,18 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
             firmware_version=_optional_str(
                 capabilities_table, "firmware_version", "rotor.capabilities", resolved, None
             ),
+            azimuth_free_play_deg=_optional_float(
+                capabilities_table, "azimuth_free_play_deg", "rotor.capabilities", resolved, None
+            ),
+            azimuth_breakaway_pwm=_optional_float(
+                capabilities_table, "azimuth_breakaway_pwm", "rotor.capabilities", resolved, None
+            ),
+            elevation_free_play_deg=_optional_float(
+                capabilities_table, "elevation_free_play_deg", "rotor.capabilities", resolved, None
+            ),
+            elevation_breakaway_pwm=_optional_float(
+                capabilities_table, "elevation_breakaway_pwm", "rotor.capabilities", resolved, None
+            ),
         )
         sdr_settings = SdrSettings(
             driver_dir=_optional_str(sdr_table, "driver_dir", "sdr", resolved, None),
@@ -617,6 +633,11 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
             or DEFAULT_PROFILE_NAME,
             profiles=_require_tracking_profiles(profiles_table, resolved),
         )
+        # Checked here as well as at the push site, the same way cadence
+        # is: a gain set that could drive an axis on its own should be
+        # refused at the desk, in daylight, rather than at the rotor.
+        for profile in tracking_settings.profiles:
+            profile.check_against(capabilities)
         horizon = HorizonMask(points=horizon_points)
     except ValueError as exc:
         # The value objects do the real range checking; re-raised as a
@@ -755,6 +776,18 @@ def _require_azimuth_wrap(table: dict[str, Any], path: Path) -> AzimuthWrap:
         ) from exc
 
 
+#: The gain keys a ``[rotor.profiles.*]`` table may declare, in register
+#: order. Named once so the allow-list and the constructor cannot drift.
+_GAIN_KEYS: Final = (
+    "azimuth_kp",
+    "azimuth_ki",
+    "azimuth_kd",
+    "elevation_kp",
+    "elevation_ki",
+    "elevation_kd",
+)
+
+
 def _require_tracking_profiles(
     profiles_table: dict[str, Any], path: Path
 ) -> tuple[TrackingProfile, ...]:
@@ -774,11 +807,17 @@ def _require_tracking_profiles(
             )
         _reject_unknown_keys(
             entry,
-            {"deadband_deg", "interval_s", "arrival_window_deg"},
+            {
+                "deadband_deg",
+                "interval_s",
+                "arrival_window_deg",
+                *_GAIN_KEYS,
+            },
             section=section,
             path=path,
         )
         raw_window = entry.get("arrival_window_deg")
+        gains = {key: _optional_float(entry, key, section, path, None) for key in _GAIN_KEYS}
         profiles.append(
             TrackingProfile(
                 name=name,
@@ -789,6 +828,7 @@ def _require_tracking_profiles(
                     if raw_window is None
                     else _as_float(raw_window, "arrival_window_deg", section, path)
                 ),
+                **gains,
             )
         )
     return tuple(profiles)
