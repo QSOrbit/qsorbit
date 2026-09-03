@@ -68,6 +68,9 @@ _VERSION_RE = re.compile(rb"^\s*VE(?P<version>\S+)\s*$")
 # Accepts e.g. b"GE1".
 _ERROR_RE = re.compile(rb"^\s*GE(?P<code>\d+)\s*$")
 
+#: A ``CR`` reply: the register index, a comma, then the value.
+_GAIN_RE = re.compile(rb"^\s*(?P<index>\d+),(?P<value>[-+]?\d+(?:\.\d+)?)\s*$")
+
 
 class RotorErrorCode(IntEnum):
     """The error state reported by ``GE``.
@@ -192,6 +195,109 @@ def format_stop() -> Command:
         position report, which the caller must read.
     """
     return Command(data=b"SA SE" + TERMINATOR, expects_reply=True)
+
+
+class GainRegister(IntEnum):
+    """The controller's PID gain registers, by number.
+
+    Named rather than passed as bare integers because the numbering is
+    not guessable and the neighbours are dangerous: ``7`` and ``8`` are
+    the park positions, and ``9`` is the control mode, which is
+    read-only. A typo in an integer literal would write one of those.
+
+    Gains are **RAM-only**: there is no EEPROM behind them, so a power
+    cycle restores the compiled defaults and any tuning has to be
+    re-pushed on every connect (integration rule 2.12). A change takes
+    effect within about 100 ms, because the firmware calls
+    ``SetTunings()`` on every loop iteration.
+    """
+
+    AZIMUTH_KP = 1
+    AZIMUTH_KI = 2
+    AZIMUTH_KD = 3
+    ELEVATION_KP = 4
+    ELEVATION_KI = 5
+    ELEVATION_KD = 6
+
+
+def format_set_gain(register: GainRegister, value: float) -> Command:
+    """Format a command to write one PID gain register.
+
+    .. warning::
+
+       **No space after ``CW``.** The firmware's read and write handlers
+       disagree about where the digit sits — ``CW`` tests ``buffer[2]``
+       and ``CR`` tests ``buffer[3]`` — so the write form is ``CW1,16.00``
+       and the read form is ``CR 1``. This is an upstream off-by-one
+       (``firmware-findings.md`` §5), confirmed on hardware, and the two
+       forms are not interchangeable: ``CR1`` silently returns nothing.
+
+    Args:
+        register: Which gain to write.
+        value: The new gain. Sent with two decimal places, matching the
+            precision the firmware parses and the ``CR`` reply reports.
+
+    Returns:
+        The command, e.g. ``b"CW2,1.00\\n"``. The firmware sends no reply
+        to a gain write, so the caller must read nothing — and must
+        verify with :func:`format_get_gain` rather than assuming the
+        write landed.
+    """
+    data = f"CW{int(register)},{value:.2f}".encode("ascii") + TERMINATOR
+    return Command(data=data, expects_reply=False)
+
+
+def format_get_gain(register: GainRegister) -> Command:
+    """Format a query for one PID gain register.
+
+    .. warning::
+
+       **The space after ``CR`` is required** — see
+       :func:`format_set_gain`. ``CR1`` parses as nothing and the
+       controller answers nothing at all, which reads as a link fault
+       rather than a malformed command.
+
+    Args:
+        register: Which gain to read.
+
+    Returns:
+        The command, e.g. ``b"CR 2\\n"``, answered with ``b"2,1.00\\n"``.
+    """
+    data = f"CR {int(register)}".encode("ascii") + TERMINATOR
+    return Command(data=data, expects_reply=True)
+
+
+def parse_gain(line: bytes, expected: GainRegister) -> float:
+    """Parse a ``CR`` reply into a gain value.
+
+    The register index comes back in the reply, and it is checked rather
+    than ignored: a mismatch means replies have shifted by one relative
+    to commands, and every later read would be attributed to the wrong
+    register. Silently accepting the value would push a Kd figure into a
+    Ki slot with nothing to show for it.
+
+    Args:
+        line: A response line, e.g. ``b"2,1.00\\n"``.
+        expected: The register that was asked for.
+
+    Returns:
+        The gain value.
+
+    Raises:
+        ProtocolError: If the line is not a gain reply, or reports a
+            different register than the one requested.
+    """
+    match = _GAIN_RE.match(line)
+    if match is None:
+        raise ProtocolError(f"Could not parse gain reply: {line!r}")
+    index = int(match.group("index"))
+    if index != int(expected):
+        raise ProtocolError(
+            f"Asked for gain register {int(expected)} ({expected.name}) and the rotor "
+            f"answered for register {index}, in {line!r}. Replies have shifted relative "
+            "to commands; every later read would be attributed to the wrong register."
+        )
+    return float(match.group("value"))
 
 
 def parse_position(line: bytes) -> Position:

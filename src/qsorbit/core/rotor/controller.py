@@ -37,11 +37,12 @@ and the dependency arrow runs one way:
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from qsorbit.core.rotor.capabilities import RotorCapabilities
 from qsorbit.core.rotor.exceptions import (
+    GainVerificationError,
     HomingError,
     ProtocolError,
     SerialConnectionError,
@@ -50,13 +51,17 @@ from qsorbit.core.rotor.exceptions import (
 from qsorbit.core.rotor.position import Position
 from qsorbit.core.rotor.satnogs import (
     Command,
+    GainRegister,
     RotorErrorCode,
     format_get_error,
+    format_get_gain,
     format_get_position,
     format_get_version,
+    format_set_gain,
     format_set_position,
     format_stop,
     parse_error,
+    parse_gain,
     parse_position,
     parse_version,
 )
@@ -75,6 +80,23 @@ DEFAULT_HOMING_POLL_INTERVAL_S = 2.0
 
 #: Gap between position reads while waiting for a move to settle.
 DEFAULT_ARRIVAL_POLL_INTERVAL_S = 0.5
+
+#: How long to wait after writing a gain before reading it back, in seconds.
+#:
+#: The firmware calls ``SetTunings()`` once per control-loop iteration,
+#: and that loop runs on a 100 ms gate — so a write is not visible to a
+#: read for up to that long. Reading back immediately would race it and
+#: report a mismatch against a value that was about to be correct.
+#: 0.15 s clears the loop period with margin, and matches the order of
+#: the RS-485 turnaround the link already waits out per command.
+DEFAULT_GAIN_SETTLE_S = 0.15
+
+#: How far a gain read-back may differ from what was written.
+#:
+#: Both the write and the reply carry two decimal places, so anything
+#: beyond half of the last digit is a real disagreement rather than
+#: rounding.
+GAIN_TOLERANCE = 0.005
 
 
 @dataclass(frozen=True)
@@ -352,6 +374,101 @@ class Rotor:
             ProtocolError: If the reply can't be parsed.
         """
         return parse_position(self._exchange_expecting_reply(format_stop()))
+
+    def read_gain(self, register: GainRegister) -> float:
+        """Read one PID gain register from the controller.
+
+        Args:
+            register: Which gain to read.
+
+        Returns:
+            The value the controller reports.
+
+        Raises:
+            SerialConnectionError: If the port is not open.
+            SerialTimeoutError: If the rotor doesn't answer.
+            ProtocolError: If the reply can't be parsed, or reports a
+                different register than the one asked for.
+        """
+        return parse_gain(self._exchange_expecting_reply(format_get_gain(register)), register)
+
+    def write_gain(self, register: GainRegister, value: float) -> None:
+        """Write one PID gain register, **without verifying it landed**.
+
+        The firmware sends no reply to a gain write, so nothing about
+        this call can tell you whether it worked. Prefer
+        :meth:`push_gains`, which reads every register back. This exists
+        for the cases that genuinely want a blind write — a diagnostic
+        tool, or a caller doing its own verification.
+
+        Args:
+            register: Which gain to write.
+            value: The new gain.
+
+        Raises:
+            SerialConnectionError: If the port is not open.
+        """
+        self._exchange(format_set_gain(register, value))
+
+    def push_gains(
+        self,
+        gains: Mapping[GainRegister, float],
+        *,
+        settle_s: float = DEFAULT_GAIN_SETTLE_S,
+    ) -> dict[GainRegister, float]:
+        """Write a set of gains and read every one of them back.
+
+        **Every register is verified, not a sample.** Gains are RAM-only
+        and re-pushed at every connect (integration rule 2.12), so a
+        write that silently fails leaves the rotor tracking on compiled
+        defaults while the application believes it is running a tuned
+        set — and every measurement taken afterwards is attributed to the
+        wrong configuration. That is a worse outcome than not pushing
+        gains at all, which is why this raises rather than warning.
+
+        Writes happen first and reads second, rather than
+        write-verify-write-verify, so the settle wait is paid once for
+        the whole set instead of once per register.
+
+        Args:
+            gains: The registers to write and the values to write them.
+            settle_s: How long to wait after the writes before reading
+                back. See :data:`DEFAULT_GAIN_SETTLE_S`.
+
+        Returns:
+            What each register read back, which on success equals what
+            was asked for.
+
+        Raises:
+            GainVerificationError: If any register disagrees with the
+                value written to it. The message names every register
+                that disagreed, not just the first — one wrong register
+                and six wrong registers are different faults.
+            SerialConnectionError: If the port is not open.
+            SerialTimeoutError: If the rotor doesn't answer a read.
+            ProtocolError: If a reply can't be parsed.
+        """
+        for register, value in gains.items():
+            self.write_gain(register, value)
+        if gains:
+            self._sleep(settle_s)
+
+        readback = {register: self.read_gain(register) for register in gains}
+        wrong = [
+            (register, gains[register], readback[register])
+            for register in gains
+            if abs(readback[register] - gains[register]) > GAIN_TOLERANCE
+        ]
+        if wrong:
+            detail = ", ".join(
+                f"{register.name} asked {asked:.2f} got {got:.2f}" for register, asked, got in wrong
+            )
+            raise GainVerificationError(
+                f"{len(wrong)} of {len(gains)} gain register(s) did not read back as "
+                f"written: {detail}. The controller is running gains nobody chose, so "
+                "anything measured now would be attributed to the wrong configuration."
+            )
+        return readback
 
     def wait_for_arrival(
         self,
