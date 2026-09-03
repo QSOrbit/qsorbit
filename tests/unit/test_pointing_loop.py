@@ -941,14 +941,38 @@ class TestStall:
         assert outcomes.count(TickOutcome.COMMANDED) == 1
 
     def test_the_guard_policy_can_be_supplied(self):
-        loop, rotor, _ = make_loop(
+        loop, _, _ = make_loop(
             self.moving_states(10),
             reported=Position(0.0, 0.0),
-            stall_guard=StallGuard(ticks=2),
+            stall_guard=StallGuard(window_s=2.0, free_play_deg=1.0),
         )
         outcomes = [loop.tick().outcome for _ in range(10)]
-        # A tighter guard declares the stall sooner than the default six.
+        # A tighter window declares the stall sooner than the default.
         assert outcomes.index(TickOutcome.STALLED) < 6
+
+    def test_free_play_does_not_hide_a_jam_from_the_loop(self):
+        # This rotator's azimuth has 2.95 deg of measured backlash, so a
+        # jammed axis nudged by wind wanders far more than the encoder's
+        # 0.1 deg resolution and arrives nowhere. Detection is net
+        # progress toward the setpoint, so the wandering does not help it.
+        wander = [0.0, 2.6, -0.2, 2.4, 0.1, 2.7, -0.3, 2.5, 0.0, 2.6, -0.1, 2.4, 0.2, 2.7]
+        reported = [Position(w, 45.0) for w in wander]
+        loop, _, _ = make_loop(self.moving_states(14), reported=reported)
+        outcomes = [loop.tick().outcome for _ in range(14)]
+
+        assert TickOutcome.STALLED in outcomes
+        assert loop.stalled_axes == ("azimuth",)
+
+    def test_wobble_on_a_following_axis_is_not_a_jam(self):
+        # The same wandering riding on an axis that is really getting
+        # somewhere. Free play is not evidence either way.
+        wobble = [0.0, 1.2, -0.8, 1.0, -0.6, 0.9, 0.0, 1.1, -0.4, 0.7, 0.0, 1.0, -0.5, 0.8]
+        reported = [Position(100.0 + 3.0 * n - 1.5 + wobble[n], 45.0) for n in range(14)]
+        loop, _, _ = make_loop(self.moving_states(14), reported=reported)
+        outcomes = [loop.tick().outcome for _ in range(14)]
+
+        assert TickOutcome.STALLED not in outcomes
+        assert loop.stall_events == 0
 
     def test_stalled_is_distinguishable_from_within_deadband(self):
         # Both command nothing. Off and broken should never look the

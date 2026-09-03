@@ -514,7 +514,7 @@ class TrackingLoop:
         self._last_commanded: Position | None = None
         self._latest_sample: TrackSample | None = None
         self._guard_rereads = 0
-        self._stall = StallDetector(stall_guard)
+        self._stall = StallDetector(stall_guard, interval_s)
         self._on_stall = on_stall
 
     # ------------------------------------------------------------------
