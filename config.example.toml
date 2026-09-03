@@ -217,38 +217,55 @@ deadband_deg = 0.25
 interval_s = 0.5
 arrival_window_deg = 1.0
 
-# The gains half of the validated set, and it ships COMMENTED OUT.
+# The gains half of the validated set.
 #
 # All six or none: whatever you leave out keeps the firmware's compiled
 # default, so a partial set runs a mixture nobody chose.
 #
-# Session 32 validated Ki 1.0 on both axes, Kp and Kd left at stock.
-# Uncommenting these as they stand will be REFUSED on the rotator whose
-# measurements are above, and the refusal is correct:
+# THE AZIMUTH Ki IS 0.97, NOT THE 1.0 SESSION 32 VALIDATED, and the
+# reason is worth reading before you change it.
 #
-#   azimuth:  0.5 x 1.0 x 2.95^2 / 0.25 = 17.4 PWM  vs  17 breakaway
+# QSOrbit refuses any integral gain that could wind past the motor's
+# breakaway before a stall is detected. Against the measurements above:
 #
-# A 2% miss, on azimuth only. The way through is not to trim Ki to fit
-# the clamp -- 0.98 would pass, but the sweep only ever measured Ki at
-# 0, 1.0 and 3.0, so 0.98 would be a number chosen to satisfy a
-# validator rather than because a bench run said so. The way through is
-# to measure free_play_deg against the disturbance the guard actually
-# has to tolerate. 2.95 is a hard human push on a boom; still air
-# measures 0.00 over 15 seconds. Anything at or under 2.91 clears
-# Ki 1.0 outright.
+#   azimuth:  0.5 x 1.00 x 2.95^2 / 0.25 = 17.40 PWM  vs  17 breakaway
+#   azimuth:  0.5 x 0.97 x 2.95^2 / 0.25 = 16.88 PWM  vs  17 breakaway
+#   elevation: 0.5 x 1.00 x 2.55^2 / 0.25 = 13.01 PWM vs  21 breakaway
+#
+# So elevation takes the validated 1.0 unchanged and azimuth misses by
+# 2.4%. 0.97 is the largest this rotator's own mechanics permit.
+#
+# This is rounding, not fitting. A value chosen to satisfy a validator
+# would be bad reasoning; a value 3% below a measured one, where the
+# measurement's own run-to-run spread is wider than 3%, is the nearest
+# safe point to what was validated. Session 32's candidate runs varied
+# more than that between repeats of an identical configuration.
+#
+# CAVEAT, and do not let it get lost: the asymmetric pair (az 0.97,
+# el 1.00) has never been bench-run together. The axes are independent
+# loops in the firmware, so there is no control-path reason for the
+# asymmetry to matter, but that is an argument rather than a
+# measurement.
+#
+# The better fix is still to measure free_play_deg against wind rather
+# than a hand push -- 2.95 is somebody leaning on a boom, and still air
+# reads 0.00 over 15 seconds. Anything at or under 2.91 restores Ki 1.00
+# on azimuth. Note that free play enters SQUARED, and wind force goes as
+# the square of wind speed, so deflection scales as v^2 and this
+# exposure as v^4: measure the wind at the same moment or the number
+# means nothing.
 #
 # Kd is listed for completeness, not as a knob worth turning: raising it
 # was measured and REFUTED. Derivative control closes a velocity loop
 # around a spring, and the boom's torsional ring-back is that spring, so
 # the term pumps the oscillation it is meant to damp. Every number got
 # worse.
-#
-# azimuth_kp = 8.0
-# azimuth_ki = 1.0
-# azimuth_kd = 0.5
-# elevation_kp = 10.0
-# elevation_ki = 1.0
-# elevation_kd = 0.3
+azimuth_kp = 8.0
+azimuth_ki = 0.97
+azimuth_kd = 0.5
+elevation_kp = 10.0
+elevation_ki = 1.0
+elevation_kd = 0.3
 
 
 # ---------------------------------------------------------------------
