@@ -45,10 +45,11 @@ from qsorbit.ui.custom_tab import (
     CustomTabConfig,
     custom_tab_config_path,
 )
-from qsorbit.ui.feed_hub import FeedHub
+from qsorbit.ui.feed_hub import FeedHub, RotorFeed
 from qsorbit.ui.frequency_widget import FrequencyWidget
 from qsorbit.ui.map_widget import MapWidget
 from qsorbit.ui.picker_widget import PickerWidget
+from qsorbit.ui.profile_widget import ProfileWidget
 from qsorbit.ui.quieting_widget import QuietingWidget
 from qsorbit.ui.readout_widget import ReadoutWidget
 from qsorbit.ui.spectrum_line_widget import SpectrumLineWidget
@@ -265,6 +266,14 @@ class RotorTab(QWidget):
                     index=0,
                 )
             )
+            left_layout.addWidget(
+                Card(
+                    "Tracking profile",
+                    _profile_panel(rotor),
+                    themes=themes,
+                    index=1,
+                )
+            )
         else:
             left_layout.addWidget(
                 Card(
@@ -296,6 +305,25 @@ class RotorTab(QWidget):
             ),
             1,
         )
+
+
+def _profile_panel(rotor: RotorFeed) -> QWidget:
+    """The toggle, or a placeholder saying why there isn't one.
+
+    Fewer than two declared profiles means there is nothing to switch
+    between, and a toggle with one option is a control that does
+    nothing. Naming the config key instead follows the same "off, not
+    broken" convention this tab already uses for a missing rotor and
+    :class:`PlanTab` uses for a missing TLE directory.
+    """
+    if len(rotor.profiles) < 2:
+        return Placeholder(
+            "Declare at least two profiles under [rotor.profiles] in your "
+            "station config to switch between them mid-pass. "
+            "config.example.toml ships a stock and a tracking profile.",
+            compact=True,
+        )
+    return ProfileWidget(rotor.loop, rotor.profiles)
 
 
 class PlanTab(QWidget):

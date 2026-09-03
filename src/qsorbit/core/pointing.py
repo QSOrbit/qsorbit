@@ -57,7 +57,11 @@ from qsorbit.core.geometry import AzEl
 from qsorbit.core.rotor import Position, Rotor, format_set_position
 from qsorbit.core.stall_guard import StallDetector, StallGuard
 from qsorbit.core.tracker import ObserverLocation, Target
-from qsorbit.core.tracking_profile import DEFAULT_INTERVAL_S, check_cadence
+from qsorbit.core.tracking_profile import (
+    DEFAULT_INTERVAL_S,
+    TrackingProfile,
+    check_cadence,
+)
 
 #: How often :meth:`TrackingLoop.run` samples the target, in seconds.
 #:
@@ -80,6 +84,17 @@ FIRMWARE_DEADZONE_DEG = 0.2
 
 class PointingError(Exception):
     """Base exception for the pointing layer."""
+
+
+class ProfileSwitchError(PointingError):
+    """Raised when a tracking profile cannot be switched to right now.
+
+    A refusal about *timing*, not about the profile: the same profile
+    is accepted once the axis it was refused over is following again.
+    Separate from the value-object rejections in
+    :mod:`qsorbit.core.tracking_profile`, which say the profile is
+    wrong rather than that this is the wrong moment.
+    """
 
 
 class TravelGuardError(PointingError):
@@ -492,6 +507,8 @@ class TrackingLoop:
         alignment_offset: AlignmentOffset = IDENTITY_ALIGNMENT_OFFSET,
         stall_guard: StallGuard | None = None,
         on_stall: Callable[[tuple[str, ...]], None] | None = None,
+        profile: TrackingProfile | None = None,
+        on_profile_change: Callable[[TrackingProfile], None] | None = None,
         now: Callable[[], datetime] = _utc_now,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
@@ -501,6 +518,18 @@ class TrackingLoop:
         if deadband_deg < 0.0:
             raise ValueError(f"deadband_deg must not be negative, got {deadband_deg}.")
         check_cadence(deadband_deg, interval_s)
+        if profile is not None and (
+            profile.interval_s != interval_s or profile.deadband_deg != deadband_deg
+        ):
+            # A wiring mistake rather than a bad value: somebody built
+            # the loop from one profile's numbers and labelled it with
+            # another's, and every later report of "which profile is
+            # running" would be wrong.
+            raise ValueError(
+                f"Tracking profile {profile.name!r} says deadband {profile.deadband_deg:g} "
+                f"at {profile.interval_s:g} s, but this loop was built with "
+                f"{deadband_deg:g} at {interval_s:g} s."
+            )
 
         self._target = target
         self._observer = observer
@@ -516,6 +545,10 @@ class TrackingLoop:
         self._guard_rereads = 0
         self._stall = StallDetector(stall_guard, interval_s)
         self._on_stall = on_stall
+        self._profile = profile
+        self._on_profile_change = on_profile_change
+        self._pending_profile: TrackingProfile | None = None
+        self._profile_refusal: str | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -530,6 +563,45 @@ class TrackingLoop:
     def deadband_deg(self) -> float:
         """How far the target must move before a new command is sent."""
         return self._deadband_deg
+
+    @property
+    def active_profile(self) -> TrackingProfile | None:
+        """The profile currently in force, or ``None`` if unlabelled.
+
+        ``None`` is a real state, not a missing one: a loop built from
+        bare numbers -- a test, or ``--interval`` with no profile
+        declared -- is running a cadence that no profile names.
+        """
+        return self._profile
+
+    @property
+    def interval_s(self) -> float:
+        """Seconds between ticks.
+
+        Read by whatever drives this loop, so a profile switch that
+        changes the cadence reaches the timer without the timer needing
+        to be told. :meth:`run` reads it every iteration for the same
+        reason.
+        """
+        return self._interval_s
+
+    @property
+    def pending_profile(self) -> TrackingProfile | None:
+        """The profile queued for the next tick, or ``None``.
+
+        Non-``None`` is the honest state to show on a toggle: the switch
+        has been asked for and has not happened yet.
+        """
+        return self._pending_profile
+
+    @property
+    def profile_refusal(self) -> str | None:
+        """Why the last profile switch was refused, or ``None``.
+
+        Cleared when a switch is next requested successfully, so it
+        describes the most recent attempt rather than accumulating.
+        """
+        return self._profile_refusal
 
     @property
     def alignment_offset(self) -> AlignmentOffset:
@@ -560,6 +632,82 @@ class TrackingLoop:
     # Running
     # ------------------------------------------------------------------
 
+    def request_profile(self, profile: TrackingProfile) -> None:
+        """Queue a profile to take effect at the top of the next tick.
+
+        **Queued rather than applied here, and that is the design.** A
+        switch is not two numbers: it is up to six serial writes, a
+        settle, and six reads back — one to two seconds of I/O on the
+        port this loop already owns. Applying it from a button press
+        would mean either freezing whatever thread the button lives on,
+        or adding a lock to the one path in this project that has
+        deliberately stayed single-owner. Letting the loop apply it at
+        the top of its own next tick costs at most one interval of
+        latency, which is invisible, and keeps the port owned by exactly
+        one thread.
+
+        Requesting a second profile before the first is applied replaces
+        it. Nothing has reached the rotor yet, so there is nothing to
+        undo, and applying a superseded switch would push gains nobody
+        currently wants.
+
+        Args:
+            profile: The profile to switch to.
+
+        Raises:
+            ProfileSwitchError: If an axis is currently stalled. A
+                stalled axis has error the guard froze the setpoint to
+                contain, and raising its gains is the runaway this
+                module's stall handling exists to prevent.
+        """
+        if self._stall.is_stalled:
+            stuck = ", ".join(self._stall.stalled_axes) or "an axis"
+            self._profile_refusal = (
+                f"Cannot switch to {profile.name!r} while {stuck} is stalled. "
+                "A stalled axis is holding error that the frozen setpoint is "
+                "containing, and new gains would act on all of it at once. "
+                "Free the axis first; the switch is available again on the "
+                "tick it starts following."
+            )
+            raise ProfileSwitchError(self._profile_refusal)
+        self._profile_refusal = None
+        self._pending_profile = profile
+
+    def _apply_pending_profile(self) -> None:
+        """Apply a queued profile, if one is queued and it is still safe.
+
+        Re-checks the stall, because a stall can arrive in the tick
+        between the request and here. On that race the switch is
+        **dropped rather than applied late**: an operator who asked for
+        gains half a second before an axis jammed did not ask for gains
+        on a jammed axis.
+
+        The gain push is not caught. A verification failure means the
+        controller is running a mixture nobody chose, so it propagates
+        out of :meth:`tick` and stops whatever is driving the loop —
+        the same path any serial fault already takes.
+        """
+        profile = self._pending_profile
+        if profile is None:
+            return
+        if self._stall.is_stalled:
+            stuck = ", ".join(self._stall.stalled_axes) or "an axis"
+            self._pending_profile = None
+            self._profile_refusal = (
+                f"Dropped the queued switch to {profile.name!r}: {stuck} stalled "
+                "before it could be applied. Ask again once the axis is following."
+            )
+            return
+
+        self._pending_profile = None
+        if self._on_profile_change is not None:
+            self._on_profile_change(profile)
+        self._profile = profile
+        self._interval_s = profile.interval_s
+        self._deadband_deg = profile.deadband_deg
+        self._stall = self._stall.rescaled(profile.interval_s)
+        self._profile_refusal = None
+
     def tick(self) -> TrackSample:
         """Sample the target once, and command the rotor if it has moved enough.
 
@@ -584,6 +732,7 @@ class TrackingLoop:
             ProtocolError: If a reply can't be parsed.
             PropagationError: If the target's position can't be computed.
         """
+        self._apply_pending_profile()
         now = self._now()
         state = self._target.topocentric_state(self._observer, now)
         rotor_position = self._read_guarded_position()

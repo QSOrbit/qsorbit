@@ -67,6 +67,7 @@ from typing import Protocol
 
 from qsorbit.core.dsp.spectrum_stream import SpectrumStream, SpectrumSubscription
 from qsorbit.core.pointing import TrackingLoop
+from qsorbit.core.tracking_profile import TrackingProfile
 
 
 def _no_fault() -> None:
@@ -197,21 +198,36 @@ class RotorFeed:
             handed whatever killed it.
     """
 
-    __slots__ = ("_fault", "_loop")
+    __slots__ = ("_fault", "_loop", "_profiles")
 
     def __init__(
         self,
         loop: TrackingLoop,
         *,
         fault: Callable[[], BaseException | None] = _no_fault,
+        profiles: tuple[TrackingProfile, ...] = (),
     ) -> None:
         self._loop = loop
         self._fault = fault
+        self._profiles = profiles
 
     @property
     def loop(self) -> TrackingLoop:
         """The loop to read. Reading is free; ticking belongs to somebody else."""
         return self._loop
+
+    @property
+    def profiles(self) -> tuple[TrackingProfile, ...]:
+        """Every tracking profile this station declares, in config order.
+
+        Carried on the feed rather than read off the loop because the
+        loop knows only the profile it is *running*; which alternatives
+        exist is station config, and a toggle needs the list. Empty is a
+        normal state -- a station that declares no ``[rotor.profiles]``
+        has nothing to toggle between, and the tab says so rather than
+        showing a control with one option.
+        """
+        return self._profiles
 
     @property
     def fault(self) -> Callable[[], BaseException | None]:
@@ -278,6 +294,7 @@ class FeedHub:
         radio: RadioSource | None = None,
         tracking: TrackingLoop | None = None,
         tracking_fault: Callable[[], BaseException | None] = _no_fault,
+        tracking_profiles: tuple[TrackingProfile, ...] = (),
     ) -> None:
         self._spectrum = spectrum
         self._radio = radio
@@ -285,7 +302,11 @@ class FeedHub:
 
         self._quieting = QuietingFeed(radio) if radio is not None else None
         self._tracked_frequency = TrackedFrequencyFeed(radio) if radio is not None else None
-        self._rotor = RotorFeed(tracking, fault=tracking_fault) if tracking is not None else None
+        self._rotor = (
+            RotorFeed(tracking, fault=tracking_fault, profiles=tracking_profiles)
+            if tracking is not None
+            else None
+        )
 
     # ------------------------------------------------------------------
     # Streams — claimed
