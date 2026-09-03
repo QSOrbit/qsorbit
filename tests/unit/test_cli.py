@@ -22,6 +22,7 @@ from qsorbit.__main__ import (
     DEFAULT_TUNING_OFFSET_KHZ,
     _describe_mechanics,
     _parse_audio_device,
+    _profile_pusher,
     _push_profile_gains,
     _quit_on_sigint,
     _range_rate_interval,
@@ -1778,3 +1779,63 @@ class TestDescribeMechanics:
     def test_the_lines_are_ascii(self):
         for line in _describe_mechanics(_station().capabilities):
             line.encode("ascii")
+
+
+class TestProfilePusher:
+    """The callback the tracking loop runs when a queued switch lands.
+
+    It exists so the gain write happens on whichever thread ticks the
+    loop -- the thread that already owns the serial port. That is what
+    lets the switch be queued instead of locked.
+    """
+
+    def _profile(self, **overrides):
+        from qsorbit.core.tracking_profile import TrackingProfile
+
+        fields = {
+            "name": "tracking",
+            "deadband_deg": 0.25,
+            "interval_s": 0.5,
+            "azimuth_kp": 8.0,
+            "azimuth_ki": 0.5,
+            "azimuth_kd": 0.5,
+            "elevation_kp": 10.0,
+            "elevation_ki": 0.5,
+            "elevation_kd": 0.3,
+        }
+        fields.update(overrides)
+        return TrackingProfile(**fields)
+
+    def test_pushing_reaches_the_rotor(self, capsys):
+        rotor = _GainRecordingRotor()
+        _profile_pusher(rotor, _station())(self._profile())
+        assert len(rotor.pushed) == 1
+
+    def test_a_stock_profile_writes_nothing(self, capsys):
+        from qsorbit.core.tracking_profile import TrackingProfile
+
+        rotor = _GainRecordingRotor()
+        stock = TrackingProfile(name="stock", deadband_deg=2.5, interval_s=1.0)
+        _profile_pusher(rotor, _station())(stock)
+        assert rotor.pushed == []
+
+    def test_a_verification_failure_is_not_swallowed(self):
+        # Phil's call: a failed mid-pass switch stops the run. The
+        # callback must therefore let the error out, so it propagates
+        # through tick() to whatever is driving the loop.
+        from qsorbit.core.rotor import GainVerificationError
+
+        rotor = _GainRecordingRotor(raises=GainVerificationError("register 2 disagreed"))
+        with pytest.raises(GainVerificationError):
+            _profile_pusher(rotor, _station())(self._profile())
+
+    def test_the_clamp_still_applies_to_a_switched_in_profile(self, capsys):
+        # A profile can reach the loop from --rotor-profile or a toggle
+        # press, not only from config. This is the last gate before the
+        # wire in both cases.
+        from qsorbit.core.tracking_profile import GainClampError
+
+        rotor = _GainRecordingRotor()
+        with pytest.raises(GainClampError):
+            _profile_pusher(rotor, _station())(self._profile(azimuth_ki=1.0))
+        assert rotor.pushed == []

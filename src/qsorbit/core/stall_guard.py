@@ -250,6 +250,25 @@ class StallDetector:
         """The policy this detector is applying."""
         return self._guard
 
+    def rescaled(self, interval_s: float) -> StallDetector:
+        """A fresh detector with the same policy at a new cadence.
+
+        Used when a tracking profile switch changes the interval. The
+        guard's window is a **duration**, so the number of ticks it
+        spans changes with the cadence and the deque has to be rebuilt.
+
+        **History is deliberately not carried over.** The samples in it
+        were taken at the old cadence, so the same number of them covers
+        a different span of time; mixing the two would make the window
+        neither duration. Starting clean costs one detection window of
+        blindness right after a switch, which is the honest price of
+        having changed the thing the window is measured in. Arming is
+        lost with it, so each axis has to be seen following again before
+        it is judged -- the same standing start the loop already handles
+        at the beginning of every run.
+        """
+        return StallDetector(self._guard, interval_s)
+
     @property
     def ticks(self) -> int:
         """How many ticks of evidence this detector needs."""

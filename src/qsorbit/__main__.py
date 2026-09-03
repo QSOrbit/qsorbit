@@ -1340,7 +1340,9 @@ def _command_receive(
                 deadband_deg=profile.deadband_deg,
                 alignment_offset=_alignment_offset(config),
                 stall_guard=_stall_guard(config),
+                profile=profile,
                 on_stall=_report_stall,
+                on_profile_change=_profile_pusher(rotor, config),
             )
             return run(args, config, satellite, applied, nbfm, doppler, squelch, sdr, loop=loop)
 
@@ -1496,6 +1498,29 @@ def _push_profile_gains(rotor: Rotor, profile: TrackingProfile, config: StationC
         f"           RAM only: a power cycle reverts these, and they are checked "
         f"against this rotor's breakaway at {DESIGN_RATE_DEG_S:g} deg/s"
     )
+
+
+def _profile_pusher(rotor: Rotor, config: StationConfig) -> Callable[[TrackingProfile], None]:
+    """The callback the tracking loop runs when a profile switch lands.
+
+    Handed to :class:`~qsorbit.core.pointing.TrackingLoop` so the push
+    happens **on whichever thread ticks the loop**, which is the thread
+    that already owns the serial port. That is the whole reason the
+    switch is queued rather than applied from the button: no lock, no
+    second owner, and it works the same under the GUI ticker and under
+    ``ReceiveSession``'s tracking thread.
+
+    Nothing is caught. A :class:`~qsorbit.core.rotor.GainVerificationError`
+    means the controller is running a gain mixture nobody chose, so it
+    propagates out of ``tick()`` and stops the run -- Phil's call, over
+    carrying on with an unknown tuning that would misattribute every
+    measurement taken afterwards.
+    """
+
+    def push(profile: TrackingProfile) -> None:
+        _push_profile_gains(rotor, profile, config)
+
+    return push
 
 
 def _tracking_profile(args: argparse.Namespace, config: StationConfig) -> TrackingProfile:
@@ -2055,7 +2080,9 @@ def _run_shell_tracking_only(
             deadband_deg=profile.deadband_deg,
             alignment_offset=_alignment_offset(config),
             stall_guard=_stall_guard(config),
+            profile=profile,
             on_stall=_report_stall,
+            on_profile_change=_profile_pusher(rotor, config),
         )
         # The ticker is built BEFORE the hub, because the hub needs its
         # fault callable. A readout left showing its last plausible
@@ -2063,7 +2090,11 @@ def _run_shell_tracking_only(
         # PR2 added `tracking_error` to prevent, and it would be a poor
         # joke to reintroduce it in the shell.
         ticker = _GuiThreadTicker(loop, interval_s=profile.interval_s)
-        hub = FeedHub(tracking=loop, tracking_fault=ticker.fault)
+        hub = FeedHub(
+            tracking=loop,
+            tracking_fault=ticker.fault,
+            tracking_profiles=config.tracking.profiles,
+        )
         print(hub.describe())
         custom_tab, custom_tab_error = _shell_custom_tab(args)
         catalog, manifest = _shell_planning_catalog()
@@ -2248,6 +2279,14 @@ class _GuiThreadTicker:
     def _tick(self) -> None:
         try:
             self._loop.tick()
+            # Re-read rather than be told. A profile switch is applied
+            # inside tick(), by the loop, on its own thread -- so the
+            # timer finds out the same way anything else does, by
+            # reading the value afterwards. A callback would mean the
+            # loop knowing a Qt timer exists.
+            wanted = int(self._loop.interval_s * 1000)
+            if wanted != self._timer.interval():
+                self._timer.setInterval(wanted)
         except Exception as exc:  # noqa: BLE001 - recorded, not raised into Qt
             # Raising here would unwind through Qt's C++ dispatch, which
             # prints a traceback and carries on -- leaving a readout
