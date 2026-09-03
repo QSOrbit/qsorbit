@@ -240,6 +240,7 @@ class StallDetector:
         self._interval_s = interval_s
         self._history: deque[tuple[Position, Position]] = deque(maxlen=self._ticks + 1)
         self._stalled = False
+        self._armed_axes: set[str] = set()
         self._stalled_axes: tuple[str, ...] = ()
         self._stalled_at: Position | None = None
         self._events = 0
@@ -263,6 +264,18 @@ class StallDetector:
     def is_stalled(self) -> bool:
         """Whether an axis is currently believed to be jammed."""
         return self._stalled
+
+    @property
+    def armed_axes(self) -> frozenset[str]:
+        """Which axes have been seen to follow, and are therefore judged.
+
+        An axis stays unarmed -- and unjudged -- until one window shows
+        it making real progress. Exposed because "the guard never fired"
+        and "the guard was never watching" are different states, and an
+        operator chasing a missed stall needs to be able to tell them
+        apart.
+        """
+        return frozenset(self._armed_axes)
 
     @property
     def stalled_axes(self) -> tuple[str, ...]:
@@ -320,13 +333,20 @@ class StallDetector:
         # the gravity load, has the higher stiction breakaway, and
         # Session 32 measured its up and down runs as separate
         # experiments for exactly that reason.
-        stalled = tuple(
-            axis
-            for axis in AXES
-            if self._axis_is_stuck(
+        stalled = []
+        for axis in AXES:
+            verdict = self._judge(
                 oldest_commanded, newest_commanded, oldest_reported, newest_reported, axis
             )
-        )
+            if verdict == "armed":
+                # Judging restarts from a window that lies entirely
+                # after the axis was seen following, rather than one
+                # still straddling its standing start.
+                self._history.clear()
+                return False
+            if verdict == "stuck":
+                stalled.append(axis)
+        stalled = tuple(stalled)
         if stalled:
             self._stalled = True
             self._stalled_axes = stalled
@@ -335,15 +355,33 @@ class StallDetector:
             self._history.clear()
         return self._stalled
 
-    def _axis_is_stuck(
+    def _judge(
         self,
         oldest_commanded: Position,
         newest_commanded: Position,
         oldest_reported: Position,
         newest_reported: Position,
         axis: str,
-    ) -> bool:
-        """Whether one axis has fallen behind its setpoint by more than the slop.
+    ) -> str:
+        """Classify one axis over the window: ``"ok"``, ``"armed"`` or ``"stuck"``.
+
+        **An axis is not judged until it has been seen to follow.** A
+        standing start looks exactly like a jam to the shortfall test:
+        the axis has to break stiction while the setpoint is already
+        walking away, so it sheds several degrees before it is properly
+        moving. Two bench runs on 2026-09-02 declared a stall within
+        eight seconds of starting, on axes that were visibly
+        accelerating -- run A shed 3.50° during acquisition against the
+        3.70° a genuine jam shed later the same evening. The numbers do
+        not separate, because the difference is not inside the window:
+        acquisition recovers and a jam does not.
+
+        So the detector arms per axis on the first window showing real
+        progress, and only then starts judging. The gap this leaves is
+        worth stating: **an axis already jammed before the track begins
+        is never flagged.** That case is visible to the operator the
+        moment nothing moves, and it is not the one this guard exists
+        for -- a snag developing mid-pass is.
 
         **The comparison is the shortfall, not the progress.** An earlier
         version asked whether net progress was under the free play, using
@@ -372,11 +410,18 @@ class StallDetector:
             # past the play inside the window, and no jam can be seen
             # until it does. That is a consequence of having 3° of
             # backlash, not something this code can decide away.
-            return False
+            return "ok"
         progress = _signed(newest_reported, oldest_reported, axis)
         toward = progress if advance > 0.0 else -progress
+
+        if axis not in self._armed_axes:
+            if toward > self._guard.free_play_deg:
+                self._armed_axes.add(axis)
+                return "armed"
+            return "ok"
+
         shortfall = abs(advance) - toward
-        return shortfall > self._guard.free_play_deg
+        return "stuck" if shortfall > self._guard.free_play_deg else "ok"
 
     def _check_recovery(self, reported: Position) -> None:
         """Clear the stall once the axis is seen to move again.

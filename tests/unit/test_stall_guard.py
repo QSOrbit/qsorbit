@@ -36,8 +36,31 @@ def drive(detector: StallDetector, pairs) -> list[bool]:
     return [detector.observe(commanded, reported) for commanded, reported in pairs]
 
 
-def detector(guard: StallGuard = TIGHT, interval_s: float = 1.0) -> StallDetector:
-    return StallDetector(guard, interval_s)
+def arm(d: StallDetector, axis: str) -> None:
+    """Feed following motion until the detector arms that axis.
+
+    The detector will not judge an axis it has never seen follow, so
+    almost every test below has to get past that first. Arming clears
+    the history, so whatever a test drives afterwards is judged on a
+    window made only of its own data.
+    """
+    for n in range(1, 60):
+        commanded = pos(2.0 * n) if axis == "azimuth" else Position(0.0, 2.0 * n)
+        reported = pos(2.0 * n - 0.3) if axis == "azimuth" else Position(0.0, 2.0 * n - 0.3)
+        d.observe(commanded, reported)
+        if axis in d.armed_axes:
+            return
+    raise AssertionError(f"detector never armed {axis}")
+
+
+def detector(
+    guard: StallGuard = TIGHT, interval_s: float = 1.0, *, armed: bool = True
+) -> StallDetector:
+    d = StallDetector(guard, interval_s)
+    if armed:
+        arm(d, "azimuth")
+        arm(d, "elevation")
+    return d
 
 
 class TestDetection:
@@ -105,7 +128,8 @@ class TestDetection:
         # Canary. A guard nobody has watched refuse something is not a
         # guard -- Session 27 shipped a check that could not have failed.
         d = StallDetector(StallGuard(window_s=1.0, free_play_deg=1.0), 1.0)
-        assert any(d.observe(pos(2.0 * n), pos(0.0)) for n in range(1, 5))
+        arm(d, "azimuth")
+        assert any(d.observe(pos(100.0 + 2.0 * n), pos(100.0)) for n in range(1, 6))
 
 
 class TestRecovery:
@@ -190,8 +214,10 @@ class TestWindowIsADuration:
         # Six seconds of a 1 deg/s target either way.
         slow = StallDetector(StallGuard(window_s=6.0, free_play_deg=1.0), 1.0)
         fast = StallDetector(StallGuard(window_s=6.0, free_play_deg=1.0), 0.5)
-        slow_verdicts = drive(slow, [(pos(1.0 * n), pos(0.0)) for n in range(1, 12)])
-        fast_verdicts = drive(fast, [(pos(0.5 * n), pos(0.0)) for n in range(1, 24)])
+        arm(slow, "azimuth")
+        arm(fast, "azimuth")
+        slow_verdicts = drive(slow, [(pos(200.0 + 1.0 * n), pos(200.0)) for n in range(1, 12)])
+        fast_verdicts = drive(fast, [(pos(200.0 + 0.5 * n), pos(200.0)) for n in range(1, 24)])
         assert slow_verdicts.index(True) * 1.0 == pytest.approx(
             fast_verdicts.index(True) * 0.5, abs=0.5
         )
@@ -257,6 +283,7 @@ class TestTheBenchFalsePositive:
         # under the threshold the advance is slightly over.
         guard = StallGuard(window_s=3.0, free_play_deg=3.0)
         d = StallDetector(guard, 1.0)
+        arm(d, "azimuth")
         commanded = [0.0, 0.0, 3.2, 3.2, 3.2, 3.2]
         reported = [0.0, 0.4, 1.1, 2.0, 2.6, 2.9]
         verdicts = [d.observe(pos(c), pos(r)) for c, r in zip(commanded, reported, strict=True)]
@@ -266,6 +293,7 @@ class TestTheBenchFalsePositive:
         # The control for the test above: identical setpoint, axis stuck.
         guard = StallGuard(window_s=3.0, free_play_deg=3.0)
         d = StallDetector(guard, 1.0)
+        arm(d, "azimuth")
         commanded = [0.0, 0.0, 3.2, 3.2, 3.2, 3.2]
         verdicts = [d.observe(pos(c), pos(0.0)) for c in commanded]
         assert verdicts[-1] is True
@@ -275,6 +303,7 @@ class TestTheBenchFalsePositive:
         # fixed lag; it must not matter how long the pass runs.
         guard = StallGuard(window_s=6.0, free_play_deg=3.0)
         d = StallDetector(guard, 1.0)
+        arm(d, "azimuth")
         verdicts = [d.observe(pos(0.7 * n), pos(0.7 * n - 2.1)) for n in range(1, 200)]
         assert not any(verdicts)
 
@@ -283,6 +312,7 @@ class TestTheBenchFalsePositive:
         # explain -- a slipping drive rather than a hard jam.
         guard = StallGuard(window_s=6.0, free_play_deg=3.0)
         d = StallDetector(guard, 1.0)
+        arm(d, "azimuth")
         verdicts = [d.observe(pos(1.0 * n), pos(0.2 * n)) for n in range(1, 20)]
         assert any(verdicts)
 
@@ -301,3 +331,137 @@ class TestOperatorMessage:
         with redirect_stdout(buf):
             _report_stall(("elevation",))
         buf.getvalue().encode("ascii")
+
+
+# ---------------------------------------------------------------------------
+# Replayed bench logs, 2026-09-02
+# ---------------------------------------------------------------------------
+
+# (commanded_az, commanded_el, reported_az, reported_el) per tick, taken
+# straight off the console. `observe` sees the PREVIOUS tick's commanded
+# position, which is what `replay` below reproduces.
+
+_RUN_HEALTHY_START_AZ = [
+    (1.50, 5.00, 1.60, 1.50),
+    (1.50, 5.00, 1.60, 2.50),
+    (1.50, 5.00, 1.60, 3.30),
+    (4.50, 5.00, 1.60, 3.50),
+    (4.50, 5.00, 2.10, 3.50),
+    (4.50, 5.00, 2.90, 3.50),
+    (7.50, 5.00, 3.00, 3.50),
+    (7.50, 5.00, 4.10, 3.50),
+    (7.50, 5.00, 5.30, 3.50),
+    (7.50, 5.00, 6.20, 3.50),
+    (7.50, 5.00, 6.20, 3.50),
+    (7.50, 5.00, 6.30, 3.50),
+]
+
+_RUN_HEALTHY_START_EL = [
+    (96.20, 3.50, 96.20, 3.50),
+    (96.20, 3.50, 96.20, 3.50),
+    (96.20, 3.50, 96.20, 3.50),
+    (96.20, 6.50, 96.20, 3.50),
+    (96.20, 6.50, 96.20, 4.40),
+    (96.20, 6.50, 96.20, 4.50),
+    (96.20, 9.50, 96.20, 4.50),
+    (96.20, 9.50, 96.20, 6.40),
+    (96.20, 9.50, 96.20, 7.40),
+    (96.20, 9.50, 96.20, 7.40),
+    (96.20, 9.50, 96.20, 7.40),
+]
+
+_RUN_REAL_STALL = [
+    (1.60, 5.00, 1.50, 1.60),
+    (1.60, 5.00, 1.60, 2.60),
+    (1.60, 5.00, 1.60, 3.40),
+    (4.60, 5.00, 1.60, 3.50),
+    (4.60, 5.00, 1.70, 3.50),
+    (4.60, 5.00, 3.10, 3.50),
+    (7.60, 5.00, 3.00, 3.50),
+    (7.60, 5.00, 5.00, 3.50),
+    (7.60, 5.00, 5.60, 3.50),
+    (10.60, 5.00, 6.20, 3.50),
+    (10.60, 5.00, 7.80, 3.50),
+    (10.60, 5.00, 8.40, 3.50),
+    (13.60, 5.00, 9.50, 3.50),
+    (13.60, 5.00, 10.50, 3.50),
+    (13.60, 5.00, 11.30, 3.50),
+    (16.60, 5.00, 12.00, 3.50),
+    (16.60, 5.00, 13.70, 3.50),
+    (16.60, 5.00, 14.90, 3.50),
+    (19.60, 5.00, 14.90, 3.50),
+    (19.60, 5.00, 17.10, 3.50),
+    (19.60, 5.00, 17.70, 3.50),
+    (22.60, 5.00, 18.20, 3.50),
+    (22.60, 5.00, 19.60, 3.50),
+    (22.60, 5.00, 20.50, 3.50),
+    (25.60, 5.00, 21.40, 3.50),
+    (25.60, 5.00, 22.50, 3.50),
+    (25.60, 5.00, 23.50, 3.50),
+    (28.60, 5.00, 24.30, 3.50),
+    (28.60, 5.00, 25.70, 3.50),
+    (28.60, 5.00, 26.70, 3.50),
+    (31.60, 5.00, 26.80, 3.50),
+    (31.60, 5.00, 28.90, 3.50),
+    (31.60, 5.00, 29.90, 3.50),
+    (34.60, 5.00, 30.20, 3.50),
+    (34.60, 5.00, 31.80, 3.50),
+    (34.60, 5.00, 32.30, 3.50),
+    (37.60, 5.00, 32.00, 3.50),
+    (37.60, 5.00, 32.10, 3.50),
+    (37.60, 5.00, 32.20, 3.50),
+    (37.60, 5.00, 32.30, 3.50),
+    (37.60, 5.00, 32.40, 3.50),
+    (37.60, 5.00, 32.40, 3.50),
+]
+
+
+def replay(rows) -> tuple[StallDetector, int | None]:
+    """Feed a logged run through a detector on stock defaults."""
+    d = StallDetector(StallGuard(), 1.0)
+    last_commanded: Position | None = None
+    fired_at: int | None = None
+    for tick, (c_az, c_el, r_az, r_el) in enumerate(rows):
+        if d.observe(last_commanded, Position(r_az, r_el)) and fired_at is None:
+            fired_at = tick
+        last_commanded = Position(c_az, c_el)
+    return d, fired_at
+
+
+class TestAgainstBenchLogs:
+    """Real runs from 2026-09-02, replayed.
+
+    Two of the three bench runs that evening false-positived within eight
+    seconds of starting, on axes that were visibly accelerating. These
+    are those runs, not a reconstruction of them -- the numbers are the
+    console output. Any future change to the detection rule has to keep
+    all three of these verdicts.
+    """
+
+    def test_a_standing_start_on_azimuth_is_not_a_stall(self):
+        # Ran 01:07:47. Declared a stall at tick 7 while the axis was
+        # accelerating through 1.60 -> 4.10 -> 5.30 -> 6.20.
+        d, fired = replay(_RUN_HEALTHY_START_AZ)
+        assert fired is None, "healthy azimuth acquisition must not stall"
+
+    def test_a_standing_start_on_elevation_is_not_a_stall(self):
+        # Ran 01:10:58. Same shape, and elevation breaks stiction later
+        # than azimuth because it carries the boom.
+        d, fired = replay(_RUN_HEALTHY_START_EL)
+        assert fired is None, "healthy elevation acquisition must not stall"
+
+    def test_the_real_stall_is_still_caught(self):
+        # Ran 00:58:53. Motor leads cut around tick 33; the axis settles
+        # at 32.4 and stops. The control for the two above -- a rule that
+        # silenced them by going deaf would pass those and fail this.
+        d, fired = replay(_RUN_REAL_STALL)
+        assert fired is not None
+        assert 34 <= fired <= 40, f"expected detection in the mid-to-late 30s, got {fired}"
+        assert d.stalled_axes == ("azimuth",)
+        assert d.events == 1
+
+    def test_elevation_is_not_blamed_for_an_azimuth_stall(self):
+        # Elevation sat at 3.50 throughout, commanded and reported. A
+        # static axis is not a failing one.
+        d, _ = replay(_RUN_REAL_STALL)
+        assert "elevation" not in d.stalled_axes
