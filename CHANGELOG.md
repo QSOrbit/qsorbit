@@ -176,6 +176,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Writing gains verifies every register by reading it back, and refuses to continue if any disagrees. There is no memory behind these settings -- a power cycle restores the controller's built-in values and any tuning has to be re-sent each time it connects -- so a write that quietly failed would leave the rotator running settings nobody chose while the application believed otherwise. Every measurement taken afterwards would then be filed under the wrong configuration, which is worse than not adjusting anything at all.
 - A gain read that comes back for the wrong register is refused rather than accepted, since that means replies have slipped out of step with commands and every later reading would be attributed to the wrong setting.
 
+### Fixed
+
+- The instrument window no longer fails to open when `receive` is run with both `--window` and `--send` and no explicit `--interval`. The readout's refresh rate was reading a setting that has been allowed to be unset since tracking profiles arrived -- profiles exist so the cadence can come from the profile rather than the command line -- and it now falls back to its own default instead. The rate a display repaints at and the rate a rotor is commanded at are different quantities that happen to share a flag; `--interval` still moves both when it is given.
+
 <!--
 When adding entries, group them under these headings as needed:
 

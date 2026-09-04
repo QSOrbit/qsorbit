@@ -26,6 +26,7 @@ from qsorbit.__main__ import (
     _push_profile_gains,
     _quit_on_sigint,
     _range_rate_interval,
+    _readout_poll_interval_ms,
     _spectrum_factory,
     _squelch_status_line,
     _stall_guard,
@@ -878,6 +879,36 @@ class TestStatus:
         # that, on both.
         args = argparse.Namespace(interval=0.25, rotor_profile=None)
         assert _range_rate_interval(args) == 0.25
+
+    def test_the_readout_falls_back_to_its_own_default_interval(self):
+        # `receive --window --send` with no --interval used to reach
+        # int(None * 1000) and die building the window. --interval
+        # defaults to None so a profile can decide the rotor's cadence;
+        # a readout's repaint rate is a different quantity that merely
+        # shared the flag, and the absence of one is not the absence of
+        # the other.
+        #
+        # 4321 rather than the real 1000 on purpose: an assertion that
+        # passes because some unrelated value in the fixture happens to
+        # equal the answer is not evidence.
+        args = argparse.Namespace(interval=None, rotor_profile="tracking")
+        assert _readout_poll_interval_ms(args, 4321) == 4321
+
+    def test_an_explicit_interval_still_moves_the_readout(self):
+        # Unchanged behaviour where --interval was given: an operator
+        # who named a tick asked for exactly that, here too.
+        args = argparse.Namespace(interval=0.25, rotor_profile=None)
+        assert _readout_poll_interval_ms(args, 4321) == 250
+
+    def test_the_receive_parser_still_leaves_interval_unset(self):
+        # The guard above only earns its keep while --interval really
+        # can arrive as None. If a numeric default is ever restored,
+        # this fails and points at the reason the guard exists rather
+        # than leaving it looking like dead defensiveness.
+        args = build_parser().parse_args(
+            ["receive", "--tle", "x", "--downlink", "145.95", "--gain", "40"]
+        )
+        assert args.interval is None
 
     def test_reports_no_alignment_recorded_by_default(self, config_path, factory, capsys):
         run(["status"], config_path, factory)
