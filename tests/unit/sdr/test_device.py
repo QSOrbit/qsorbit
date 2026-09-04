@@ -14,12 +14,16 @@ import pytest
 
 from qsorbit.core.sdr import (
     AUTO_GAIN,
+    AmbiguousDeviceError,
     DeviceError,
     DeviceInfo,
+    DeviceNotFoundError,
     DriverMismatchError,
     RtlSdr,
     SdrConfig,
     TunerType,
+    attached_devices,
+    index_for_serial,
 )
 
 V4_GAIN_STEPS_DB = (0.0, 0.9, 1.4, 12.5, 25.4, 32.8, 33.8, 49.6)
@@ -415,3 +419,139 @@ class TestDeviceInfo:
         )
 
         assert "Generic RTL2832U OEM" in info.describe()
+
+
+# ---------------------------------------------------------------------------
+# Addressing a device by serial
+# ---------------------------------------------------------------------------
+
+
+class FakeBus:
+    """A stand-in library that only knows how to enumerate.
+
+    Separate from :class:`FakeLib` above, which models one device and
+    records the call order through it. This one models *several*, and
+    none of them open — which is the whole claim ``attached_devices``
+    makes about itself.
+    """
+
+    def __init__(self, devices: tuple[tuple[str, str, str], ...] = (), unreadable: int = -1):
+        # Each entry is (manufacturer, product, serial).
+        self._devices = devices
+        self._unreadable = unreadable
+        self.opened: list[int] = []
+
+    def device_count(self) -> int:
+        return len(self._devices)
+
+    def device_name(self, index: int) -> str:
+        return "Generic RTL2832U OEM"
+
+    def usb_strings(self, index: int) -> tuple[str, str, str]:
+        if index == self._unreadable:
+            raise DeviceNotFoundError(f"No RTL-SDR at index {index}")
+        return self._devices[index]
+
+    def open(self, index: int) -> object:
+        self.opened.append(index)
+        return object()
+
+
+V4 = ("RTLSDRBlog", "Blog V4")
+
+
+def bus(*serials: str, unreadable: int = -1) -> FakeBus:
+    return FakeBus(tuple((*V4, serial) for serial in serials), unreadable=unreadable)
+
+
+class TestAttachedDevices:
+    def test_it_reports_one_record_per_device_in_enumeration_order(self):
+        found = attached_devices(bus("LEFT", "RIGHT"))
+
+        assert [device.index for device in found] == [0, 1]
+        assert [device.serial for device in found] == ["LEFT", "RIGHT"]
+
+    def test_an_empty_bus_is_an_empty_tuple_not_an_error(self):
+        assert attached_devices(bus()) == ()
+
+    def test_it_opens_nothing(self):
+        # The reason this function exists rather than reusing
+        # DeviceInfo: enumerating must not claim a device another
+        # branch is already streaming from.
+        enumeration = bus("LEFT", "RIGHT")
+
+        attached_devices(enumeration)
+
+        assert enumeration.opened == []
+
+    def test_a_device_whose_strings_will_not_read_is_still_listed(self):
+        # Counted by the library but unreadable — an unbound WinUSB
+        # driver does exactly this. Dropping it would turn "one device
+        # would not answer" into "no device has that serial".
+        found = attached_devices(bus("LEFT", "RIGHT", unreadable=0))
+
+        assert len(found) == 2
+        assert found[0].serial == ""
+        assert found[1].serial == "RIGHT"
+
+    def test_describe_names_the_v4_and_its_serial(self):
+        described = attached_devices(bus("LEFT"))[0].describe()
+
+        assert "RTL-SDR Blog V4" in described
+        assert "serial LEFT" in described
+
+    def test_describe_says_blank_rather_than_leaving_a_gap(self):
+        described = attached_devices(bus(""))[0].describe()
+
+        assert "(blank)" in described
+
+
+class TestIndexForSerial:
+    def test_it_finds_the_device_carrying_that_serial(self):
+        assert index_for_serial(bus("LEFT", "RIGHT"), "RIGHT") == 1
+
+    def test_it_does_not_settle_for_the_first_device(self):
+        # The failure this whole feature exists to prevent: ignoring the
+        # serial and opening index 0 looks correct whenever the wanted
+        # device happens to be first, so the test asks for the one that
+        # is not.
+        assert index_for_serial(bus("RIGHT", "LEFT"), "LEFT") == 1
+
+    def test_matching_is_exact(self):
+        with pytest.raises(DeviceNotFoundError):
+            index_for_serial(bus("LEFT"), "left")
+
+    def test_an_unknown_serial_lists_what_is_actually_attached(self):
+        with pytest.raises(DeviceNotFoundError) as error:
+            index_for_serial(bus("LEFT", "RIGHT"), "MIDDLE")
+
+        message = str(error.value)
+        assert "LEFT" in message
+        assert "RIGHT" in message
+
+    def test_an_empty_bus_says_so_rather_than_listing_nothing(self):
+        with pytest.raises(DeviceNotFoundError, match="no devices at all"):
+            index_for_serial(bus(), "LEFT")
+
+    def test_two_devices_with_one_serial_is_refused_not_guessed(self):
+        # Both V4s ship as 00000001. Picking the first match would hand
+        # back whichever enumerated first, which is the unstable thing
+        # addressing by serial exists to escape.
+        with pytest.raises(AmbiguousDeviceError) as error:
+            index_for_serial(bus("00000001", "00000001"), "00000001")
+
+        assert "rtl_eeprom" in str(error.value)
+
+    def test_the_ambiguous_message_names_both_indices(self):
+        with pytest.raises(AmbiguousDeviceError) as error:
+            index_for_serial(bus("00000001", "LEFT", "00000001"), "00000001")
+
+        message = str(error.value)
+        assert "index 0" in message
+        assert "index 2" in message
+
+    def test_a_blank_serial_can_still_be_ambiguous(self):
+        # Most dongles report a blank serial, so this is the common
+        # shape of the mistake rather than an edge case.
+        with pytest.raises(AmbiguousDeviceError):
+            index_for_serial(bus("", ""), "")

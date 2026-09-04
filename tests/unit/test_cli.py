@@ -21,12 +21,14 @@ from qsorbit.__main__ import (
     DEFAULT_PLAN_HOURS,
     DEFAULT_TUNING_OFFSET_KHZ,
     _describe_mechanics,
+    _open_sdr,
     _parse_audio_device,
     _profile_pusher,
     _push_profile_gains,
     _quit_on_sigint,
     _range_rate_interval,
     _readout_poll_interval_ms,
+    _sdr_ppm,
     _spectrum_factory,
     _squelch_status_line,
     _stall_guard,
@@ -38,7 +40,14 @@ from qsorbit.core.dsp.spectrum_stream import SpectrumStream
 from qsorbit.core.profiles import CATALOG_MANIFEST_FILENAME
 from qsorbit.core.receive import DEFAULT_TRACKING_INTERVAL_S
 from qsorbit.core.rotor import Arrival, HomingError, Position, Rotor, RotorErrorCode, RotorStatus
-from qsorbit.core.sdr import AppliedSettings, DeviceError, DeviceInfo, TunerType
+from qsorbit.core.sdr import (
+    AppliedSettings,
+    DeviceError,
+    DeviceInfo,
+    DeviceNotFoundError,
+    TunerType,
+)
+from qsorbit.core.station import load_station_config
 from qsorbit.ui.theme import DEFAULT_THEME_NAME, DEFAULT_THEMES_DIR, discover_themes
 
 # Vallado AIAA 2006-6753 Appendix C example, the same TLE used throughout
@@ -1977,3 +1986,143 @@ class TestProfilePusher:
         with pytest.raises(GainClampError):
             _profile_pusher(rotor, _station())(self._profile(azimuth_ki=1.0))
         assert rotor.pushed == []
+
+
+# ---------------------------------------------------------------------------
+# Opening the right dongle
+# ---------------------------------------------------------------------------
+
+
+class FakeBus:
+    """Enough of a loaded binding to enumerate a bus, and nothing more.
+
+    ``_open_sdr`` never opens what it builds -- the caller's ``with``
+    does -- so this only has to answer the three handle-free calls that
+    serial resolution makes.
+    """
+
+    def __init__(self, *serials: str) -> None:
+        self.serials = serials
+
+    def device_count(self) -> int:
+        return len(self.serials)
+
+    def device_name(self, index: int) -> str:
+        return "Generic RTL2832U OEM"
+
+    def usb_strings(self, index: int) -> tuple[str, str, str]:
+        return ("RTLSDRBlog", "Blog V4", self.serials[index])
+
+
+@pytest.fixture
+def on_the_bus(monkeypatch):
+    """Put a fake set of dongles on the bus that _open_sdr will walk."""
+
+    def attach(*serials: str) -> FakeBus:
+        bus = FakeBus(*serials)
+        monkeypatch.setattr(
+            "qsorbit.__main__.LibRtlSdr.load", staticmethod(lambda driver_dir=None: bus)
+        )
+        return bus
+
+    return attach
+
+
+def config_with(tmp_path, extra):
+    path = tmp_path / "branched.toml"
+    path.write_text(textwrap.dedent(CONFIG) + textwrap.dedent(extra), encoding="utf-8")
+    return load_station_config(path)
+
+
+TWO_BRANCHES = """
+[[sdr.branch]]
+serial = "RIGHT"
+label = "A - Arrow V"
+ppm = 4
+
+[[sdr.branch]]
+serial = "LEFT"
+label = "B - Arrow H"
+"""
+
+
+class TestOpenSdr:
+    def test_no_branches_addresses_the_configured_index(self, tmp_path):
+        # The path every config written before branches existed takes.
+        config = config_with(tmp_path, "\n[sdr]\ndevice_index = 1\n")
+
+        assert _open_sdr(config).index == 1
+
+    def test_no_branches_does_not_touch_the_bus(self, tmp_path, monkeypatch):
+        # A single-device station must not need an enumeration to work,
+        # or a broken driver load becomes a new failure mode for a
+        # station that never asked for any of this.
+        def explode(driver_dir=None):
+            raise AssertionError("the library was loaded for an index-addressed open")
+
+        monkeypatch.setattr("qsorbit.__main__.LibRtlSdr.load", staticmethod(explode))
+
+        assert _open_sdr(config_with(tmp_path, "\n[sdr]\n")).index == 0
+
+    def test_a_branch_is_addressed_by_serial(self, tmp_path, on_the_bus):
+        # RIGHT is second on the bus on purpose. Asking for the device
+        # that enumerates first would pass whether the serial was
+        # honoured or quietly ignored.
+        on_the_bus("LEFT", "RIGHT")
+        config = config_with(tmp_path, '\n[[sdr.branch]]\nserial = "RIGHT"\nlabel = "B"\n')
+
+        assert _open_sdr(config).index == 1
+
+    def test_it_resolves_against_the_bus_as_it_is_now(self, tmp_path, on_the_bus):
+        # The same config against a differently-populated bus resolves
+        # to a different index, which is the entire point: indices move
+        # and serials do not.
+        on_the_bus("RIGHT", "LEFT")
+        config = config_with(tmp_path, '\n[[sdr.branch]]\nserial = "RIGHT"\nlabel = "B"\n')
+
+        assert _open_sdr(config).index == 0
+
+    def test_a_serial_that_is_not_there_is_reported(self, tmp_path, on_the_bus):
+        on_the_bus("LEFT")
+        config = config_with(tmp_path, '\n[[sdr.branch]]\nserial = "RIGHT"\nlabel = "B"\n')
+
+        with pytest.raises(DeviceNotFoundError, match="RIGHT"):
+            _open_sdr(config)
+
+    def test_two_branches_open_the_first_declared(self, tmp_path, on_the_bus):
+        on_the_bus("LEFT", "RIGHT")
+        config = config_with(tmp_path, TWO_BRANCHES)
+
+        assert _open_sdr(config).index == 1
+
+    def test_two_branches_say_out_loud_that_one_is_opened(self, tmp_path, on_the_bus, capsys):
+        # Silence here would look exactly like dual-branch receive
+        # working.
+        on_the_bus("LEFT", "RIGHT")
+
+        _open_sdr(config_with(tmp_path, TWO_BRANCHES))
+
+        out = capsys.readouterr().out
+        assert "A - Arrow V" in out
+        assert "RIGHT" in out
+
+    def test_one_branch_says_nothing(self, tmp_path, on_the_bus, capsys):
+        on_the_bus("LEFT")
+        _open_sdr(config_with(tmp_path, '\n[[sdr.branch]]\nserial = "LEFT"\nlabel = "B"\n'))
+
+        assert capsys.readouterr().out == ""
+
+
+class TestSdrPpm:
+    def test_no_branches_uses_the_station_correction(self, tmp_path):
+        assert _sdr_ppm(config_with(tmp_path, "\n[sdr]\nppm = -3\n")) == -3
+
+    def test_the_first_branch_overrides_it(self, tmp_path):
+        assert _sdr_ppm(config_with(tmp_path, "\n[sdr]\nppm = -3\n" + TWO_BRANCHES)) == 4
+
+    def test_a_branch_without_one_falls_back(self, tmp_path):
+        config = config_with(
+            tmp_path, '\n[sdr]\nppm = -3\n\n[[sdr.branch]]\nserial = "L"\nlabel = "B"\n'
+        )
+
+        assert _sdr_ppm(config) == -3

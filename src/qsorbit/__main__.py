@@ -98,13 +98,15 @@ from qsorbit.core.sdr import (
     AUTO_GAIN,
     AppliedSettings,
     IqStream,
+    LibRtlSdr,
     RtlSdr,
     SdrConfig,
     SdrError,
     capture_to_file,
+    index_for_serial,
 )
 from qsorbit.core.stall_guard import StallGuard
-from qsorbit.core.station import ConfigError, StationConfig, load_station_config
+from qsorbit.core.station import ConfigError, SdrBranch, StationConfig, load_station_config
 from qsorbit.core.track_log import TrackLog
 from qsorbit.core.tracker import Pass, Satellite, TrackerError, predict_passes
 from qsorbit.core.tracking_profile import (
@@ -1190,9 +1192,12 @@ def _command_sdr_info(config: StationConfig, factory: SdrFactory) -> int:
         print(f"Config:    {config.source_path}")
         print(f"Driver:    {config.sdr.driver_dir or 'system library search path'}")
         print(f"Device:    {info.describe()}")
+        branch = _active_branch(config)
+        if branch is not None:
+            print(f"Branch:    {branch.label} (serial {branch.serial})")
         print(f"Gains:     {len(gains)} steps, {min(gains)} to {max(gains)} dB")
         print(f"           {' '.join(str(step) for step in gains)}")
-        print(f"Ppm:       {config.sdr.ppm}")
+        print(f"Ppm:       {_sdr_ppm(config)}")
         print()
         print(
             "The gain table belongs to the tuner chip, so it doubles as a "
@@ -1216,7 +1221,7 @@ def _command_sdr_capture(
         center_hz=center_hz,
         sample_rate_hz=args.rate,
         gain_db=AUTO_GAIN if args.auto_gain else args.gain,
-        ppm=config.sdr.ppm,
+        ppm=_sdr_ppm(config),
     )
     if sdr_config.may_drop_samples:
         print(
@@ -1282,7 +1287,7 @@ def _command_receive(
         center_hz=center_hz,
         sample_rate_hz=args.rate,
         gain_db=AUTO_GAIN if args.auto_gain else args.gain,
-        ppm=config.sdr.ppm,
+        ppm=_sdr_ppm(config),
     )
 
     with sdr_factory(config) as sdr:
@@ -2495,9 +2500,58 @@ def _open_rotor(config: StationConfig, on_homing_wait: Callable[[float], None]) 
     return Rotor(port, config.capabilities, on_homing_wait=on_homing_wait)
 
 
+def _active_branch(config: StationConfig) -> SdrBranch | None:
+    """The branch a single-device command works with, or ``None``.
+
+    The first declared one. Everything in this module still opens
+    exactly one device; the branch list is what says *which*, and the
+    order it is written in is what ranks them.
+    """
+    return config.sdr.branches[0] if config.sdr.branches else None
+
+
+def _sdr_ppm(config: StationConfig) -> int:
+    """The crystal correction for whichever device this run will open.
+
+    Asked as its own question rather than read off ``[sdr] ppm``
+    directly, because with branches declared the two are not the same
+    number, and a correction taken from the wrong dongle is a tuning
+    error nothing downstream reports.
+    """
+    branch = _active_branch(config)
+    return config.sdr.ppm if branch is None else config.sdr.ppm_for(branch)
+
+
 def _open_sdr(config: StationConfig) -> RtlSdr:
-    """Build an :class:`RtlSdr` from the station's ``[sdr]`` settings."""
-    return RtlSdr(config.sdr.device_index, driver_dir=config.sdr.driver_dir)
+    """Build an :class:`RtlSdr` from the station's ``[sdr]`` settings.
+
+    Addresses the device by EEPROM serial when branches are declared,
+    and by index otherwise — the second path is what every config
+    written before branches existed still takes.
+
+    The resolution happens here, at the composition root, rather than
+    inside :class:`RtlSdr`: an index is only true for as long as the bus
+    does not change, so it is worked out fresh on every open and never
+    written down. The caller's ``with`` opens the device an instant
+    later and nothing re-checks in between, so a dongle unplugged inside
+    that window would be opened by a stale index. That gap is real and
+    is left open deliberately — closing it means opening the device
+    here, outside the context manager that owns its lifetime.
+    """
+    branch = _active_branch(config)
+    if branch is None:
+        return RtlSdr(config.sdr.device_index, driver_dir=config.sdr.driver_dir)
+    if len(config.sdr.branches) > 1:
+        # Said out loud rather than assumed: with two branches declared
+        # and one device opened, silence would look exactly like
+        # dual-branch receive working.
+        print(
+            f"Note: {len(config.sdr.branches)} branches are declared and this "
+            f"command opens one. Using {branch.label} (serial {branch.serial}); "
+            "receiving on both comes later."
+        )
+    lib = LibRtlSdr.load(config.sdr.driver_dir)
+    return RtlSdr(index_for_serial(lib, branch.serial), driver_dir=config.sdr.driver_dir)
 
 
 def _report_homing_wait(elapsed_s: float) -> None:

@@ -355,6 +355,57 @@ ppm = 0
 
 
 # ---------------------------------------------------------------------
+# Receive branches, for a station with more than one dongle
+# ---------------------------------------------------------------------
+#
+# Optional, and absent from every config written before this existed —
+# no [[sdr.branch]] entries means the single-device behaviour above,
+# unchanged.
+#
+# A branch is one whole receive chain: its own dongle, its own stream,
+# its own demodulator. Two of them, on two antennas in different
+# polarisations, are what let a later stage pick whichever is hearing
+# the pass better at that moment.
+#
+# Each branch names its dongle by EEPROM SERIAL, not by index. Indices
+# are enumeration order and nothing more: unplug some other stick and
+# they renumber, and a config addressing index 1 then quietly opens a
+# different radio. Serials do not move.
+#
+# The catch is that serials are not unique out of the box — every
+# RTL-SDR Blog V4 ships as "00000001", so two of them answer to the
+# same name until you flash them. With one plugged in at a time:
+#
+#     rtl_eeprom -d 0 -s LEFT
+#
+# then unplug and replug it for the new string to be read. QSOrbit
+# refuses to open a serial that two devices claim, rather than guessing
+# which one you meant.
+#
+# 'label' names the ANTENNA, not the dongle — it is what the per-branch
+# meters are titled with, and the antenna is what you are deciding
+# about when you read one.
+#
+# 'ppm' is optional per branch and overrides [sdr] ppm above. Two
+# dongles have two oscillators, so once you have measured them and they
+# differ, this is where the difference goes.
+#
+# Declaring branches replaces device_index — set both and the file is
+# rejected rather than one of them silently ignored, so delete
+# device_index above if you uncomment these.
+#
+#[[sdr.branch]]
+#serial = "LEFT"
+#label = "A - Arrow V"
+#ppm = 0
+#
+#[[sdr.branch]]
+#serial = "RIGHT"
+#label = "B - Arrow H"
+#ppm = 0
+
+
+# ---------------------------------------------------------------------
 # What your own site blocks
 # ---------------------------------------------------------------------
 #
