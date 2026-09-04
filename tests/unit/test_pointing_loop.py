@@ -1024,3 +1024,63 @@ class TestStall:
         for _ in range(40):
             loop.tick()
         assert loop.is_stalled
+
+
+class TestObserve:
+    """observe() is tick() with every decision removed."""
+
+    def test_it_reports_target_and_position_without_commanding(self):
+        # The whole point: an instrument sampling between ticks must not
+        # move the antenna as a side effect of measuring it.
+        loop, rotor, _ = make_loop(
+            [state(azimuth=120.0, elevation=30.0)],
+            reported=Position(118.0, 29.0),
+        )
+
+        observed = loop.observe()
+
+        assert observed.rotor_target == Position(120.0, 30.0)
+        assert observed.rotor_position == Position(118.0, 29.0)
+        rotor.move_to.assert_not_called()
+
+    def test_it_does_not_disturb_the_latest_sample(self):
+        # latest_sample is the record of what the loop last DECIDED, and
+        # a readout follows it. An observation decides nothing, so it
+        # must not overwrite the last decision with something that has
+        # no outcome to report.
+        loop, _rotor, _ = make_loop(
+            [state(azimuth=120.0, elevation=30.0), state(azimuth=200.0, elevation=40.0)],
+            reported=Position(120.0, 30.0),
+        )
+        ticked = loop.tick()
+
+        loop.observe()
+
+        assert loop.latest_sample is ticked
+
+    def test_it_does_not_advance_the_setpoint(self):
+        # Sampling must not consume the deadband's memory either: if an
+        # observation moved last_commanded, the next tick would measure
+        # movement against a position that was never sent.
+        loop, _rotor, _ = make_loop(
+            [state(azimuth=120.0, elevation=30.0), state(azimuth=121.0, elevation=30.0)],
+            reported=Position(120.0, 30.0),
+        )
+        loop.tick()
+        before = loop.last_commanded
+
+        loop.observe()
+
+        assert loop.last_commanded == before
+
+    def test_a_position_outside_declared_travel_still_stops_it(self):
+        # Same guard as tick(), deliberately: a reading from outside the
+        # safe envelope is worth stopping for whoever asked for it, and
+        # an instrument that swallowed it would be the quieter failure.
+        loop, _rotor, _ = make_loop(
+            [state(azimuth=120.0, elevation=30.0)],
+            reported=Position(120.0, 400.0),
+        )
+
+        with pytest.raises(TravelGuardError):
+            loop.observe()

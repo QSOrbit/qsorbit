@@ -11,10 +11,18 @@ whole subject is the thread.
 from __future__ import annotations
 
 import threading
+import time
+from datetime import UTC, datetime
 
 import pytest
 
+from qsorbit.core.geometry import AzEl
+from qsorbit.core.pointing import TickOutcome, TrackObservation, TrackSample
+from qsorbit.core.rotor import Position
+from qsorbit.core.track_log import CSV_COLUMNS, TrackLog
 from qsorbit.core.tracking_thread import TrackingThread
+
+AN_INSTANT = datetime(2026, 9, 3, 22, 0, tzinfo=UTC)
 
 
 class FakeClock:
@@ -55,12 +63,33 @@ class FakeLoop:
         self._clock = clock
         self._tick_cost_s = tick_cost_s
 
-    def tick(self) -> None:
+        self.observations = 0
+
+    def tick(self) -> TrackSample:
         if self.raise_on_tick is not None:
             raise self.raise_on_tick
         self.ticks += 1
         if self._clock is not None:
             self._clock.now += self._tick_cost_s
+        # Target and position deliberately differ, and differ per tick,
+        # so a CSV assertion cannot pass by reading the wrong column.
+        return TrackSample(
+            time=AN_INSTANT,
+            sky_position=AzEl(azimuth=10.0, elevation=20.0),
+            range_km=1_000.0,
+            range_rate_km_s=-3.0,
+            rotor_target=Position(azimuth=10.0 + self.ticks, elevation=20.0),
+            rotor_position=Position(azimuth=10.0, elevation=19.0),
+            outcome=TickOutcome.COMMANDED,
+        )
+
+    def observe(self) -> TrackObservation:
+        self.observations += 1
+        return TrackObservation(
+            time=AN_INSTANT,
+            rotor_target=Position(azimuth=50.0 + self.observations, elevation=60.0),
+            rotor_position=Position(azimuth=50.0, elevation=59.0),
+        )
 
 
 class ScriptedWait:
@@ -305,3 +334,148 @@ class TestDescribe:
         ticker.run_until_stopped()
 
         assert "STOPPED" not in ticker.describe()
+
+
+class TestLogging:
+    """The logger is opt-in, and rides the thread that already owns the port."""
+
+    def test_without_a_log_it_never_observes_at_all(self):
+        # The whole cost of this feature -- extra reads and a target
+        # computation per sample -- must not land on a run that did not
+        # ask for it, because this is the path where CPU is measured to
+        # turn into lost USB samples.
+        ticker, loop, _wait = _driven(0.5, stop_after=4)
+
+        ticker.run_until_stopped()
+
+        assert loop.observations == 0
+        assert ticker.describe_log() is None
+
+    def test_a_sample_due_near_a_tick_defers_to_it(self, tmp_path):
+        """The port-budget rule, and it is arithmetic rather than taste.
+
+        Every tick and every sample is one read round trip and the link
+        sustains about 5.9 a second. Two free-running clocks at 0.5 s
+        and 0.2 s put a tick 0.1 s behind a sample and reach six reads a
+        second -- over budget, which queues reads and jitters the tick.
+        A tick reads position anyway, so a sample close to one defers.
+        """
+        clock = FakeClock()
+        loop = FakeLoop(0.5, clock=clock)
+        wait = ScriptedWait(clock, stop_after=4)
+        with TrackLog(tmp_path / "t.csv") as log:
+            ticker = TrackingThread(
+                loop, log=log, wait=wait, monotonic=clock, report=lambda _m: None
+            )
+            ticker.run_until_stopped()
+
+        # Samples land at 0.2 and 0.7; the 0.4 and 0.9 slots defer to
+        # the ticks at 0.5 and 1.0 rather than crowding them. That is
+        # one sample plus one tick per 0.5 s -- FOUR reads per second,
+        # not five, and hardware agreed: a 60 s run measured 3.9 Hz with
+        # gaps alternating 0.2 and 0.3. Six would need two samples
+        # between ticks and is over the link's ~5.9 transactions.
+        assert wait.delays == pytest.approx([0.2, 0.3, 0.2, 0.3, 0.2])
+        assert loop.ticks == 2
+        assert loop.observations == 2
+
+    def test_tick_rows_carry_the_outcome_and_observed_rows_do_not(self, tmp_path):
+        # An observation decided nothing. Naming a decision on its row
+        # would let a later reader filter observations in as ticks.
+        path = tmp_path / "t.csv"
+        clock = FakeClock()
+        loop = FakeLoop(0.5, clock=clock)
+        with TrackLog(path) as log:
+            ticker = TrackingThread(
+                loop,
+                log=log,
+                wait=ScriptedWait(clock, stop_after=2),
+                monotonic=clock,
+                report=lambda _m: None,
+            )
+            ticker.run_until_stopped()
+
+        rows = path.read_text(encoding="utf-8").splitlines()
+        assert rows[0] == ",".join(CSV_COLUMNS)
+        assert rows[1] == "0.200,51.00,50.00,60.00,59.00,"
+        assert rows[2] == "0.500,11.00,10.00,20.00,19.00,commanded"
+
+    def test_a_log_failure_stops_logging_and_not_tracking(self, tmp_path):
+        # A full disk part-way through a pass is a reason to lose the
+        # record, not the antenna.
+        class BrokenLog(TrackLog):
+            def record(self, *args, **kwargs):
+                raise OSError("no space left on device")
+
+        clock = FakeClock()
+        loop = FakeLoop(0.5, clock=clock)
+        said: list[str] = []
+        with BrokenLog(tmp_path / "t.csv") as log:
+            ticker = TrackingThread(
+                loop,
+                log=log,
+                wait=ScriptedWait(clock, stop_after=5),
+                monotonic=clock,
+                report=said.append,
+            )
+            ticker.run_until_stopped()
+
+        assert ticker.fault() is None
+        assert loop.ticks >= 1
+        # Announced once, not every 0.2 s until the console is useless.
+        assert said == ["track log stopped: no space left on device"]
+
+    def test_the_priming_tick_is_logged_at_zero(self, tmp_path):
+        # A log that starts after the priming tick begins mid-slew with
+        # no record of where the antenna came from.
+        path = tmp_path / "t.csv"
+        loop = FakeLoop(interval_s=60.0)
+        with TrackLog(path) as log:
+            ticker = TrackingThread(loop, log=log, report=lambda _m: None)
+            ticker.start()
+            try:
+                rows = path.read_text(encoding="utf-8").splitlines()
+            finally:
+                ticker.stop()
+
+        assert len(rows) == 2
+        assert rows[1].startswith("0.000,")
+        assert rows[1].endswith(",commanded")
+
+    def test_elapsed_is_measured_from_before_the_priming_tick(self, tmp_path):
+        """A real thread and a real clock, because that is where the bug lives.
+
+        start() records the origin, then does the priming tick -- a
+        serial round trip on real hardware -- and only then spawns the
+        thread. If the thread timed from its own start instead, the
+        priming row would sit at 0.000 and every row after it would be
+        measured from a later instant, offsetting the whole file from
+        its own first line by however long that round trip took.
+
+        Every other test here drives run_until_stopped() directly, where
+        the two origins coincide and the defect is invisible. This one
+        makes the priming tick slow on purpose so they cannot.
+        """
+        path = tmp_path / "t.csv"
+
+        class SlowFirstTick(FakeLoop):
+            def tick(self):
+                if self.ticks == 0:
+                    time.sleep(0.1)
+                return super().tick()
+
+        loop = SlowFirstTick(interval_s=10.0)
+        with TrackLog(path) as log:
+            ticker = TrackingThread(loop, log=log, sample_interval_s=0.05, report=lambda _m: None)
+            ticker.start()
+            try:
+                time.sleep(0.2)
+            finally:
+                ticker.stop()
+
+        rows = path.read_text(encoding="utf-8").splitlines()
+        assert len(rows) >= 3, "expected the priming row and at least one sample"
+        first_sample_s = float(rows[2].split(",")[0])
+        # Timed from the thread it would be ~0.05; timed from start() it
+        # carries the 0.1 s priming tick as well.
+        assert first_sample_s > 0.12

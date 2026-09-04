@@ -182,6 +182,34 @@ class TrackSample:
 
 
 @dataclass(frozen=True)
+class TrackObservation:
+    """Where the target and the rotor are, with nothing decided.
+
+    **Deliberately not a** :class:`TrackSample`. That type carries an
+    :attr:`~TrackSample.outcome`, which records what a tick *did* about
+    the rotor -- and an observation does nothing, so any value it put
+    there would be a lie. A reader that later filtered a log by outcome
+    would find observations claiming to be decisions.
+
+    Produced by :meth:`TrackingLoop.observe`, for an instrument that
+    wants position faster than the rotor is commanded.
+
+    Args:
+        time: The instant this was computed for, timezone-aware.
+        rotor_target: Where the axes would have to be for the antenna to
+            point at the target now, in the same frame as
+            ``rotor_position`` -- so the difference between the two is
+            the pointing error, directly.
+        rotor_position: The axis position the rotor reported, measured
+            from wherever it homed. Not a compass bearing.
+    """
+
+    time: datetime
+    rotor_target: Position
+    rotor_position: Position
+
+
+@dataclass(frozen=True)
 class AlignmentOffset:
     """The measured difference between a rotor's home position and true sky.
 
@@ -707,6 +735,49 @@ class TrackingLoop:
         self._deadband_deg = profile.deadband_deg
         self._stall = self._stall.rescaled(profile.interval_s)
         self._profile_refusal = None
+
+    def observe(self) -> TrackObservation:
+        """Read where the target and the rotor are. Command nothing.
+
+        The first four lines of :meth:`tick` with every decision
+        removed: same target computation, same guarded position read,
+        no deadband test, no stall check, no command.
+
+        **For sampling faster than the rotor is commanded.** A tracking
+        cadence of 0.5 s cannot resolve a ~1 Hz mechanical ring, so an
+        instrument measuring how the boom actually moves has to read
+        between ticks. It runs the target computation afresh rather than
+        carrying the last tick's forward, because a staircase target
+        sampled against a continuous position is the sort of mismatch
+        that later gets read as a mechanism.
+
+        **Does not disturb** :attr:`latest_sample`. That is the record
+        of what the loop last *decided*, which a readout follows, and an
+        observation decides nothing.
+
+        Performs a serial read, so it must be called from whatever
+        thread owns the tick -- never concurrently with it.
+
+        Returns:
+            What the target and the rotor were doing.
+
+        Raises:
+            TravelGuardError: If the rotor reports a position outside
+                its declared travel. Same guard as :meth:`tick`, and for
+                the same reason: a reading from outside the safe
+                envelope is worth stopping for whoever asked for it.
+            SerialConnectionError: If the port is not open.
+            ProtocolError: If a reply can't be parsed.
+            PropagationError: If the target's position can't be computed.
+        """
+        now = self._now()
+        state = self._target.topocentric_state(self._observer, now)
+        rotor_position = self._read_guarded_position()
+        return TrackObservation(
+            time=now,
+            rotor_target=sky_to_rotor(state.sky_position, self._alignment_offset),
+            rotor_position=rotor_position,
+        )
 
     def tick(self) -> TrackSample:
         """Sample the target once, and command the rotor if it has moved enough.
