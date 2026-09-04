@@ -105,6 +105,7 @@ from qsorbit.core.sdr import (
 )
 from qsorbit.core.stall_guard import StallGuard
 from qsorbit.core.station import ConfigError, StationConfig, load_station_config
+from qsorbit.core.track_log import TrackLog
 from qsorbit.core.tracker import Pass, Satellite, TrackerError, predict_passes
 from qsorbit.core.tracking_profile import (
     DESIGN_RATE_DEG_S,
@@ -642,6 +643,18 @@ def _add_radio_arguments(parser: argparse.ArgumentParser, *, required: bool) -> 
         help=(
             "Actually move the rotor to follow the pass. Without this nothing "
             "is transmitted to the controller and the serial port is not opened."
+        ),
+    )
+    parser.add_argument(
+        "--track-log",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write a CSV of how the rotor actually moved: one row per sample "
+            "at about 5 Hz, both axes, target beside position. Needs --send. "
+            "Sampling rides the thread that already owns the serial port, so "
+            "it adds reads but no contention; a run without this flag pays "
+            "nothing for it."
         ),
     )
     parser.add_argument(
@@ -1321,6 +1334,18 @@ def _command_receive(
         )
 
         if not args.send:
+            if args.track_log is not None:
+                # Refused rather than ignored. A log that silently was
+                # not written because --send was forgotten is the "off
+                # and broken look the same" failure this project keeps
+                # meeting, and it would be discovered after the pass.
+                print(
+                    "--track-log needs --send: without a rotor there is no motion to "
+                    "sample, and an empty log discovered after the pass is worse than "
+                    "an error before it.",
+                    file=sys.stderr,
+                )
+                return 2
             print(
                 "Rotor:     not being moved. Doppler correction needs the TLE and "
                 "your location, not the rotor, so this is a complete receive."
@@ -1409,6 +1434,22 @@ def _readout_poll_interval_ms(args: argparse.Namespace, default_ms: int) -> int:
     if args.interval is not None:
         return int(args.interval * 1000)
     return default_ms
+
+
+def _print_track_log(ticker: TrackingThread, log: TrackLog | None) -> None:
+    """Report the track log and close it, if there was one.
+
+    The line carries the rate the run **achieved** rather than the one
+    configured. They differ by design -- a sample due close to a tick
+    defers to it -- and the achieved figure is the one that says whether
+    the log can resolve the roughly 1 Hz mechanical ring it exists for.
+    """
+    if log is None:
+        return
+    line = ticker.describe_log()
+    if line is not None:
+        print(line)
+    log.close()
 
 
 def _no_tracking_fault() -> BaseException | None:
@@ -1616,7 +1657,10 @@ def _run_receive(
         sample_rate_hz=applied.sample_rate_hz,
         center_freq_hz=applied.center_hz,
     )
-    ticker = TrackingThread(loop) if loop is not None else None
+    track_log = TrackLog(args.track_log) if args.track_log is not None else None
+    if track_log is not None:
+        track_log.open()
+    ticker = TrackingThread(loop, log=track_log) if loop is not None else None
 
     session = ReceiveSession(
         stream=stream,
@@ -1723,6 +1767,7 @@ def _run_receive(
     print(stats.describe())
     if ticker is not None:
         print(ticker.describe())
+        _print_track_log(ticker, track_log)
     return 0
 
 
@@ -1938,6 +1983,31 @@ def _command_shell(
     comes back silent with nobody noticing, which is the same reason
     ``sdr capture`` refuses to invent one.
     """
+    # Checked before the mode dispatch below, because two of the three
+    # modes never reach the code that builds a log -- and a flag that is
+    # accepted, ignored, and discovered to have written nothing after
+    # the pass is the failure this option exists to prevent.
+    if args.track_log is not None:
+        if args.tle is None or not args.send:
+            print(
+                "shell: --track-log needs --tle and --send. Without a rotor "
+                "following something there is no motion to sample, and an empty "
+                "log discovered after the pass is worse than an error before it.",
+                file=sys.stderr,
+            )
+            return 1
+        if args.downlink is None:
+            print(
+                "shell: --track-log is not supported on a rotor-only shell yet. "
+                "That path still ticks from the GUI timer, and sampling at 5 Hz "
+                "there would make the interface sluggish and jitter the tick -- "
+                "which changes the commanded step and corrupts the very thing "
+                "the log is measuring. Add --downlink, or use `receive "
+                "--track-log`.",
+                file=sys.stderr,
+            )
+            return 1
+
     if args.tle is None:
         if args.downlink is not None or args.send:
             print(
@@ -2240,7 +2310,10 @@ def _run_shell(
         sample_rate_hz=applied.sample_rate_hz,
         center_freq_hz=applied.center_hz,
     )
-    ticker = TrackingThread(loop) if loop is not None else None
+    track_log = TrackLog(args.track_log) if args.track_log is not None else None
+    if track_log is not None:
+        track_log.open()
+    ticker = TrackingThread(loop, log=track_log) if loop is not None else None
     session = ReceiveSession(
         stream=stream,
         nbfm=nbfm,
@@ -2323,6 +2396,7 @@ def _run_shell(
     print(stats.describe())
     if ticker is not None:
         print(ticker.describe())
+        _print_track_log(ticker, track_log)
     print(f"feeds: {', '.join(hub.claimed) or 'none claimed'}")
     _print_paint_stats(window)
     return 0

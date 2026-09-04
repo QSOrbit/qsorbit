@@ -1564,6 +1564,60 @@ class TestReceiveParser:
         assert args.offset == DEFAULT_TUNING_OFFSET_KHZ
 
 
+class TestTrackLogParser:
+    """``--track-log`` is available wherever a rotor can be driven."""
+
+    def test_it_is_unset_by_default(self):
+        # Opt-in matters here beyond taste: the sampling adds serial
+        # reads and a target computation to the path where CPU is
+        # measured to turn into lost USB samples.
+        args = build_parser().parse_args(
+            ["receive", "--tle", "x", "--downlink", "145.95", "--gain", "40"]
+        )
+        assert args.track_log is None
+
+    def test_receive_accepts_it(self):
+        args = build_parser().parse_args(
+            [
+                "receive",
+                "--tle",
+                "x",
+                "--downlink",
+                "145.95",
+                "--gain",
+                "40",
+                "--send",
+                "--track-log",
+                "pass.csv",
+            ]
+        )
+        assert args.track_log == "pass.csv"
+
+    def test_shell_accepts_it_too(self):
+        # Chunk E's acceptance runs on the receive path and Chunk H's
+        # runs rotor-only, so both need the same instrument -- otherwise
+        # the two halves of the evidence come from different tools.
+        args = build_parser().parse_args(["shell", "--send", "--track-log", "pass.csv"])
+        assert args.track_log == "pass.csv"
+
+    def test_shell_refuses_it_without_a_rotor(self, config_path, factory, capsys):
+        # Two of shell's three modes never reach the code that builds a
+        # log at all, so the parser accepting the flag is not the same
+        # claim as the command honouring it.
+        assert run(["shell", "--track-log", "x.csv"], config_path, factory) == 1
+
+        assert "--track-log needs --tle and --send" in capsys.readouterr().err
+
+    def test_shell_refuses_it_on_a_rotor_only_run_and_says_why(self, config_path, factory, capsys):
+        # Not "invalid" -- unsupported, for a stated reason, until that
+        # path moves off the GUI timer. Refusing beats accepting it and
+        # writing nothing.
+        code = run(["shell", "--tle", "x", "--send", "--track-log", "x.csv"], config_path, factory)
+
+        assert code == 1
+        assert "not supported on a rotor-only shell yet" in capsys.readouterr().err
+
+
 class TestReceiveTheme:
     """``receive --theme`` picks the instrument window's theme."""
 
