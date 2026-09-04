@@ -81,16 +81,6 @@ DEFAULT_HOMING_POLL_INTERVAL_S = 2.0
 #: Gap between position reads while waiting for a move to settle.
 DEFAULT_ARRIVAL_POLL_INTERVAL_S = 0.5
 
-#: How long to wait after writing a gain before reading it back, in seconds.
-#:
-#: The firmware calls ``SetTunings()`` once per control-loop iteration,
-#: and that loop runs on a 100 ms gate — so a write is not visible to a
-#: read for up to that long. Reading back immediately would race it and
-#: report a mismatch against a value that was about to be correct.
-#: 0.15 s clears the loop period with margin, and matches the order of
-#: the RS-485 turnaround the link already waits out per command.
-DEFAULT_GAIN_SETTLE_S = 0.15
-
 #: How far a gain read-back may differ from what was written.
 #:
 #: Both the write and the reply carry two decimal places, so anything
@@ -413,8 +403,6 @@ class Rotor:
     def push_gains(
         self,
         gains: Mapping[GainRegister, float],
-        *,
-        settle_s: float = DEFAULT_GAIN_SETTLE_S,
     ) -> dict[GainRegister, float]:
         """Write a set of gains and read every one of them back.
 
@@ -426,14 +414,49 @@ class Rotor:
         wrong configuration. That is a worse outcome than not pushing
         gains at all, which is why this raises rather than warning.
 
-        Writes happen first and reads second, rather than
-        write-verify-write-verify, so the settle wait is paid once for
-        the whole set instead of once per register.
+        **Exactly one write per exchange, and that is a firmware
+        requirement rather than caution.** This used to send every write
+        first and then read them all back, to pay one settle wait for
+        the set instead of one per register. That is not merely slower
+        to recover from -- it silently loses writes. ``easycomm_proc()``
+        drains the whole serial buffer in a single call and sets
+        ``char *Data = buffer`` once, at function entry; the ``CW``
+        handler parses with ``strtok_r(Data, ",", &Data)``, which
+        *mutates* ``Data``. So the first ``CW`` in a drain finds its
+        value at ``rawData + 4`` and applies, and every later ``CW`` in
+        the same drain parses from a stale pointer, fails
+        ``isNumber()``, and is skipped -- with no error, and no reply,
+        because gain writes never reply. Measured on hardware
+        2026-09-03: six writes sent as a burst applied four and dropped
+        both ``Kd`` registers, and ``rotor-pid.py``, which sends one
+        command per turnaround, had been writing the same registers
+        successfully for months.
+
+        Interleaving the read is what fixes it, and it fixes it **by
+        construction rather than by a sleep tuned to a guess**: a read
+        is a round trip, so the host physically cannot send the next
+        ``CW`` until the firmware has replied to the previous ``CR``.
+        One ``CW`` per drain, guaranteed by the protocol. ``CR`` itself
+        is immune -- it uses no ``strtok_r``, only ``buffer[3]``.
+
+        It is also *cheaper* than what it replaces: the same six reads
+        happen either way, and the separate settle wait is gone.
+
+        **On what a matching read-back does and does not prove.** It
+        proves what this method exists for -- that the register holds
+        the value asked for, which is what "the controller is running
+        the gains I chose" means. It is **not** evidence that the write
+        path is healthy, because a register that already held the target
+        reads back correct whether or not the write landed. That is how
+        the burst defect stayed invisible: ``Kp`` was pushed at the
+        firmware's own compiled defaults, so its dropped writes were
+        indistinguishable from successful ones, and only ``Ki`` and
+        ``Kd`` -- which differ from stock -- could ever have shown it.
+        The ordering above is what guards the mechanism; the read-back
+        guards the outcome.
 
         Args:
             gains: The registers to write and the values to write them.
-            settle_s: How long to wait after the writes before reading
-                back. See :data:`DEFAULT_GAIN_SETTLE_S`.
 
         Returns:
             What each register read back, which on success equals what
@@ -448,12 +471,14 @@ class Rotor:
             SerialTimeoutError: If the rotor doesn't answer a read.
             ProtocolError: If a reply can't be parsed.
         """
+        # Write, verify, write, verify -- never write, write, verify.
+        # See the docstring: the read's round trip is what keeps two
+        # writes out of one serial drain, and two writes in one drain
+        # means the second is silently discarded by the firmware.
+        readback: dict[GainRegister, float] = {}
         for register, value in gains.items():
             self.write_gain(register, value)
-        if gains:
-            self._sleep(settle_s)
-
-        readback = {register: self.read_gain(register) for register in gains}
+            readback[register] = self.read_gain(register)
         wrong = [
             (register, gains[register], readback[register])
             for register in gains
