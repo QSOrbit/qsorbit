@@ -28,6 +28,15 @@ htmlcov/
 tests/fixtures/iq/*.iq
 tests/fixtures/iq/*.json
 
+# Bench outputs
+# Track logs and motion captures from real runs. These belong beside the
+# other bench data in the notes folder, not in the repo -- one was
+# committed to main this way (a --track-log path pointed at the repo
+# root, and `git add -A` did the rest). Anchored to the root so a
+# deliberate fixture deeper in the tree is still possible.
+/*.csv
+/runs/
+
 # Editors and OS
 .vscode/
 .idea/
