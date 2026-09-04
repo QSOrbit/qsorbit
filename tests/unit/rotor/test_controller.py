@@ -23,7 +23,6 @@ from qsorbit.core.rotor import (
     SerialConnectionError,
     SerialTimeoutError,
 )
-from qsorbit.core.rotor.controller import DEFAULT_GAIN_SETTLE_S
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -530,41 +529,56 @@ class TestPushGains:
         result = rotor.push_gains(self.TRACKING)
 
         assert result == {GainRegister.AZIMUTH_KI: 1.0, GainRegister.ELEVATION_KI: 1.0}
-        assert port.writes[-4:] == [b"CW2,1.00\n", b"CW5,1.00\n", b"CR 2\n", b"CR 5\n"]
+        assert port.writes[-4:] == [b"CW2,1.00\n", b"CR 2\n", b"CW5,1.00\n", b"CR 5\n"]
 
-    def test_writes_all_before_reading_any(self):
-        # One settle wait for the whole set rather than one per register.
-        rotor, port, _ = make_rotor([*HEALTHY_CONNECT, b"2,1.00\n", b"5,1.00\n"])
+    def test_never_sends_two_writes_without_a_read_between_them(self):
+        """The guard on the mechanism, and it replaces a test that asserted the bug.
+
+        The previous version of this test asserted that every write went
+        out before any read -- the batching was tested, so it looked
+        deliberate. It silently loses gains: the firmware drains the
+        whole serial buffer in one call and only the FIRST ``CW`` in a
+        drain applies, because the handler's ``strtok_r`` mutates the
+        pointer the next one parses from. A read between writes is a
+        round trip, so the host cannot send the second ``CW`` until the
+        firmware has answered -- one write per drain, by construction.
+
+        Asserted structurally rather than by counting sleeps: what has
+        to be true is the *interleave*, and a duration would go stale
+        the moment anyone retuned the turnaround.
+        """
+        rotor, port, _ = make_rotor([*HEALTHY_CONNECT, b"1,8.00\n", b"2,1.00\n", b"5,1.00\n"])
         rotor.connect()
-        rotor.push_gains(self.TRACKING)
-
-        written = [w for w in port.writes if w.startswith(b"CW")]
-        read = [w for w in port.writes if w.startswith(b"CR")]
-        assert port.writes.index(written[-1]) < port.writes.index(read[0])
-
-    def test_waits_for_the_firmware_to_apply_the_write(self):
-        # SetTunings() runs on the control loop's 100 ms gate, so an
-        # immediate read-back would race a value that was about to be
-        # correct and report a mismatch that is not one.
-        # The turnaround is deliberately set to something other than
-        # the settle, because every exchange sleeps the turnaround --
-        # with both at 0.15 this assertion would pass whether or not the
-        # settle happened at all.
-        rotor, _, clock = make_rotor(
-            [*HEALTHY_CONNECT, b"2,1.00\n", b"5,1.00\n"],
-            caps=capabilities(rs485_turnaround_s=0.05),
+        rotor.push_gains(
+            {
+                GainRegister.AZIMUTH_KP: 8.0,
+                GainRegister.AZIMUTH_KI: 1.0,
+                GainRegister.ELEVATION_KI: 1.0,
+            }
         )
-        rotor.connect()
-        before = list(clock.sleeps)
-        rotor.push_gains(self.TRACKING)
-        added = clock.sleeps[len(before) :]
 
-        assert DEFAULT_GAIN_SETTLE_S in added
-        assert DEFAULT_GAIN_SETTLE_S not in before
-        # It has to clear the firmware's 100 ms control-loop gate.
-        assert DEFAULT_GAIN_SETTLE_S > 0.1
+        gain_traffic = [w for w in port.writes if w.startswith((b"CW", b"CR"))]
+        assert gain_traffic == [
+            b"CW1,8.00\n",
+            b"CR 1\n",
+            b"CW2,1.00\n",
+            b"CR 2\n",
+            b"CW5,1.00\n",
+            b"CR 5\n",
+        ]
+        # Stated as the rule as well as the sequence, so a future edit
+        # that reorders these is told what it broke.
+        for earlier, later in zip(gain_traffic, gain_traffic[1:], strict=False):
+            assert not (earlier.startswith(b"CW") and later.startswith(b"CW"))
 
     def test_a_register_that_did_not_take_raises(self):
+        # This guards the OUTCOME, and it has a blind spot worth stating
+        # rather than discovering twice: it can only see a lost write
+        # whose target differs from what the register already held. That
+        # is exactly how the burst defect hid behind Kp, which was being
+        # pushed at the firmware's own compiled default and so read back
+        # correct whether or not the write landed. The interleave test
+        # above is what guards the mechanism.
         rotor, _, _ = make_rotor([*HEALTHY_CONNECT, b"2,0.00\n", b"5,1.00\n"])
         rotor.connect()
         with pytest.raises(GainVerificationError, match="AZIMUTH_KI asked 1.00 got 0.00"):
