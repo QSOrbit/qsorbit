@@ -50,7 +50,6 @@ from qsorbit.core.pointing import TravelGuardError
 from qsorbit.core.receive import (
     AUDIO_SUBSCRIBER,
     WATERFALL_SUBSCRIBER,
-    LoopRangeRate,
     ReceiveSession,
     TargetRangeRate,
 )
@@ -337,75 +336,6 @@ class TestTargetRangeRate:
         source = TargetRangeRate(target, observer=object(), now=lambda: AN_INSTANT)
 
         assert source.prime() == source.sample()
-
-
-class FakeLoop:
-    """A TrackingLoop-shaped double, so no rotor is involved."""
-
-    def __init__(self) -> None:
-        self.ticks = 0
-        self.latest_sample = None
-        self._time = AN_INSTANT
-
-    def tick(self):
-        self.ticks += 1
-        self._time += timedelta(seconds=1)
-        self.latest_sample = _sample_at(self._time, -3.0)
-        return self.latest_sample
-
-    def publish(self, when: datetime, range_rate_km_s: float) -> None:
-        """Simulate somebody else — a readout widget — ticking the loop."""
-        self.latest_sample = _sample_at(when, range_rate_km_s)
-
-
-def _sample_at(when: datetime, range_rate_km_s: float):
-    from qsorbit.core.pointing import TickOutcome, TrackSample
-    from qsorbit.core.rotor import Position
-
-    return TrackSample(
-        time=when,
-        sky_position=AzEl(azimuth=120.0, elevation=30.0),
-        range_km=1_000.0,
-        range_rate_km_s=range_rate_km_s,
-        rotor_target=Position(azimuth=120.0, elevation=30.0),
-        rotor_position=Position(azimuth=120.0, elevation=30.0),
-        outcome=TickOutcome.COMMANDED,
-    )
-
-
-class TestLoopRangeRate:
-    def test_it_ticks_the_loop_on_every_sample(self):
-        loop = FakeLoop()
-        source = LoopRangeRate(loop)
-
-        source.sample()
-        source.sample()
-
-        assert loop.ticks == 2
-
-    def test_it_ticks_in_every_configuration_now(self):
-        """The following mode is gone, and its absence is the fix.
-
-        A windowed run used to build this with ``drive=False`` and let
-        ReadoutWidget tick from a QTimer instead, which put a serial
-        write, an RS-485 turnaround sleep and a blocking read on the GUI
-        thread once a second. There is no longer a way to construct this
-        class that does not tick.
-        """
-        import inspect
-
-        parameters = inspect.signature(LoopRangeRate).parameters
-
-        assert "drive" not in parameters
-
-    def test_priming_ticks_once_so_a_pass_starts_corrected(self):
-        # Priming has to produce a sample: the alternative is starting
-        # the radio with no correction at all for the first second.
-        loop = FakeLoop()
-
-        LoopRangeRate(loop).prime()
-
-        assert loop.ticks == 1
 
 
 class TestTrackingError:

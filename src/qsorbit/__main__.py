@@ -80,7 +80,6 @@ from qsorbit.core.profiles import (
 )
 from qsorbit.core.receive import (
     DEFAULT_TRACKING_INTERVAL_S,
-    LoopRangeRate,
     ReceiveSession,
     TargetRangeRate,
 )
@@ -113,6 +112,7 @@ from qsorbit.core.tracking_profile import (
     TrackingProfile,
     max_safe_ki,
 )
+from qsorbit.core.tracking_thread import TrackingThread
 from qsorbit.ui.theme import DEFAULT_THEME_NAME
 
 #: How long ``point --send`` waits for the rotor to settle, in seconds.
@@ -1411,6 +1411,19 @@ def _readout_poll_interval_ms(args: argparse.Namespace, default_ms: int) -> int:
     return default_ms
 
 
+def _no_tracking_fault() -> BaseException | None:
+    """No rotor, so nothing can have stopped ticking one.
+
+    Handed to a feed hub in place of a
+    :meth:`~qsorbit.core.tracking_thread.TrackingThread.fault` when the
+    run has no rotor attached. A hub asked for a fault source has to get
+    a callable either way; "there is no rotor" and "the rotor is fine"
+    are different facts, but neither of them is a fault, and the panel
+    that would show one is not built at all in this configuration.
+    """
+    return None
+
+
 def _report_stall(axes: tuple[str, ...]) -> None:
     """Tell the operator an axis has stopped following, while it matters.
 
@@ -1603,19 +1616,18 @@ def _run_receive(
         sample_rate_hz=applied.sample_rate_hz,
         center_freq_hz=applied.center_hz,
     )
+    ticker = TrackingThread(loop) if loop is not None else None
 
     session = ReceiveSession(
         stream=stream,
         nbfm=nbfm,
         doppler=doppler,
         audio=AudioOutput(nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)),
-        range_rate=(
-            # The session's tracking thread ticks the loop in every
-            # configuration now. It used to hand the tick to
-            # ReadoutWidget whenever a window was open, which put a
-            # blocking serial read on the GUI thread once a second.
-            LoopRangeRate(loop) if loop is not None else TargetRangeRate(satellite, config.observer)
-        ),
+        # Always from the target, never from the rotor. A range rate
+        # comes from the TLE and the observer's location; taking it from
+        # a rotor tick was what made the rotor follow this cadence
+        # instead of its own profile's.
+        range_rate=TargetRangeRate(satellite, config.observer),
         squelch=squelch,
         # args.squelch is "let the gate's decision reach the speaker" -
         # the gate itself is always deciding now, see
@@ -1671,11 +1683,28 @@ def _run_receive(
     # that returns leaves that reference nowhere. Keeping `window` a
     # local of the frame that is still executing `app.exec()` makes the
     # lifetime structural instead of something a later edit can drop.
+    def start_everything() -> None:
+        # The rotor first, and synchronously: its first tick points the
+        # antenna before anything is streaming, and a rotor that cannot
+        # be reached at all should stop the run here rather than half a
+        # second into the pass. Then the radio.
+        if ticker is not None:
+            ticker.start()
+        session.start()
+
     try:
         if args.window:
-            _show_instruments(args, satellite, session, loop, feeds, start=session.start)
+            _show_instruments(
+                args,
+                satellite,
+                session,
+                loop,
+                feeds,
+                start=start_everything,
+                tracking_fault=ticker.fault if ticker is not None else _no_tracking_fault,
+            )
         else:
-            session.start()
+            start_everything()
             if session.wait(args.seconds):
                 # The demodulating thread ended before the clock did,
                 # which means the blocks stopped arriving. Sleeping out
@@ -1686,10 +1715,14 @@ def _run_receive(
     except KeyboardInterrupt:
         print()  # the ^C the terminal echoed deserves its own line
     finally:
+        if ticker is not None:
+            ticker.stop()
         stats = session.stop()
 
     print()
     print(stats.describe())
+    if ticker is not None:
+        print(ticker.describe())
     return 0
 
 
@@ -1701,6 +1734,7 @@ def _show_instruments(
     feeds: tuple[SpectrumSubscription, SpectrumSubscription] | None = None,
     *,
     start: Callable[[], None],
+    tracking_fault: Callable[[], BaseException | None] = _no_tracking_fault,
 ) -> None:
     """Build the instrument window, start the session, then run Qt's loop.
 
@@ -1732,10 +1766,15 @@ def _show_instruments(
     belongs inside the function that actually needs it.
 
     The readout is present only when there is a loop to show. It
-    **follows** that loop rather than ticking it: the session's tracking
-    thread owns the tick, and the readout is handed
-    ``session.tracking_error`` so a rotor fault reaches the screen
-    instead of freezing the last good numbers there.
+    **follows** that loop rather than ticking it, and the fault source it
+    is handed comes from whatever *does* tick -- a
+    :class:`~qsorbit.core.tracking_thread.TrackingThread` when a rotor is
+    attached. That indirection is the point: a rotor fault has to reach
+    the screen rather than freezing the last good numbers there, and the
+    readout should not have to know which object owns the cadence to find
+    out. It used to be ``session.tracking_error``, back when the receive
+    session's own range-rate thread held the tick; that method still
+    exists and now means something narrower.
 
     **Ctrl-C is handled explicitly** via :func:`_quit_on_sigint` wrapping
     ``app.exec()`` below — see that function's own docstring for why
@@ -1803,7 +1842,7 @@ def _show_instruments(
         readout=(
             ReadoutWidget(
                 loop,
-                fault=session.tracking_error,
+                fault=tracking_fault,
                 poll_interval_ms=_readout_poll_interval_ms(args, DEFAULT_POLL_INTERVAL_MS),
             )
             if loop is not None
@@ -2201,14 +2240,13 @@ def _run_shell(
         sample_rate_hz=applied.sample_rate_hz,
         center_freq_hz=applied.center_hz,
     )
+    ticker = TrackingThread(loop) if loop is not None else None
     session = ReceiveSession(
         stream=stream,
         nbfm=nbfm,
         doppler=doppler,
         audio=AudioOutput(nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)),
-        range_rate=(
-            LoopRangeRate(loop) if loop is not None else TargetRangeRate(satellite, config.observer)
-        ),
+        range_rate=TargetRangeRate(satellite, config.observer),
         squelch=squelch,
         mute_squelch=args.squelch,
         # Unconditional here, unlike `receive`, where it follows
@@ -2224,7 +2262,7 @@ def _run_shell(
         spectrum=session.spectrum,
         radio=session,
         tracking=loop,
-        tracking_fault=session.tracking_error,
+        tracking_fault=ticker.fault if ticker is not None else _no_tracking_fault,
     )
     print(hub.describe())
     print(
@@ -2263,7 +2301,10 @@ def _run_shell(
 
     try:
         # Only now, with Qt fully up and the window realised, does
-        # anything begin streaming.
+        # anything begin streaming. The rotor goes first, for the same
+        # reason it does in _run_receive.
+        if ticker is not None:
+            ticker.start()
         session.start()
         if args.seconds is not None:
             from PySide6.QtCore import QTimer
@@ -2274,10 +2315,14 @@ def _run_shell(
     except KeyboardInterrupt:
         print()  # the ^C the terminal echoed deserves its own line
     finally:
+        if ticker is not None:
+            ticker.stop()
         stats = session.stop()
 
     print()
     print(stats.describe())
+    if ticker is not None:
+        print(ticker.describe())
     print(f"feeds: {', '.join(hub.claimed) or 'none claimed'}")
     _print_paint_stats(window)
     return 0
