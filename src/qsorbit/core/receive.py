@@ -19,15 +19,18 @@ the demodulating thread
     shares a thread with nothing else — in particular not with the rotor,
     whose serial round trips take 0.15 s of RS-485 turnaround apiece.
 
-the tracking side
-    Feeds range-rate samples in. **This module does not insist on owning
-    it**, which is the point of :class:`RangeRateSource`: headless, a
-    thread here ticks the loop; with a window,
-    :class:`~qsorbit.ui.readout_widget.ReadoutWidget` already ticks it on
-    the GUI thread exactly as Chunk F bench-proved, and this module just
-    follows :attr:`~qsorbit.core.pointing.TrackingLoop.latest_sample`.
-    One feeding mechanism, two drivers, rather than two code paths of
-    which only one ever gets exercised at the bench.
+the range-rate thread
+    Feeds the Doppler tracker on its own cadence, from
+    :class:`TargetRangeRate` -- the TLE and the observer's location,
+    which is where a range rate actually comes from. **No rotor is
+    involved and none ever was**: for a while this thread also held the
+    rotor's tick, by way of a range-rate source that ticked the loop to
+    get its number, and the side effect was that the rotor was commanded
+    at *this* cadence rather than at the one its tracking profile
+    declared. The tick now lives in
+    :class:`~qsorbit.core.tracking_thread.TrackingThread`, which is what
+    makes "this module does not insist on owning the tracking side" true
+    rather than aspirational.
 
 A ``SpectrumStream``, when one is given, gets the ``"waterfall"``
 subscription and runs its own worker as it always has.
@@ -73,7 +76,6 @@ from qsorbit.core.dsp.iq import unpack_uint8_iq
 from qsorbit.core.dsp.spectrum_stream import SpectrumStream, SpectrumStreamStats
 from qsorbit.core.dsp.squelch import NoiseSquelch, SquelchStats
 from qsorbit.core.dsp.tuning import DopplerStats, DopplerTracker
-from qsorbit.core.pointing import TrackingLoop
 from qsorbit.core.sdr.stream import IqStream, StreamStats
 from qsorbit.core.tracker.observer import ObserverLocation
 from qsorbit.core.tracker.target import Target
@@ -165,58 +167,6 @@ class TargetRangeRate:
         when = self._now()
         state = self._target.topocentric_state(self._observer, when)
         return when, state.range_rate_km_s
-
-
-class LoopRangeRate:
-    """Range rates taken from a :class:`~qsorbit.core.pointing.TrackingLoop`.
-
-    **This source ticks the loop, and it is the only thing that does, in
-    every configuration.** A tick reads the rotor over serial and may
-    command it.
-
-    It used to have a second, *following* mode for windowed runs, where
-    :class:`~qsorbit.ui.readout_widget.ReadoutWidget` did the ticking
-    from a ``QTimer`` and this class merely read what the widget had
-    produced. That arrangement was exactly backwards, and Chunk A PR2
-    reversed it: :meth:`~qsorbit.core.pointing.TrackingLoop.tick` writes
-    a command, sleeps out the RS-485 turnaround, and then blocks on a
-    read, so a windowed run was freezing its own interface for a sixth of
-    a second every second -- and for as long as the port's whole timeout
-    whenever a reply went missing, which the rotor doc says is more often
-    a short turnaround than a real fault. Blocking serial I/O belongs on
-    a thread nobody is looking at, and this class already runs on one.
-
-    The readout now follows the samples this produces. Exactly one thing
-    still ticks, which was always the requirement -- two would double the
-    rotor's serial traffic and interleave two streams of commands.
-
-    Args:
-        loop: The tracking loop to tick.
-    """
-
-    def __init__(self, loop: TrackingLoop) -> None:
-        self._loop = loop
-
-    def prime(self) -> tuple[datetime, float]:
-        """Tick the loop once, before anything else is running.
-
-        Priming has to produce a sample: the alternative is starting the
-        radio with no correction at all for the first second of a pass.
-        One tick before anything streams also leaves the antenna pointed
-        at the target rather than wherever it was parked, which is what
-        you would have done by hand anyway.
-
-        Runs on whichever thread calls :meth:`ReceiveSession.start`. That
-        is the only rotor read this class ever performs off its own
-        tracking thread, and it happens before the event loop exists, so
-        there is no interface for it to block.
-        """
-        return self.sample()
-
-    def sample(self) -> tuple[datetime, float]:
-        """Tick the loop and report what it saw."""
-        ticked = self._loop.tick()
-        return ticked.time, ticked.range_rate_km_s
 
 
 @dataclass(frozen=True)
@@ -409,20 +359,23 @@ class ReceiveSession:
         return self._spectrum
 
     def tracking_error(self) -> BaseException | None:
-        """Whatever stopped the tracking thread, or ``None`` if nothing has.
+        """Whatever stopped the range-rate thread, or ``None`` if nothing has.
 
-        Exposed for a readout that *follows* this session's tracking
-        rather than driving it. When the ticker dies, the panel has to be
-        able to say so: leaving the last good numbers on screen with a
-        dead rotor underneath them is the silent failure this project
-        keeps meeting, and it is worse here than most because the numbers
-        look perfectly plausible.
+        **This is no longer a rotor fault, and the change of meaning is
+        worth stating rather than leaving to be inferred.** While this
+        thread also held the rotor's tick, a fault here usually *was* a
+        serial fault, and a readout took it as one. The tick now belongs
+        to :class:`~qsorbit.core.tracking_thread.TrackingThread`, whose
+        own :meth:`~qsorbit.core.tracking_thread.TrackingThread.fault`
+        is what a rotor readout should ask. What is left here is the
+        Doppler side: a range-rate source that stopped producing, which
+        on the receive path means propagation rather than hardware.
 
         **Deliberately separate from the demodulating thread's error**,
         which :meth:`stop` re-raises. They are different faults with
-        different consequences -- a tracking fault stops the antenna
-        following and leaves the audio playing, and the readout is the
-        only place a person would find out.
+        different consequences -- losing range rates leaves the audio
+        playing, uncorrected and drifting, which is a degradation to
+        report rather than a reason to tear the session down mid-pass.
 
         A method rather than a property so it can be handed to a widget
         as a plain callable, without the caller having to wrap it.
