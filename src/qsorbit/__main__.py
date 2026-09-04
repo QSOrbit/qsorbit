@@ -1372,6 +1372,45 @@ def _range_rate_interval(args: argparse.Namespace) -> float:
     return DEFAULT_TRACKING_INTERVAL_S
 
 
+def _readout_poll_interval_ms(args: argparse.Namespace, default_ms: int) -> int:
+    """Milliseconds between repaints of the live readout.
+
+    The same guard as :func:`_range_rate_interval`, and it is here for
+    the same reason: ``--interval`` defaults to ``None`` so that a
+    tracking profile can decide the cadence, and every site that reads
+    it has to cope with that. This one did not, and
+    ``receive --window --send`` without an explicit ``--interval``
+    therefore died building the window on ``int(None * 1000)``. Two of
+    the three readers were given the guard when profiles landed; this
+    was the third.
+
+    **The default is passed in rather than imported.**
+    :data:`~qsorbit.ui.readout_widget.DEFAULT_POLL_INTERVAL_MS` lives
+    in a module that imports Qt at module scope, and importing it here
+    would make the entire CLI unusable anywhere PySide6 is absent --
+    the rule ``core/dsp/audio.py`` and ``core/sdr/librtlsdr.py``
+    already follow for the same reason. Taking it as an argument also
+    keeps this function testable with no Qt at all, and leaves exactly
+    one copy of the number.
+
+    Note what this is *not* saying. A readout's repaint rate and a
+    rotor's tracking cadence are different quantities that happen to
+    have shared a flag; ``--interval`` still moves both, because an
+    operator who named a tick asked for exactly that, but the absence
+    of one does not mean the absence of the other.
+
+    Args:
+        args: Parsed arguments, for ``--interval``.
+        default_ms: What to use when ``--interval`` was not given.
+
+    Returns:
+        Milliseconds between repaints.
+    """
+    if args.interval is not None:
+        return int(args.interval * 1000)
+    return default_ms
+
+
 def _report_stall(axes: tuple[str, ...]) -> None:
     """Tell the operator an axis has stopped following, while it matters.
 
@@ -1708,7 +1747,7 @@ def _show_instruments(
     from qsorbit.core.dsp.spectrum import frequency_axis_hz
     from qsorbit.ui.instrument_window import InstrumentWindow
     from qsorbit.ui.quieting_widget import QuietingWidget
-    from qsorbit.ui.readout_widget import ReadoutWidget
+    from qsorbit.ui.readout_widget import DEFAULT_POLL_INTERVAL_MS, ReadoutWidget
     from qsorbit.ui.spectrum_line_widget import SpectrumLineWidget
     from qsorbit.ui.theme_manager import ThemeManager
     from qsorbit.ui.waterfall_render import WaterfallScale
@@ -1765,7 +1804,7 @@ def _show_instruments(
             ReadoutWidget(
                 loop,
                 fault=session.tracking_error,
-                poll_interval_ms=int(args.interval * 1000),
+                poll_interval_ms=_readout_poll_interval_ms(args, DEFAULT_POLL_INTERVAL_MS),
             )
             if loop is not None
             else None
