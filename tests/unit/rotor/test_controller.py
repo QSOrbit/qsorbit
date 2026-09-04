@@ -512,6 +512,64 @@ class TestWriteGain:
         assert port.replies == [b"2,1.00\n"]
 
 
+class TestReadGains:
+    """The read-only counterpart to push_gains."""
+
+    def test_it_reads_every_register_in_order(self):
+        rotor, port, _ = make_rotor(
+            [
+                *HEALTHY_CONNECT,
+                b"1,8.00\n",
+                b"2,0.97\n",
+                b"3,0.50\n",
+                b"4,10.00\n",
+                b"5,1.00\n",
+                b"6,0.30\n",
+            ]
+        )
+        rotor.connect()
+
+        gains = rotor.read_gains()
+
+        assert gains == {
+            GainRegister.AZIMUTH_KP: 8.0,
+            GainRegister.AZIMUTH_KI: 0.97,
+            GainRegister.AZIMUTH_KD: 0.5,
+            GainRegister.ELEVATION_KP: 10.0,
+            GainRegister.ELEVATION_KI: 1.0,
+            GainRegister.ELEVATION_KD: 0.3,
+        }
+        assert port.writes[-6:] == [
+            b"CR 1\n",
+            b"CR 2\n",
+            b"CR 3\n",
+            b"CR 4\n",
+            b"CR 5\n",
+            b"CR 6\n",
+        ]
+
+    def test_it_writes_nothing(self):
+        # The whole point of having it separate from push_gains: asking
+        # what a controller is running must not change what it is
+        # running.
+        rotor, port, _ = make_rotor(
+            [
+                *HEALTHY_CONNECT,
+                b"1,8.00\n",
+                b"2,0.97\n",
+                b"3,0.50\n",
+                b"4,10.00\n",
+                b"5,1.00\n",
+                b"6,0.30\n",
+            ]
+        )
+        rotor.connect()
+
+        rotor.read_gains()
+
+        assert not [w for w in port.writes if w.startswith(b"CW")]
+
+
 class TestPushGains:
     """Every register is verified, not a sample.
 

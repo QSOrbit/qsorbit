@@ -400,6 +400,36 @@ class Rotor:
         """
         self._exchange(format_set_gain(register, value))
 
+    def read_gains(self) -> dict[GainRegister, float]:
+        """Read every gain register, in register order.
+
+        The read-only counterpart to :meth:`push_gains`, and it exists
+        because "what is this controller actually running" is a question
+        worth answering with a measurement rather than an assumption.
+
+        **Gains are RAM-only and survive a disconnect.** A profile that
+        writes nothing therefore does not mean the controller holds its
+        compiled defaults -- it means it holds whatever was last written
+        to it, which may be a previous profile, a half-applied set, or a
+        bench tool's experiment. Reporting the compiled defaults in that
+        situation is a claim nobody checked, and it was wrong on this
+        station's own rotator for a whole 543-second track.
+
+        Costs six serial round trips, about a second, so it belongs
+        where a second is affordable -- at the start of a run, not in
+        the middle of a pass.
+
+        Returns:
+            Every register and the value the controller reports for it.
+
+        Raises:
+            SerialConnectionError: If the port is not open.
+            SerialTimeoutError: If the rotor doesn't answer a read.
+            ProtocolError: If a reply can't be parsed, or reports a
+                different register than the one asked for.
+        """
+        return {register: self.read_gain(register) for register in GainRegister}
+
     def push_gains(
         self,
         gains: Mapping[GainRegister, float],

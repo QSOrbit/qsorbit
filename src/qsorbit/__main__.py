@@ -1556,7 +1556,13 @@ def _stall_guard(config: StationConfig) -> StallGuard:
     return StallGuard(free_play_deg=max(azimuth, elevation))
 
 
-def _push_profile_gains(rotor: Rotor, profile: TrackingProfile, config: StationConfig) -> None:
+def _push_profile_gains(
+    rotor: Rotor,
+    profile: TrackingProfile,
+    config: StationConfig,
+    *,
+    report_in_force: bool = True,
+) -> None:
     """Write this profile's gains to the controller, verified, and say so.
 
     **Called when a track starts, not when the port opens.** Gains are
@@ -1575,13 +1581,41 @@ def _push_profile_gains(rotor: Rotor, profile: TrackingProfile, config: StationC
     it, for the same reason the cadence check runs at both ends: a
     profile can reach this point from ``--rotor-profile`` or from a
     direct construction, and this is the last place before the wire.
+
+    **A profile that writes nothing gets its gains read back and
+    reported, rather than described.** This line used to say the
+    controller "keeps its compiled defaults", which is a claim about
+    hardware that nothing had checked -- and false on any controller
+    written to since power-on, because gains are RAM-only and survive a
+    disconnect. It was wrong for a whole 543-second track on this
+    station: an aborted push had left Ki live while the console asserted
+    stock. That matters beyond tidiness, since Chunk H's entire windup
+    argument rests on ``stock`` meaning Ki = 0, and the acceptance pass
+    is a stock-versus-tracking comparison whose baseline has to be real.
+
+    Args:
+        rotor: The controller to write to.
+        profile: The profile whose gains to push.
+        config: For the breakaway clamp.
+        report_in_force: Whether to read the registers back and report
+            them when the profile writes none. ``True`` at the start of
+            a run, where a second of round trips buys a recorded
+            baseline. **``False`` on a live profile toggle**, where the
+            operator just chose the profile and a second of stalled
+            ticking mid-pass costs more than the information is worth --
+            and where paying it on only one of the two directions would
+            make the switch asymmetric inside the very measurement the
+            toggle exists to serve.
     """
     gains = profile.gains
     if gains is None:
-        print(
-            f"Gains:     {profile.name} profile writes none, "
-            "so the controller keeps its compiled defaults"
+        if not report_in_force:
+            print(f"Gains:     {profile.name} profile writes none")
+            return
+        in_force = ", ".join(
+            f"{register.name.lower()} {value:g}" for register, value in rotor.read_gains().items()
         )
+        print(f"Gains:     {profile.name} profile writes none - controller is running {in_force}")
         return
     profile.check_against(config.capabilities)
     rotor.push_gains(gains)
@@ -1611,7 +1645,10 @@ def _profile_pusher(rotor: Rotor, config: StationConfig) -> Callable[[TrackingPr
     """
 
     def push(profile: TrackingProfile) -> None:
-        _push_profile_gains(rotor, profile, config)
+        # No read-back here: see report_in_force. A live toggle must not
+        # stall the tick for a second, and must not stall it on only one
+        # of the two directions.
+        _push_profile_gains(rotor, profile, config, report_in_force=False)
 
     return push
 

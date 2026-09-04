@@ -1693,17 +1693,33 @@ class _GainRecordingRotor:
 
     Deliberately minimal: nothing here needs a serial port, and the
     question under test is whether the CLI decides to push at all.
+
+    ``in_force`` is what :meth:`read_gains` reports, and it defaults to
+    something **other** than the firmware's compiled defaults on
+    purpose. A double that answered 8.0 / 0.0 / 0.5 would let a test
+    pass whether the value came from the hardware or from the old
+    hard-coded sentence about compiled defaults.
     """
 
-    def __init__(self, raises: Exception | None = None):
+    def __init__(self, raises: Exception | None = None, in_force: dict | None = None):
+        from qsorbit.core.rotor import GainRegister
+
         self.pushed: list[dict] = []
+        self.reads = 0
         self._raises = raises
+        self._in_force = in_force or dict(
+            zip(GainRegister, [7.5, 0.42, 0.11, 9.25, 0.63, 0.07], strict=True)
+        )
 
     def push_gains(self, gains):
         if self._raises is not None:
             raise self._raises
         self.pushed.append(dict(gains))
         return dict(gains)
+
+    def read_gains(self):
+        self.reads += 1
+        return dict(self._in_force)
 
 
 def _station(mechanics: bool = True):
@@ -1766,6 +1782,44 @@ class TestPushProfileGains:
         stock = TrackingProfile(name="stock", deadband_deg=2.5, interval_s=1.0)
         _push_profile_gains(rotor, stock, _station())
         assert rotor.pushed == []
+        assert "writes none" in capsys.readouterr().out
+
+    def test_a_profile_that_writes_none_reports_what_is_actually_in_force(self, capsys):
+        """The line used to be a claim about hardware that nothing checked.
+
+        Gains are RAM-only and survive a disconnect, so "writes none"
+        does not mean "compiled defaults" -- it means whatever was last
+        written, which on this station was an aborted push that left Ki
+        live for a 543-second track while the console said stock.
+        """
+        from qsorbit.core.tracking_profile import TrackingProfile
+
+        rotor = _GainRecordingRotor()
+        stock = TrackingProfile(name="stock", deadband_deg=2.5, interval_s=1.0)
+
+        _push_profile_gains(rotor, stock, _station())
+
+        out = capsys.readouterr().out
+        assert rotor.reads == 1
+        assert "azimuth_ki 0.42" in out
+        assert "elevation_kd 0.07" in out
+        # The old sentence asserted a fact about the controller from a
+        # string literal. It must not come back.
+        assert "compiled defaults" not in out
+
+    def test_a_live_toggle_does_not_read_the_gains_back(self, capsys):
+        # Six round trips is about a second, and this path runs inside
+        # tick() on the ticking thread. Paying it on the stock direction
+        # only would make the toggle asymmetric during the very pass its
+        # acceptance depends on.
+        from qsorbit.core.tracking_profile import TrackingProfile
+
+        rotor = _GainRecordingRotor()
+        stock = TrackingProfile(name="stock", deadband_deg=2.5, interval_s=1.0)
+
+        _profile_pusher(rotor, _station())(stock)
+
+        assert rotor.reads == 0
         assert "writes none" in capsys.readouterr().out
 
     def test_a_gain_profile_pushes_all_six(self, capsys):
