@@ -50,16 +50,36 @@ class DriverMismatchError(DriverError):
 
 
 class DeviceNotFoundError(SdrError):
-    """Raised when no RTL-SDR is present at the requested device index.
+    """Raised when nothing attached matches the device that was asked for.
+
+    Two ways to ask, and this covers both: an index the enumeration
+    does not reach, and an EEPROM serial no attached device carries.
 
     The library loaded and answered; there is simply no hardware there.
-    Nothing to diagnose beyond "is it plugged in, and is it the index
-    you meant" — so this is deliberately distinct from
-    :class:`DeviceError`, which means something *is* there and it went
-    wrong.
+    Nothing to diagnose beyond "is it plugged in, and is it the one you
+    meant" — so this is deliberately distinct from :class:`DeviceError`,
+    which means something *is* there and it went wrong, and from
+    :class:`AmbiguousDeviceError`, which means too many things are.
 
     The integration suite treats this as a skip, never a failure: there
     is no bug to report in "the dongle isn't connected".
+    """
+
+
+class AmbiguousDeviceError(SdrError):
+    """Raised when more than one attached device carries the same serial.
+
+    Not a hypothetical. RTL-SDR Blog V4s ship with the serial
+    ``00000001`` burned into every one of them, so the first thing that
+    happens when a second identical stick is plugged in is that both
+    answer to the same name. Until one is reflashed there is no way to
+    say which is which — and picking "the first match" would quietly
+    hand back whichever happened to enumerate first, which is the
+    unstable thing addressing by serial exists to escape.
+
+    So this refuses rather than guesses, for the same reason
+    :class:`DriverMismatchError` does: the alternative failure is
+    silent, and looks exactly like success.
     """
 
 

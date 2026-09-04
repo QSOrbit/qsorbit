@@ -129,6 +129,64 @@ class SerialSettings:
 
 
 @dataclass(frozen=True)
+class SdrBranch:
+    """One receive branch: which dongle it is, and what to call it.
+
+    A *branch* is one whole receive chain — its own device, its own
+    stream, its own demodulator — that a later stage combines with the
+    others. Declaring them here rather than taking whatever happens to
+    be plugged in passes the same config-boundary test everything else
+    in this file does: which antenna is on which dongle is a fact about
+    this station's cabling, and it does not change when you point at a
+    different satellite.
+
+    Args:
+        serial: The dongle's EEPROM serial, which is how it is
+            addressed. Not an index: indices are enumeration order and
+            renumber when some *other* device is unplugged, so a config
+            written against them addresses the wrong stick without
+            saying so. Both V4s here shipped as ``00000001`` and were
+            reflashed with ``rtl_eeprom -s`` before either could be
+            named.
+        label: What to call this branch in the UI, e.g.
+            ``"A - Arrow V"``. Names the *antenna*, not the dongle,
+            because the antenna is what an operator is deciding about
+            when they read a per-branch meter; which stick is behind it
+            is a detail of the cable run.
+        ppm: Crystal correction for this dongle, overriding ``[sdr]``'s
+            when set. Optional because it is a property of an
+            individual oscillator and is only worth measuring per stick
+            once the two are known to differ — omitted means "use the
+            station's".
+
+    Raises:
+        ValueError: If a value is outside what any device could use.
+    """
+
+    serial: str
+    label: str
+    ppm: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.serial.strip():
+            raise ValueError(
+                "A branch serial must not be blank. A blank one matches every "
+                "dongle whose EEPROM was never flashed, which is most of them."
+            )
+        if not self.label.strip():
+            raise ValueError(
+                f"The branch with serial {self.serial!r} needs a label. It is what "
+                "the per-branch meters are titled with, and a blank one leaves "
+                "the operator reading two unnamed bars."
+            )
+        if self.ppm is not None and abs(self.ppm) > MAX_PPM:
+            raise ValueError(
+                f"ppm must be within +/-{MAX_PPM}, got {self.ppm}. A real dongle is "
+                "out by single or low double digits."
+            )
+
+
+@dataclass(frozen=True)
 class SdrSettings:
     """How to reach this station's SDR.
 
@@ -153,15 +211,23 @@ class SdrSettings:
         ppm: Crystal frequency correction in parts per million. A
             property of this particular dongle's oscillator, which is
             exactly why it lives with the station rather than the
-            satellite.
+            satellite. When branches are declared this is the default
+            each of them falls back to — see :meth:`ppm_for`.
+        branches: The receive branches this station is cabled for, in
+            declaration order, or empty for the single-device case that
+            every config written before this existed describes. The
+            first is the one a command that can only open one device
+            opens.
 
     Raises:
-        ValueError: If a value is outside what any device could use.
+        ValueError: If a value is outside what any device could use, or
+            if two branches name the same dongle.
     """
 
     driver_dir: str | None = None
     device_index: int = DEFAULT_DEVICE_INDEX
     ppm: int = DEFAULT_PPM
+    branches: tuple[SdrBranch, ...] = ()
 
     def __post_init__(self) -> None:
         if self.driver_dir is not None and not self.driver_dir.strip():
@@ -173,6 +239,30 @@ class SdrSettings:
                 f"ppm must be within +/-{MAX_PPM}, got {self.ppm}. A real dongle is "
                 "out by single or low double digits."
             )
+        _reject_duplicate_branch_field(
+            [branch.serial for branch in self.branches],
+            noun="serial",
+            because=(
+                "each branch is a separate dongle, and two entries on one stick "
+                "would give two meters reading the same antenna"
+            ),
+        )
+        _reject_duplicate_branch_field(
+            [branch.label for branch in self.branches],
+            noun="label",
+            because="the labels are what tell the two branches apart on screen",
+        )
+
+    def ppm_for(self, branch: SdrBranch) -> int:
+        """Return the crystal correction to use for ``branch``.
+
+        Its own if it declares one, the station's otherwise. Resolved
+        here on demand rather than at parse time so the distinction
+        survives: an omitted branch ppm stays omitted, instead of
+        freezing into a copy of whatever ``[sdr] ppm`` happened to be
+        when the file was read.
+        """
+        return self.ppm if branch.ppm is None else branch.ppm
 
 
 @dataclass(frozen=True)
@@ -549,10 +639,22 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
     )
     _reject_unknown_keys(
         sdr_table,
-        {"driver_dir", "device_index", "ppm"},
+        {"driver_dir", "device_index", "ppm", "branch"},
         section="sdr",
         path=resolved,
     )
+    sdr_branches = _require_sdr_branches(sdr_table, resolved)
+    # Refused rather than resolved in some precedence order, for the
+    # reason _reject_unknown_keys gives: branches address devices by
+    # serial, which is the whole point of them, so a device_index
+    # alongside them is a setting the operator believes is in force and
+    # isn't.
+    if sdr_branches and "device_index" in sdr_table:
+        raise ConfigError(
+            f"[sdr] in {resolved} sets both 'device_index' and [[sdr.branch]] "
+            "entries. A branch names its dongle by EEPROM serial, so the index "
+            "would be ignored — remove 'device_index'."
+        )
     _reject_unknown_keys(
         planning_table,
         {"tle_dir"},
@@ -616,6 +718,7 @@ def load_station_config(path: str | Path | None = None) -> StationConfig:
                 sdr_table, "device_index", "sdr", resolved, DEFAULT_DEVICE_INDEX
             ),
             ppm=_optional_int(sdr_table, "ppm", "sdr", resolved, DEFAULT_PPM),
+            branches=sdr_branches,
         )
         alignment_settings = AlignmentSettings(
             azimuth_deg=_optional_float(
@@ -673,6 +776,22 @@ def _reject_unknown_keys(
             "Nothing is silently ignored here — a misspelled travel limit would "
             "be a limit you believe is in force and isn't."
         )
+
+
+def _reject_duplicate_branch_field(values: list[str], *, noun: str, because: str) -> None:
+    """Raise if a ``[[sdr.branch]]`` field repeats, saying why it matters.
+
+    A ``ValueError`` rather than a ``ConfigError``, because it is
+    called from a value object's own validation and the loader turns it
+    into one with the file name attached.
+    """
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            raise ValueError(
+                f"Two [[sdr.branch]] entries both use the {noun} {value!r} - {because}."
+            )
+        seen.add(value)
 
 
 def _require_table(
@@ -753,13 +872,17 @@ def _optional_str(
     return _require_str(table, key, section, path)
 
 
-def _optional_int(table: dict[str, Any], key: str, section: str, path: Path, default: int) -> int:
-    if key not in table:
-        return default
-    value = table[key]
+def _as_int(value: Any, key: str, section: str, path: Path) -> int:
+    # bool is a subclass of int in Python, and `true` is not a number.
     if isinstance(value, bool) or not isinstance(value, int):
         raise ConfigError(f"'{key}' in [{section}] of {path} must be an integer, got {value!r}.")
     return value
+
+
+def _optional_int(table: dict[str, Any], key: str, section: str, path: Path, default: int) -> int:
+    if key not in table:
+        return default
+    return _as_int(table[key], key, section, path)
 
 
 def _require_azimuth_wrap(table: dict[str, Any], path: Path) -> AzimuthWrap:
@@ -832,6 +955,44 @@ def _require_tracking_profiles(
             )
         )
     return tuple(profiles)
+
+
+def _require_sdr_branches(sdr_table: dict[str, Any], path: Path) -> tuple[SdrBranch, ...]:
+    """Parse the ``[[sdr.branch]]`` array of tables, if present.
+
+    An array of tables like ``[[horizon]]`` and not a keyed table like
+    ``[rotor.profiles]``, because order carries meaning here: the first
+    branch is the one a single-device command opens. A profile has a
+    name and no rank; a branch has both, and the file's own ordering is
+    the honest place for the rank to live.
+    """
+    raw = sdr_table.get("branch", [])
+    if not isinstance(raw, list):
+        raise ConfigError(
+            f"'branch' in [sdr] of {path} must be an array of tables "
+            f"('[[sdr.branch]]' entries), got {type(raw).__name__}."
+        )
+    branches: list[SdrBranch] = []
+    for index, entry in enumerate(raw):
+        section = f"sdr.branch[{index}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{section} in {path} must be a table, got {type(entry).__name__}.")
+        _reject_unknown_keys(entry, {"serial", "label", "ppm"}, section=section, path=path)
+        raw_ppm = entry.get("ppm")
+        try:
+            branches.append(
+                SdrBranch(
+                    serial=_require_str(entry, "serial", section, path),
+                    label=_require_str(entry, "label", section, path),
+                    ppm=(None if raw_ppm is None else _as_int(raw_ppm, "ppm", section, path)),
+                )
+            )
+        except ValueError as exc:
+            # Caught here rather than in the loader's blanket handler so
+            # the message names which branch, which is the only part an
+            # operator with two of them needs.
+            raise ConfigError(f"Invalid value in {section} of {path}: {exc}") from exc
+    return tuple(branches)
 
 
 def _require_horizon_points(data: dict[str, Any], path: Path) -> tuple[HorizonPoint, ...]:

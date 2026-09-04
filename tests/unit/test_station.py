@@ -18,6 +18,7 @@ from qsorbit.core.station import (
     AlignmentSettings,
     ConfigError,
     PlanningSettings,
+    SdrBranch,
     SdrSettings,
     SerialSettings,
     StationConfig,
@@ -468,6 +469,204 @@ class TestSdrSettings:
 
     def test_accepts_a_realistic_ppm(self):
         assert SdrSettings(ppm=-12).ppm == -12
+
+    def test_defaults_to_no_branches(self):
+        # A single-dongle station, which is every station that existed
+        # before branches did.
+        assert SdrSettings().branches == ()
+
+    def test_rejects_two_branches_on_one_dongle(self):
+        with pytest.raises(ValueError, match="serial"):
+            SdrSettings(
+                branches=(
+                    SdrBranch(serial="LEFT", label="A"),
+                    SdrBranch(serial="LEFT", label="B"),
+                )
+            )
+
+    def test_rejects_two_branches_with_one_label(self):
+        with pytest.raises(ValueError, match="label"):
+            SdrSettings(
+                branches=(
+                    SdrBranch(serial="LEFT", label="A"),
+                    SdrBranch(serial="RIGHT", label="A"),
+                )
+            )
+
+
+class TestSdrBranch:
+    def test_ppm_is_optional(self):
+        assert SdrBranch(serial="LEFT", label="A - Arrow V").ppm is None
+
+    def test_rejects_a_blank_serial(self):
+        # A blank serial matches every dongle whose EEPROM was never
+        # flashed, which is most of them.
+        with pytest.raises(ValueError, match="serial"):
+            SdrBranch(serial="  ", label="A")
+
+    def test_rejects_a_blank_label(self):
+        with pytest.raises(ValueError, match="label"):
+            SdrBranch(serial="LEFT", label="")
+
+    def test_rejects_an_absurd_ppm(self):
+        with pytest.raises(ValueError, match="ppm"):
+            SdrBranch(serial="LEFT", label="A", ppm=5000)
+
+
+class TestBranchPpm:
+    """Which correction a branch actually receives."""
+
+    def test_a_branch_without_a_ppm_falls_back_to_the_station(self):
+        settings = SdrSettings(ppm=-3, branches=(SdrBranch(serial="LEFT", label="A"),))
+
+        assert settings.ppm_for(settings.branches[0]) == -3
+
+    def test_a_branch_with_a_ppm_overrides_the_station(self):
+        settings = SdrSettings(ppm=-3, branches=(SdrBranch(serial="LEFT", label="A", ppm=7),))
+
+        assert settings.ppm_for(settings.branches[0]) == 7
+
+    def test_a_branch_ppm_of_zero_overrides_rather_than_falls_back(self):
+        # The trap in every "use the default when unset" scheme: zero is
+        # a measurement, not an absence, and a branch measured at 0 next
+        # to a station default of -3 must get 0.
+        settings = SdrSettings(ppm=-3, branches=(SdrBranch(serial="LEFT", label="A", ppm=0),))
+
+        assert settings.ppm_for(settings.branches[0]) == 0
+
+    def test_the_two_branches_can_differ(self):
+        settings = SdrSettings(
+            ppm=-3,
+            branches=(
+                SdrBranch(serial="LEFT", label="A", ppm=1),
+                SdrBranch(serial="RIGHT", label="B"),
+            ),
+        )
+
+        assert [settings.ppm_for(branch) for branch in settings.branches] == [1, -3]
+
+
+BRANCH_SECTION = """
+    [sdr]
+    ppm = -3
+
+    [[sdr.branch]]
+    serial = "LEFT"
+    label = "A - Arrow V"
+    ppm = 1
+
+    [[sdr.branch]]
+    serial = "RIGHT"
+    label = "B - Arrow H"
+"""
+
+
+class TestSdrBranchSection:
+    """The [[sdr.branch]] array of tables, optional like [sdr] itself."""
+
+    def test_no_branches_is_the_single_device_station(self, tmp_path):
+        config = load_station_config(write_config(tmp_path, VALID_CONFIG + SDR_SECTION))
+
+        assert config.sdr.branches == ()
+
+    def test_reads_every_branch_in_file_order(self, tmp_path):
+        # Order is meaningful, unlike [rotor.profiles]: the first branch
+        # is the one a single-device command opens.
+        config = load_station_config(write_config(tmp_path, VALID_CONFIG + BRANCH_SECTION))
+
+        assert [branch.serial for branch in config.sdr.branches] == ["LEFT", "RIGHT"]
+        assert [branch.label for branch in config.sdr.branches] == ["A - Arrow V", "B - Arrow H"]
+
+    def test_reads_the_optional_per_branch_ppm(self, tmp_path):
+        config = load_station_config(write_config(tmp_path, VALID_CONFIG + BRANCH_SECTION))
+
+        assert config.sdr.branches[0].ppm == 1
+        assert config.sdr.branches[1].ppm is None
+        assert config.sdr.ppm_for(config.sdr.branches[1]) == -3
+
+    def test_one_branch_is_allowed(self, tmp_path):
+        path = write_config(
+            tmp_path,
+            VALID_CONFIG + '\n[[sdr.branch]]\nserial = "LEFT"\nlabel = "A"\n',
+        )
+
+        assert load_station_config(path).sdr.branches[0].serial == "LEFT"
+
+    def test_a_branch_needs_a_serial(self, tmp_path):
+        path = write_config(tmp_path, VALID_CONFIG + '\n[[sdr.branch]]\nlabel = "A"\n')
+
+        with pytest.raises(ConfigError, match="serial"):
+            load_station_config(path)
+
+    def test_a_branch_needs_a_label(self, tmp_path):
+        path = write_config(tmp_path, VALID_CONFIG + '\n[[sdr.branch]]\nserial = "LEFT"\n')
+
+        with pytest.raises(ConfigError, match="label"):
+            load_station_config(path)
+
+    def test_an_unknown_branch_key_is_an_error(self, tmp_path):
+        path = write_config(
+            tmp_path,
+            VALID_CONFIG + '\n[[sdr.branch]]\nserial = "L"\nlabel = "A"\nindex = 0\n',
+        )
+
+        with pytest.raises(ConfigError, match="index"):
+            load_station_config(path)
+
+    def test_the_error_names_which_branch(self, tmp_path):
+        # With two of them, "invalid ppm" without an index sends you
+        # reading both.
+        path = write_config(
+            tmp_path,
+            VALID_CONFIG
+            + '\n[[sdr.branch]]\nserial = "L"\nlabel = "A"\n'
+            + '\n[[sdr.branch]]\nserial = "R"\nlabel = "B"\nppm = 50000\n',
+        )
+
+        with pytest.raises(ConfigError, match=r"sdr\.branch\[1\]"):
+            load_station_config(path)
+
+    def test_branch_is_not_a_table_keyed_section(self, tmp_path):
+        # [sdr.branch] rather than [[sdr.branch]] -- one bracket short,
+        # and a plausible typo. TOML reads it as a table, not a list.
+        path = write_config(tmp_path, VALID_CONFIG + '\n[sdr.branch]\nserial = "L"\nlabel = "A"\n')
+
+        with pytest.raises(ConfigError, match="array of tables"):
+            load_station_config(path)
+
+    def test_two_branches_on_one_dongle_is_an_error(self, tmp_path):
+        path = write_config(
+            tmp_path,
+            VALID_CONFIG
+            + '\n[[sdr.branch]]\nserial = "L"\nlabel = "A"\n'
+            + '\n[[sdr.branch]]\nserial = "L"\nlabel = "B"\n',
+        )
+
+        with pytest.raises(ConfigError, match="serial"):
+            load_station_config(path)
+
+    def test_branches_and_device_index_together_are_refused(self, tmp_path):
+        # Not resolved in some precedence order: a device_index that
+        # branches override is a setting the operator believes is in
+        # force and isn't, which this file refuses everywhere else.
+        path = write_config(
+            tmp_path,
+            VALID_CONFIG
+            + "\n[sdr]\ndevice_index = 1\n"
+            + '\n[[sdr.branch]]\nserial = "L"\nlabel = "A"\n',
+        )
+
+        with pytest.raises(ConfigError, match="device_index"):
+            load_station_config(path)
+
+    def test_device_index_alone_is_still_fine(self, tmp_path):
+        # The guard above must not fire on the single-device config
+        # every existing station has.
+        config = load_station_config(
+            write_config(tmp_path, VALID_CONFIG + "\n[sdr]\ndevice_index = 1\n")
+        )
+
+        assert config.sdr.device_index == 1
 
 
 PLANNING_SECTION = """

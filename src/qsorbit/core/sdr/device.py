@@ -18,6 +18,13 @@ from the request, rather than letting a caller assume.
 stock librtlsdr enumerates, opens, and streams — at the wrong frequency,
 with nothing reporting an error. That is the failure this whole module
 exists to prevent, so it is a refusal rather than a warning.
+
+**Address a device by serial, never by a stored index.** An index is
+enumeration order and nothing more; unplugging some other dongle
+renumbers it, and a stored one then opens a different radio without
+saying so. :func:`index_for_serial` resolves one at the moment of
+opening, and refuses rather than guesses when two sticks answer to the
+same name — which, out of the box, they do.
 """
 
 from __future__ import annotations
@@ -25,7 +32,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from qsorbit.core.sdr.config import AutoGain, SdrConfig, nearest_gain_step
-from qsorbit.core.sdr.exceptions import DeviceError, DriverMismatchError
+from qsorbit.core.sdr.exceptions import (
+    AmbiguousDeviceError,
+    DeviceError,
+    DeviceNotFoundError,
+    DriverMismatchError,
+)
 from qsorbit.core.sdr.librtlsdr import DeviceHandle, LibRtlSdr, TunerType
 
 #: EEPROM strings that identify an RTL-SDR Blog V4. The Blog driver's own
@@ -40,6 +52,17 @@ BLOG_V4_PRODUCT: str = "Blog V4"
 DEFAULT_READ_BYTES: int = 262_144
 
 
+def _device_label(manufacturer: str, product: str, name: str) -> str:
+    """Return the friendliest true name for a device, for one-line output.
+
+    Shared by the two records below so that a device does not describe
+    itself one way before it is opened and another way after.
+    """
+    if manufacturer == BLOG_V4_MANUFACTURER and product == BLOG_V4_PRODUCT:
+        return "RTL-SDR Blog V4"
+    return name or "unknown device"
+
+
 @dataclass(frozen=True)
 class DeviceInfo:
     """What a device says about itself, read before it is configured.
@@ -50,9 +73,9 @@ class DeviceInfo:
             ``"Generic RTL2832U OEM"``. Not distinguishing.
         manufacturer: EEPROM manufacturer string.
         product: EEPROM product string.
-        serial: EEPROM serial string. Blank on many dongles; the field
-            that eventually distinguishes two identical sticks in
-            Phase 3.
+        serial: EEPROM serial string. Blank on many dongles, and the
+            field :func:`index_for_serial` addresses a device by when
+            there is more than one attached.
         tuner: Which tuner chip the library reports.
     """
 
@@ -70,9 +93,144 @@ class DeviceInfo:
 
     def describe(self) -> str:
         """Return a one-line human description, for logs and CLI output."""
-        label = "RTL-SDR Blog V4" if self.is_blog_v4 else (self.name or "unknown device")
+        label = _device_label(self.manufacturer, self.product, self.name)
         serial = f", serial {self.serial}" if self.serial else ""
         return f"[{self.index}] {label} ({self.tuner.name} tuner{serial})"
+
+
+@dataclass(frozen=True)
+class AttachedDevice:
+    """One device the library can see, identified without opening it.
+
+    Deliberately smaller than :class:`DeviceInfo`, and the difference is
+    the entire point of having two records: :attr:`DeviceInfo.tuner` can
+    only be read through an open handle, so building one costs an
+    exclusive claim on the device. Every field here comes from
+    ``rtlsdr_get_device_name`` and ``rtlsdr_get_device_usb_strings``,
+    neither of which needs a handle — so the whole bus can be
+    enumerated while something else is already streaming from one of
+    them, which is exactly the situation a second receive branch
+    creates.
+
+    Args:
+        index: Enumeration order, and only that. Not an address worth
+            writing down: it changes with which ports are populated and
+            with what was plugged in when, which is why
+            :func:`index_for_serial` exists at all.
+        name: The library's generic name, e.g. ``"Generic RTL2832U
+            OEM"``. Not distinguishing — every dongle reports it.
+        manufacturer: EEPROM manufacturer string.
+        product: EEPROM product string.
+        serial: EEPROM serial string. Blank on many dongles and
+            identical on many more: both V4s used here shipped as
+            ``00000001`` and had to be reflashed before either could be
+            named.
+    """
+
+    index: int
+    name: str
+    manufacturer: str
+    product: str
+    serial: str
+
+    def describe(self) -> str:
+        """Return a one-line human description, for logs and CLI output."""
+        label = _device_label(self.manufacturer, self.product, self.name)
+        return f"[{self.index}] {label}, serial {self.serial or '(blank)'}"
+
+
+def attached_devices(lib: LibRtlSdr) -> tuple[AttachedDevice, ...]:
+    """Enumerate every RTL-SDR the library can see, opening none of them.
+
+    Args:
+        lib: A loaded binding.
+
+    Returns:
+        One record per device, in enumeration order.
+
+    A device whose USB strings will not read is reported with blank
+    strings rather than skipped. It is genuinely attached — the count
+    includes it, and on Windows an unbound WinUSB driver produces
+    exactly this — so dropping it would turn "one device would not
+    answer" into "no device has that serial", which sends whoever is at
+    the bench looking in the wrong place entirely.
+    """
+    devices: list[AttachedDevice] = []
+    for index in range(lib.device_count()):
+        try:
+            manufacturer, product, serial = lib.usb_strings(index)
+        except DeviceNotFoundError:
+            manufacturer, product, serial = ("", "", "")
+        devices.append(
+            AttachedDevice(
+                index=index,
+                name=lib.device_name(index),
+                manufacturer=manufacturer,
+                product=product,
+                serial=serial,
+            )
+        )
+    return tuple(devices)
+
+
+def index_for_serial(lib: LibRtlSdr, serial: str) -> int:
+    """Return the index of the attached device carrying EEPROM ``serial``.
+
+    Args:
+        lib: A loaded binding.
+        serial: The serial to look for. Matched exactly — it is read
+            from the dongle's EEPROM, not normalised by anything here.
+
+    Returns:
+        The index that device currently enumerates at. Resolve it again
+        next time rather than storing it: it is enumeration order, and
+        unplugging some *other* dongle renumbers it.
+
+    Raises:
+        DeviceNotFoundError: If nothing attached carries that serial.
+            The message lists what is attached, because the useful next
+            question is always "then what did I flash it as".
+        AmbiguousDeviceError: If more than one device carries it.
+
+    librtlsdr has ``rtlsdr_get_index_by_serial`` and it is deliberately
+    not bound: it collapses "no such serial", "no devices at all" and
+    "two devices match" into negative return codes, and it cannot say
+    what it *did* find. Walking the enumeration costs two extra calls
+    per attached device and buys an error message that names the
+    alternatives — which, at a bench with two identical sticks, is the
+    whole difference between a fix and a guess.
+    """
+    devices = attached_devices(lib)
+    matches = [device for device in devices if device.serial == serial]
+    if len(matches) > 1:
+        where = ", ".join(f"index {device.index}" for device in matches)
+        raise AmbiguousDeviceError(
+            f"{len(matches)} attached devices report serial {serial!r} ({where}), "
+            "so there is no way to say which one was meant. Serials are not "
+            "unique out of the box — every RTL-SDR Blog V4 ships as "
+            "'00000001' — so give each stick its own with "
+            "'rtl_eeprom -d <index> -s <name>', one plugged in at a time, and "
+            "replug afterwards for the new string to be read."
+        )
+    if not matches:
+        raise DeviceNotFoundError(_no_such_serial_message(serial, devices))
+    return matches[0].index
+
+
+def _no_such_serial_message(serial: str, devices: tuple[AttachedDevice, ...]) -> str:
+    if not devices:
+        return (
+            f"No RTL-SDR with serial {serial!r}: the library sees no devices at "
+            "all. Check it is plugged in, and that the USB driver is bound "
+            "(Zadig on Windows)."
+        )
+    listing = "\n  ".join(device.describe() for device in devices)
+    return (
+        f"No RTL-SDR with serial {serial!r}. Attached right now:\n  {listing}\n"
+        "Serials are case-sensitive, and are read from the dongle's EEPROM "
+        "rather than from anything QSOrbit stores — so this is asking what the "
+        "stick is called, not what the config calls it."
+    )
 
 
 @dataclass(frozen=True)
