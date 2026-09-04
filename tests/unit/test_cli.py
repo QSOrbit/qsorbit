@@ -1604,18 +1604,17 @@ class TestTrackLogParser:
         # Two of shell's three modes never reach the code that builds a
         # log at all, so the parser accepting the flag is not the same
         # claim as the command honouring it.
+        #
+        # This is the only --track-log refusal shell still has. The
+        # rotor-only one was removed when that path moved onto
+        # TrackingThread, and it is deliberately not replaced by a test
+        # asserting the flag now works there: reaching that would need
+        # Qt and a rotor, so a unit test could only get as far as an
+        # import error, which asserts the sandbox's limitations rather
+        # than the code's behaviour. That path is covered at the bench.
         assert run(["shell", "--track-log", "x.csv"], config_path, factory) == 1
 
         assert "--track-log needs --tle and --send" in capsys.readouterr().err
-
-    def test_shell_refuses_it_on_a_rotor_only_run_and_says_why(self, config_path, factory, capsys):
-        # Not "invalid" -- unsupported, for a stated reason, until that
-        # path moves off the GUI timer. Refusing beats accepting it and
-        # writing nothing.
-        code = run(["shell", "--tle", "x", "--send", "--track-log", "x.csv"], config_path, factory)
-
-        assert code == 1
-        assert "not supported on a rotor-only shell yet" in capsys.readouterr().err
 
 
 class TestReceiveTheme:

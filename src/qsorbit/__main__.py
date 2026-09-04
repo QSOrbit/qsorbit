@@ -2033,18 +2033,6 @@ def _command_shell(
                 file=sys.stderr,
             )
             return 1
-        if args.downlink is None:
-            print(
-                "shell: --track-log is not supported on a rotor-only shell yet. "
-                "That path still ticks from the GUI timer, and sampling at 5 Hz "
-                "there would make the interface sluggish and jitter the tick -- "
-                "which changes the commanded step and corrupts the very thing "
-                "the log is measuring. Add --downlink, or use `receive "
-                "--track-log`.",
-                file=sys.stderr,
-            )
-            return 1
-
     if args.tle is None:
         if args.downlink is not None or args.send:
             print(
@@ -2269,12 +2257,20 @@ def _run_shell_tracking_only(
             on_stall=_report_stall,
             on_profile_change=_profile_pusher(rotor, config),
         )
+        track_log = TrackLog(args.track_log) if args.track_log is not None else None
+        if track_log is not None:
+            track_log.open()
         # The ticker is built BEFORE the hub, because the hub needs its
         # fault callable. A readout left showing its last plausible
         # numbers under a dead rotor is the exact silent failure Chunk A
         # PR2 added `tracking_error` to prevent, and it would be a poor
         # joke to reintroduce it in the shell.
-        ticker = _GuiThreadTicker(loop, interval_s=profile.interval_s)
+        #
+        # No interval is passed: the loop already holds one, and giving
+        # this object a second copy is two sources for a number that
+        # must agree -- which a live profile switch would then have to
+        # keep in step in two places.
+        ticker = TrackingThread(loop, log=track_log)
         hub = FeedHub(
             tracking=loop,
             tracking_fault=ticker.fault,
@@ -2296,9 +2292,19 @@ def _run_shell_tracking_only(
             title=f"QSOrbit - tracking {satellite.name}",
         )
         try:
+            # Started before the window is shown, and unlike the receive
+            # path that ordering carries no weight here: there is no SDR
+            # reader thread for Qt's startup to starve, which is the
+            # same reason this path was allowed a GUI-thread ticker for
+            # as long as it was.
+            ticker.start()
             _exec_shell(window, app, args)
         finally:
             ticker.stop()
+
+    print()
+    print(ticker.describe())
+    _print_track_log(ticker, track_log)
     return 0
 
 
@@ -2437,60 +2443,6 @@ def _run_shell(
     print(f"feeds: {', '.join(hub.claimed) or 'none claimed'}")
     _print_paint_stats(window)
     return 0
-
-
-class _GuiThreadTicker:
-    """Ticks a tracking loop from the GUI thread. Rotor-only shell runs.
-
-    Deliberately not used anywhere a radio is running -- see
-    :func:`_run_shell_tracking_only` for the argument, which turns
-    entirely on whether there is a reader thread to starve.
-    """
-
-    def __init__(self, loop: TrackingLoop, *, interval_s: float) -> None:
-        from PySide6.QtCore import QTimer
-
-        self._loop = loop
-        self._error: BaseException | None = None
-        # Unparented, and kept alive by the caller's own local for as
-        # long as `app.exec()` runs -- the same lifetime rule a
-        # top-level widget follows, and for the same reason. It is
-        # unparented because it has to exist before the window does, so
-        # that the hub can be handed its fault callable.
-        self._timer = QTimer()
-        self._timer.setInterval(int(interval_s * 1000))
-        self._timer.timeout.connect(self._tick)
-        self._timer.start()
-        self._tick()
-
-    def fault(self) -> BaseException | None:
-        """Whatever stopped the ticker, or ``None``. Read by the readout."""
-        return self._error
-
-    def stop(self) -> None:
-        """Stop ticking. Does not stop the rotor."""
-        self._timer.stop()
-
-    def _tick(self) -> None:
-        try:
-            self._loop.tick()
-            # Re-read rather than be told. A profile switch is applied
-            # inside tick(), by the loop, on its own thread -- so the
-            # timer finds out the same way anything else does, by
-            # reading the value afterwards. A callback would mean the
-            # loop knowing a Qt timer exists.
-            wanted = int(self._loop.interval_s * 1000)
-            if wanted != self._timer.interval():
-                self._timer.setInterval(wanted)
-        except Exception as exc:  # noqa: BLE001 - recorded, not raised into Qt
-            # Raising here would unwind through Qt's C++ dispatch, which
-            # prints a traceback and carries on -- leaving a readout
-            # frozen on its last plausible numbers, which is the silent
-            # failure this project keeps meeting. Recording it where the
-            # readout will find it, and stopping, is the honest outcome.
-            self._error = exc
-            self._timer.stop()
-            print(f"tracking stopped: {exc}", file=sys.stderr)
 
 
 def _command_stop(config: StationConfig, factory: RotorFactory) -> int:
