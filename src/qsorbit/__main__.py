@@ -78,6 +78,7 @@ from qsorbit.core.profiles import (
     load_catalog_manifest,
     load_profile_catalog,
 )
+from qsorbit.core.quieting_log import QuietingLog
 from qsorbit.core.receive import (
     DEFAULT_TRACKING_INTERVAL_S,
     Branch,
@@ -662,6 +663,19 @@ def _add_radio_arguments(parser: argparse.ArgumentParser, *, required: bool) -> 
             "branch demodulates and measures either way -- this chooses what "
             "you hear, and the waterfall follows it. Means nothing on a "
             "station with one dongle, which has one branch."
+        ),
+    )
+    parser.add_argument(
+        "--quieting-log",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write a CSV of what each branch was hearing: one row per block "
+            "per branch, with the quieting measurement and the squelch's "
+            "decision. This is what a combiner's switching margin is sized "
+            "from - the wander in the difference between two branches "
+            "hearing the same thing - which no summary of minima and maxima "
+            "can give."
         ),
     )
     parser.add_argument(
@@ -1492,6 +1506,28 @@ def _readout_poll_interval_ms(args: argparse.Namespace, default_ms: int) -> int:
     return default_ms
 
 
+def _open_quieting_log(args: argparse.Namespace) -> QuietingLog | None:
+    """Open the quieting log if one was asked for, else ``None``.
+
+    Opened before the session is built, so its time origin is fixed
+    before any block can arrive and both branches measure elapsed time
+    from the same instant.
+    """
+    if args.quieting_log is None:
+        return None
+    log = QuietingLog(args.quieting_log)
+    log.open()
+    return log
+
+
+def _print_quieting_log(log: QuietingLog | None) -> None:
+    """Report the quieting log and close it, if there was one."""
+    if log is None:
+        return
+    print(log.describe())
+    log.close()
+
+
 def _print_track_log(ticker: TrackingThread, log: TrackLog | None) -> None:
     """Report the track log and close it, if there was one.
 
@@ -1732,7 +1768,12 @@ def _tracking_profile(args: argparse.Namespace, config: StationConfig) -> Tracki
 
 
 def _build_branches(
-    args: argparse.Namespace, radios: Sequence[_Radio], listening: int, *, window: bool
+    args: argparse.Namespace,
+    radios: Sequence[_Radio],
+    listening: int,
+    *,
+    window: bool,
+    log: QuietingLog | None = None,
 ) -> list[Branch]:
     """Turn configured radios into receive branches.
 
@@ -1748,6 +1789,9 @@ def _build_branches(
         window: Whether anything will drain spectrum frames. ``receive``
             passes ``--window``; the shell passes ``True`` always,
             because a shell has a Radio tab in every configuration.
+        log: Optional quieting log, shared by every branch. One log and
+            not one per branch, because the whole point is a difference
+            between two series and two files would be two time origins.
     """
     spectrum_config = SpectrumConfig(
         fft_size=RECEIVE_FFT_SIZE,
@@ -1767,6 +1811,7 @@ def _build_branches(
             # _squelch_status_line.
             mute_squelch=args.squelch,
             spectrum_factory=factory if index == listening else None,
+            log=log,
         )
         for index, radio in enumerate(radios)
     ]
@@ -1786,9 +1831,10 @@ def _run_receive(
     if track_log is not None:
         track_log.open()
     ticker = TrackingThread(loop, log=track_log) if loop is not None else None
+    quieting_log = _open_quieting_log(args)
 
     session = ReceiveSession(
-        branches=_build_branches(args, radios, listening, window=args.window),
+        branches=_build_branches(args, radios, listening, window=args.window, log=quieting_log),
         audio=AudioOutput(
             radios[listening].nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)
         ),
@@ -1885,6 +1931,7 @@ def _run_receive(
 
     print()
     print(stats.describe())
+    _print_quieting_log(quieting_log)
     if ticker is not None:
         print(ticker.describe())
         _print_track_log(ticker, track_log)
@@ -2447,11 +2494,12 @@ def _run_shell(
     if track_log is not None:
         track_log.open()
     ticker = TrackingThread(loop, log=track_log) if loop is not None else None
+    quieting_log = _open_quieting_log(args)
     session = ReceiveSession(
         # window=True unconditionally here, unlike `receive`, where it
         # follows --window: a shell always has a Radio tab, so there is
         # always something that would drain the frames.
-        branches=_build_branches(args, radios, listening, window=True),
+        branches=_build_branches(args, radios, listening, window=True, log=quieting_log),
         audio=AudioOutput(
             radios[listening].nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)
         ),
@@ -2525,6 +2573,7 @@ def _run_shell(
 
     print()
     print(stats.describe())
+    _print_quieting_log(quieting_log)
     if ticker is not None:
         print(ticker.describe())
         _print_track_log(ticker, track_log)
