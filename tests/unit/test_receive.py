@@ -1302,3 +1302,199 @@ class TestQuietingLogging:
             device.finish()
             quietly_stop(session)
             log.close()
+
+
+# ---------------------------------------------------------------------------
+# The combiner, wired in
+# ---------------------------------------------------------------------------
+
+
+class StubSelector:
+    """A selector the test drives, standing in for BranchSelector.
+
+    The selection *rules* are covered in test_combiner.py against the
+    real thing. What is untestable there and testable here is the
+    wiring: what readings the session hands over, and whether the answer
+    actually moves the speaker.
+    """
+
+    def __init__(self, answers=None):
+        self.seen: list[tuple[str, dict]] = []
+        self._answers = list(answers or [])
+
+    def choose(self, current, readings):
+        self.seen.append((current, dict(readings)))
+        return self._answers.pop(0) if self._answers else current
+
+    @property
+    def stats(self):
+        from qsorbit.core.combiner import SelectorStats
+
+        return SelectorStats(
+            margin_db=3.0,
+            evaluations=len(self.seen),
+            switches=0,
+            evaluations_by_branch=(),
+        )
+
+
+class TestCombinerWiring:
+    def a_pair(self, **overrides):
+        devices = (
+            SteppedFakeDevice([TUNING_OFFSET_HZ] * 4),
+            SteppedFakeDevice([TUNING_OFFSET_HZ] * 4),
+        )
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        audio = RecordingAudio()
+        branches = [
+            a_branch(device, label=label, clock=BlockClock(), squelch=NoiseSquelch())
+            for device, label in zip(devices, ("A", "B"), strict=True)
+        ]
+        session = ReceiveSession(branches=branches, audio=audio, range_rate=source, **overrides)
+        return devices, session, audio
+
+    def test_no_selector_leaves_the_branch_fixed(self):
+        # The control run for the acceptance comparison: same command,
+        # one flag apart.
+        devices, session, audio = self.a_pair()
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+            step_both(devices, session, 2)
+            assert session.listening.label == "A"
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
+        assert session.stats.combiner is None
+
+    def test_the_selector_is_asked_after_every_block(self):
+        stub = StubSelector()
+        devices, session, audio = self.a_pair(selector=stub)
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
+        # One decision per demodulated block per branch.
+        assert len(stub.seen) >= 2
+
+    def test_it_is_handed_a_reading_for_every_branch(self):
+        stub = StubSelector()
+        devices, session, audio = self.a_pair(selector=stub)
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
+        _, readings = stub.seen[-1]
+        assert set(readings) == {"A", "B"}
+
+    def test_its_answer_moves_the_speaker(self):
+        # The claim the pure-function tests cannot make: a decision has
+        # to actually reach listen_to().
+        stub = StubSelector(answers=["B"])
+        devices, session, audio = self.a_pair(selector=stub)
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+            assert wait_until(lambda: session.listening.label == "B")
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
+    def test_exactly_one_branch_still_holds_the_ear_after_a_switch(self):
+        stub = StubSelector(answers=["B"])
+        devices, session, audio = self.a_pair(selector=stub)
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+            assert wait_until(lambda: session.listening.label == "B")
+            assert [branch.listened for branch in session.branches] == [False, True]
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
+    def test_the_stats_reach_the_report(self):
+        stub = StubSelector()
+        devices, session, audio = self.a_pair(selector=stub)
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
+        assert session.stats.combiner is not None
+        assert "combiner:" in session.stats.describe()
+
+    def test_the_report_distinguishes_off_from_never_switched(self):
+        # "off" and "broken" must never look the same, and neither must
+        # "off" and "on but steady".
+        _, session, _ = self.a_pair()
+
+        assert "combiner: off" in session.stats.describe()
+
+
+class TestStaleBranchGuard:
+    """A branch that has stopped must not keep or take the speaker."""
+
+    def a_branch_with_squelch(self, device, label):
+        return a_branch(device, label=label, clock=BlockClock(), squelch=NoiseSquelch())
+
+    def test_a_branch_that_never_produced_reads_as_stale(self):
+        branch = self.a_branch_with_squelch(SteppedFakeDevice([TUNING_OFFSET_HZ]), "A")
+
+        assert branch.fresh_quieting_db(now=time.monotonic(), stale_after_s=2.0) is None
+
+    def test_a_branch_that_just_produced_reads_fresh(self):
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ])
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        session, audio = a_session(device, source, squelch=NoiseSquelch())
+
+        session.start()
+        try:
+            device.step()
+            assert audio.wait_for(1), "the block was never demodulated"
+            branch = session.branches[0]
+            assert branch.fresh_quieting_db(now=time.monotonic(), stale_after_s=2.0) is not None
+        finally:
+            device.finish()
+            quietly_stop(session)
+
+    def test_a_long_enough_gap_makes_it_stale(self):
+        # The value is still sitting there and still looks plausible --
+        # which is exactly why the guard is a time check and not a value
+        # check.
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ])
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        session, audio = a_session(device, source, squelch=NoiseSquelch())
+
+        session.start()
+        try:
+            device.step()
+            assert audio.wait_for(1), "the block was never demodulated"
+            branch = session.branches[0]
+            assert branch.live_quieting_db is not None
+            # Same instant, judged against a threshold of zero: the
+            # reading has not changed, only how long ago it arrived.
+            assert branch.fresh_quieting_db(now=time.monotonic() + 60.0, stale_after_s=2.0) is None
+        finally:
+            device.finish()
+            quietly_stop(session)

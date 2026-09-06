@@ -23,6 +23,7 @@ from qsorbit.__main__ import (
     DEFAULT_TUNING_OFFSET_KHZ,
     UNNAMED_BRANCH_LABEL,
     _build_branches,
+    _build_selector,
     _command_receive,
     _declared_branches,
     _describe_mechanics,
@@ -45,6 +46,7 @@ from qsorbit.__main__ import (
     build_parser,
     main,
 )
+from qsorbit.core.combiner import DEFAULT_MARGIN_DB
 from qsorbit.core.dsp.spectrum import SpectrumConfig
 from qsorbit.core.dsp.spectrum_stream import SpectrumStream
 from qsorbit.core.profiles import CATALOG_MANIFEST_FILENAME
@@ -2542,3 +2544,48 @@ class TestQuietingLogWiring:
         _print_quieting_log(log)
 
         assert "q.csv" in capsys.readouterr().out
+
+
+class TestCombinerFlags:
+    def test_combining_is_off_by_default(self, tle_path):
+        # Not timidity: "combined beats either branch alone" is a
+        # comparison, and the control for it is the same command without
+        # the flag.
+        assert receive_args(tle_path).combine is False
+        assert _build_selector(receive_args(tle_path)) is None
+
+    def test_combine_builds_a_selector_at_the_measured_margin(self, tle_path):
+        selector = _build_selector(receive_args(tle_path, "--combine"))
+
+        assert selector is not None
+        assert selector.margin_db == DEFAULT_MARGIN_DB
+
+    def test_the_margin_is_overridable(self, tle_path):
+        # So the acceptance pass can sweep it without a rebuild.
+        selector = _build_selector(receive_args(tle_path, "--combine", "--combine-margin", "1.5"))
+
+        assert selector.margin_db == 1.5
+
+    def test_a_zero_margin_is_accepted(self, tle_path):
+        # The deliberate no-hysteresis control.
+        assert (
+            _build_selector(receive_args(tle_path, "--combine", "--combine-margin", "0")).margin_db
+            == 0.0
+        )
+
+    def test_a_negative_margin_is_refused(self, tle_path):
+        with pytest.raises(ValueError, match="must not be negative"):
+            _build_selector(receive_args(tle_path, "--combine", "--combine-margin", "-1"))
+
+    def test_the_margin_is_ignored_without_combine(self, tle_path):
+        # No selector at all, so nothing to carry the margin -- which is
+        # the honest outcome rather than a selector nobody consults.
+        assert _build_selector(receive_args(tle_path, "--combine-margin", "1.5")) is None
+
+    def test_the_shell_takes_the_flags_too(self):
+        args = build_parser().parse_args(
+            ["shell", "--tle", "x", "--downlink", "145.95", "--gain", "32.8", "--combine"]
+        )
+
+        assert args.combine is True
+        assert args.combine_margin == DEFAULT_MARGIN_DB

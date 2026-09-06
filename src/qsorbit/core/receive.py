@@ -99,6 +99,7 @@ from typing import Final, Protocol
 
 import numpy as np
 
+from qsorbit.core.combiner import BranchSelector, SelectorStats
 from qsorbit.core.dsp.audio import AudioOutput, AudioStats
 from qsorbit.core.dsp.demod import NbfmConfig, demodulate_nbfm
 from qsorbit.core.dsp.iq import unpack_uint8_iq
@@ -123,6 +124,14 @@ WATERFALL_SUBSCRIBER: Final = "waterfall"
 #: headless and windowed runs feed the tracker at the same rate and their
 #: measurements stay comparable.
 DEFAULT_TRACKING_INTERVAL_S: Final = 1.0
+
+#: How long a branch may go without producing a block before the
+#: combiner stops treating its last measurement as usable. At 2.048 Msps
+#: a block is about 64 ms, so two seconds is roughly thirty blocks --
+#: long enough that an ordinary hiccup does not drop a branch out of
+#: contention, short enough that a radio which has actually stopped
+#: cannot hold the speaker for a meaningful part of a pass.
+DEFAULT_STALE_AFTER_S: Final = 2.0
 
 #: How long :meth:`ReceiveSession.stop` waits for each of its threads.
 #: The demodulating thread checks for the stop signal between blocks, so
@@ -263,6 +272,10 @@ class ReceiveStats:
         audio: Playback, including underruns. Session-level because
             there is one speaker.
         spectrum: Present only if a waterfall was being fed.
+        combiner: Present only if a combiner was running. ``None`` means
+            the branch was fixed for the whole run -- which is a
+            different fact from "the combiner never switched", and the
+            report says which.
         stopped_cleanly: Whether every thread this module started exited
             within its join timeout.
     """
@@ -271,6 +284,7 @@ class ReceiveStats:
     range_rate_updates: int
     audio: AudioStats
     spectrum: SpectrumStreamStats | None
+    combiner: SelectorStats | None
     stopped_cleanly: bool
 
     @property
@@ -305,12 +319,18 @@ class ReceiveStats:
         branches = "".join(
             f"\n--- {branch.label} ---\n{branch.describe()}\n" for branch in self.branches
         )
+        combiner = (
+            self.combiner.describe()
+            if self.combiner is not None
+            else "combiner: off, so one branch held the speaker for the whole run."
+        )
         return (
             f"{clean}"
             f"receive: {len(self.branches)} branch(es), "
             f"{self.range_rate_updates:,} range-rate update(s)\n"
             f"{branches}"
             f"\n--- audio ---\n{self.audio.describe()}\n"
+            f"\n--- combiner ---\n{combiner}\n"
             f"\n--- spectrum ---\n{spectrum}"
         )
 
@@ -408,6 +428,10 @@ class Branch:
 
         self._lock = threading.Lock()
         self._blocks_demodulated = 0
+        # Monotonic, not wall clock: this is only ever used for an
+        # elapsed comparison, and monotonic cannot be moved by an NTP
+        # step in the middle of a pass.
+        self._last_block_at: float | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -447,6 +471,31 @@ class Branch:
         if self._squelch is None:
             return None
         return self._squelch.stats.last_quieting_db
+
+    def fresh_quieting_db(self, *, now: float, stale_after_s: float) -> float | None:
+        """This branch's quieting, or ``None`` if it has stopped producing.
+
+        Args:
+            now: A ``time.monotonic()`` reading.
+            stale_after_s: How long without a block counts as stopped.
+
+        Returns:
+            The most recent measurement, or ``None``.
+
+        **The staleness check is the point of this method existing at
+        all.** A branch whose radio has died keeps reporting its last
+        measurement forever, and by value alone a stale reading is
+        indistinguishable from a live one — so a combiner reading
+        :attr:`live_quieting_db` directly could hold the speaker on a
+        dead radio for the rest of a pass, with a plausible number on
+        the meter the whole time. ``None`` here is what lets the
+        selector move the ear away instead.
+        """
+        with self._lock:
+            last = self._last_block_at
+        if last is None or (now - last) > stale_after_s:
+            return None
+        return self.live_quieting_db
 
     @property
     def live_squelch_open(self) -> bool | None:
@@ -539,6 +588,7 @@ class Branch:
         )
         with self._lock:
             self._blocks_demodulated += 1
+            self._last_block_at = time.monotonic()
         if self._log is not None and self._squelch is not None:
             quieting_db = self._squelch.stats.last_quieting_db
             if quieting_db is not None:
@@ -586,7 +636,17 @@ class ReceiveSession:
             comes from the TLE and the observer's location, so it is a
             property of the pass and not of any radio.
         listening: Index of the branch whose audio reaches the speaker.
-            Defaults to the first. See :meth:`listen_to`.
+            Defaults to the first. See :meth:`listen_to`. With a
+            ``selector`` this is only the starting choice.
+        selector: Optional
+            :class:`~qsorbit.core.combiner.BranchSelector`. When given,
+            the branch holding the speaker is chosen after every
+            demodulated block instead of being fixed. ``None`` — the
+            default — leaves ``listening`` in force for the whole run,
+            which is what makes a single-branch control run possible.
+        stale_after_s: How long a branch may go without producing a
+            block before the selector stops trusting its last reading.
+            Ignored without a ``selector``.
         tracking_interval_s: Seconds between range-rate samples.
         join_timeout_s: How long :meth:`stop` waits per thread.
 
@@ -603,6 +663,8 @@ class ReceiveSession:
         audio: AudioOutput,
         range_rate: RangeRateSource,
         listening: int = 0,
+        selector: BranchSelector | None = None,
+        stale_after_s: float = DEFAULT_STALE_AFTER_S,
         tracking_interval_s: float = DEFAULT_TRACKING_INTERVAL_S,
         join_timeout_s: float = DEFAULT_JOIN_TIMEOUT_S,
         sleep: Callable[[float], None] = time.sleep,
@@ -629,6 +691,14 @@ class ReceiveSession:
         self._listening = self._branches[listening]
         for branch in self._branches:
             branch.listened = branch is self._listening
+        self._selector = selector
+        self._stale_after_s = stale_after_s
+        self._by_label = {branch.label: branch for branch in self._branches}
+        # Guards the read-decide-switch sequence, which every
+        # demodulating thread runs. Without it two threads can read the
+        # same readings and both act on them, producing two switches
+        # where the decision was one.
+        self._select_lock = threading.Lock()
 
         self._stop = threading.Event()
         self._demod_threads: list[threading.Thread] = []
@@ -682,6 +752,38 @@ class ReceiveSession:
         for candidate in self._branches:
             candidate.listened = candidate is branch
         self._listening = branch
+
+    @property
+    def selector(self) -> BranchSelector | None:
+        """The combiner, or ``None`` if this run has a fixed branch."""
+        return self._selector
+
+    def _reselect(self) -> None:
+        """Let the combiner move the speaker, if there is one.
+
+        Called from every demodulating thread after that thread's branch
+        has demodulated, so decisions happen at about twice the block
+        rate on a two-branch station.
+
+        **The readings one thread sees may be one block stale on the
+        other branch** -- roughly 64 ms at 2.048 Msps. That is an
+        accepted approximation rather than an oversight: the measured
+        difference between branches wanders with a lag-1 autocorrelation
+        around 0.5, so a neighbouring block's reading is close to the
+        current one, and the margin it is being compared against is
+        several times the whole measurement's standard deviation.
+        """
+        if self._selector is None:
+            return
+        with self._select_lock:
+            now = time.monotonic()
+            readings = {
+                branch.label: branch.fresh_quieting_db(now=now, stale_after_s=self._stale_after_s)
+                for branch in self._branches
+            }
+            chosen = self._selector.choose(self._listening.label, readings)
+            if chosen != self._listening.label:
+                self.listen_to(self._by_label[chosen])
 
     @property
     def is_running(self) -> bool:
@@ -959,6 +1061,10 @@ class ReceiveSession:
                 if self._stop.is_set():
                     break
                 audio = branch.demodulate(block)
+                # Decided BEFORE the listened check, so a switch takes
+                # effect on the very block that justified it rather than
+                # the next one.
+                self._reselect()
                 # Read per block rather than captured once, so a live
                 # switch takes effect within one block.
                 if branch.listened:
@@ -1010,5 +1116,6 @@ class ReceiveSession:
             range_rate_updates=updates,
             audio=audio_stats,
             spectrum=spectrum.stats if spectrum is not None else None,
+            combiner=self._selector.stats if self._selector is not None else None,
             stopped_cleanly=self._stopped_cleanly,
         )
