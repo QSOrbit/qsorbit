@@ -185,6 +185,108 @@ def test_the_radio_tab_shows_every_value_in_full(themes):
     assert clipped_labels(tab) == []
 
 
+class FakeBranch:
+    """One branch, with the widest strings a real one produces.
+
+    ``label`` is deliberately long: branch labels come from station
+    config, they name antennas, and the convention this station settled
+    on ("A - Left Arrow") is longer than the placeholder text the card
+    used to hold. A short label here would flatter the column.
+    """
+
+    live_quieting_db: float | None = -6.2
+    live_squelch_open: bool | None = True
+
+    def __init__(self, label: str, listened: bool = False) -> None:
+        self.label = label
+        self.listened = listened
+
+
+def test_the_radio_tab_fits_two_branch_meters(themes):
+    """Two meters in the column that was sized for one.
+
+    **The check this file exists for, aimed at the thing predicted in
+    advance.** ``quieting_widget``'s own docstring records the panel
+    rendering as ``"Quieting: -6.2 dB quietin"`` in the shell's 300 px
+    column, and says in as many words that *"a second instance in a
+    narrow Custom-tab cell is exactly what PR3 will do to it"*. This is
+    that second instance, in the Radio tab rather than the Custom tab,
+    and now with a "heard" marker sharing the row.
+    """
+    hub = FeedHub(
+        radio=FakeRadio(),
+        branches=[FakeBranch("A - Left Arrow", listened=True), FakeBranch("B - Right Arrow")],
+    )
+    tab = RadioTab(hub, themes=themes, nominal_hz=435_600_000.0)
+    realise(tab)
+    assert clipped_labels(tab) == []
+
+
+def test_the_radio_tab_names_each_branch(themes):
+    """A meter nobody can identify is not a per-branch meter.
+
+    The whole point of two panels is telling them apart, so the labels
+    from station config have to reach the screen -- not just the
+    numbers.
+    """
+    hub = FeedHub(
+        radio=FakeRadio(),
+        branches=[FakeBranch("A - Left Arrow", listened=True), FakeBranch("B - Right Arrow")],
+    )
+    tab = RadioTab(hub, themes=themes, nominal_hz=435_600_000.0)
+    realise(tab)
+
+    shown = {label.text() for label in tab.findChildren(QLabel)}
+    assert "A - Left Arrow" in shown
+    assert "B - Right Arrow" in shown
+
+
+def test_two_branches_supersede_the_session_wide_quieting_card(themes):
+    """Three cards where two say everything.
+
+    Found by looking at the built shell rather than by a test: the
+    "Quieting / squelch" card read identically to the branch being
+    heard, because the session's levels ARE the listening branch's. A
+    duplicate is bad enough; one that silently changes which branch it
+    duplicates whenever the combiner switches is worse.
+    """
+    hub = FeedHub(
+        radio=FakeRadio(),
+        branches=[FakeBranch("A - Left Arrow", listened=True), FakeBranch("B - Right Arrow")],
+    )
+    tab = RadioTab(hub, themes=themes, nominal_hz=435_600_000.0)
+    realise(tab)
+
+    shown = {label.text() for label in tab.findChildren(QLabel)}
+    assert "Quieting / squelch" not in shown
+    assert "A - Left Arrow" in shown
+
+
+def test_one_branch_keeps_the_session_wide_quieting_card(themes):
+    """And the station that had one meter before this existed still has it."""
+    hub = FeedHub(radio=FakeRadio(), branches=[FakeBranch("A - Left Arrow", listened=True)])
+    tab = RadioTab(hub, themes=themes, nominal_hz=435_600_000.0)
+    realise(tab)
+
+    shown = {label.text() for label in tab.findChildren(QLabel)}
+    assert "Quieting / squelch" in shown
+
+
+def test_a_single_branch_station_keeps_the_placeholder(themes):
+    """One meter titled with an antenna name says nothing the plain card did not.
+
+    And a "Branches" card showing a single branch would imply a
+    comparison that is not being made.
+    """
+    hub = FeedHub(radio=FakeRadio(), branches=[FakeBranch("A - Left Arrow", listened=True)])
+    tab = RadioTab(hub, themes=themes, nominal_hz=435_600_000.0)
+    realise(tab)
+
+    shown = {label.text() for label in tab.findChildren(QLabel)}
+    assert "Branches" in shown
+    assert "A - Left Arrow" not in shown
+
+
 def test_the_custom_tab_shows_every_value_in_full(themes, ticked_loop):
     """The same defect class, one PR later, in cells nobody sized by hand.
 

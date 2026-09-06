@@ -74,6 +74,22 @@ class QuietingSource(Protocol):
         ...
 
 
+def _listening_state(source: object) -> bool | None:
+    """Whether ``source`` is a branch holding the speaker, or ``None``.
+
+    Read with :func:`getattr` rather than by widening
+    :class:`QuietingSource`, and the reason is the widget rule. A
+    session-wide feed has no ear to hold -- it *is* the ear -- so
+    requiring the attribute would force every source to answer a
+    question only some of them have. ``None`` is "no choice is being
+    made here", which is the honest answer for a single-branch station
+    and what stops the only panel on screen being labelled as the
+    chosen one.
+    """
+    listening = getattr(source, "is_listening", None)
+    return listening if isinstance(listening, bool) else None
+
+
 class QuietingWidget(QWidget):
     """A live "how quiet is the channel" readout: a number and a bar.
 
@@ -130,10 +146,18 @@ class QuietingWidget(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         self._gate_label = QLabel("-")
         self._gate_label.setProperty("role", "dim")
+        # Between the gate state and the figure, so it reads as a
+        # property of this panel rather than of the number. Empty on a
+        # single-branch station, where it takes no space at all -- the
+        # layout below it is unchanged for every station that had one
+        # meter before this existed.
+        self._ear_label = QLabel("")
+        self._ear_label.setProperty("role", "dim")
         self._value_label = QLabel("-")
         self._value_label.setProperty("role", "value")
         row.addWidget(self._gate_label)
         row.addStretch(1)
+        row.addWidget(self._ear_label)
         row.addWidget(self._value_label)
         layout.addLayout(row)
 
@@ -147,7 +171,15 @@ class QuietingWidget(QWidget):
         self._timer.stop()
 
     def _on_timer(self) -> None:
-        text = quieting_text(self._source.live_quieting_db, self._source.live_squelch_open)
+        text = quieting_text(
+            self._source.live_quieting_db,
+            self._source.live_squelch_open,
+            # Read every poll, not captured at construction: with a
+            # combiner running the ear moves mid-pass, and a marker
+            # fixed at build time would be wrong for most of the run.
+            listening=_listening_state(self._source),
+        )
         self._value_label.setText(text.quieting_label)
         self._gate_label.setText(text.gate_label)
+        self._ear_label.setText(text.ear_label)
         self._bar.setValue(round(text.bar_fraction * _BAR_STEPS))

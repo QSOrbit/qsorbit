@@ -2438,7 +2438,7 @@ class TestWindowTitle:
 
     def test_one_branch_is_not_labelled(self, tmp_path, tle_path):
         # A label would be noise on a station with one dongle.
-        session = SimpleNamespace(branches=(object(),), listening=None)
+        session = SimpleNamespace(branches=(object(),), listening=None, selector=None)
 
         title = _window_title(SimpleNamespace(name="AO-91"), session)
 
@@ -2451,6 +2451,7 @@ class TestWindowTitle:
         session = SimpleNamespace(
             branches=(object(), object()),
             listening=SimpleNamespace(label="B - Arrow H"),
+            selector=None,
         )
 
         title = _window_title(SimpleNamespace(name="AO-91"), session)
@@ -2589,3 +2590,47 @@ class TestCombinerFlags:
 
         assert args.combine is True
         assert args.combine_margin == DEFAULT_MARGIN_DB
+
+
+class TestWindowTitleWithACombiner:
+    """A title is written once; the ear is not."""
+
+    class FakeBranch:
+        def __init__(self, label):
+            self.label = label
+
+    def a_session(self, *labels, selector=None, listening=0):
+        branches = tuple(self.FakeBranch(label) for label in labels)
+        return SimpleNamespace(
+            branches=branches,
+            listening=branches[listening],
+            selector=selector,
+        )
+
+    def test_a_fixed_branch_is_still_named(self):
+        # --listen has no other visible effect: both branches tune to
+        # the same downlink, so their waterfalls are identical.
+        session = self.a_session("A - Left Arrow", "B - Right Arrow", listening=1)
+
+        assert _window_title(SimpleNamespace(name="AO-91"), session) == (
+            "QSOrbit - receiving AO-91 on B - Right Arrow"
+        )
+
+    def test_a_combining_run_names_no_branch(self):
+        # The defect: the title was evaluated once, the combiner moved
+        # the ear inside a second, and the window went on asserting the
+        # starting branch for the rest of the run. A confidently wrong
+        # antenna is worse than the silence it replaced.
+        session = self.a_session("A", "B", selector=object())
+
+        assert _window_title(SimpleNamespace(name="AO-91"), session) == (
+            "QSOrbit - receiving AO-91 (combining)"
+        )
+
+    def test_one_branch_is_never_named_combiner_or_not(self):
+        for selector in (None, object()):
+            session = self.a_session("A", selector=selector)
+
+            assert _window_title(SimpleNamespace(name="AO-91"), session) == (
+                "QSOrbit - receiving AO-91"
+            )

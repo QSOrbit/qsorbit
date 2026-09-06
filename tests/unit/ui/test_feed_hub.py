@@ -16,7 +16,13 @@ import pytest
 from qsorbit.core.dsp.iq import IQ_ZERO_OFFSET
 from qsorbit.core.dsp.spectrum import SpectrumConfig
 from qsorbit.core.dsp.spectrum_stream import SpectrumStream
-from qsorbit.ui.feed_hub import FeedHub, QuietingFeed, RotorFeed, TrackedFrequencyFeed
+from qsorbit.ui.feed_hub import (
+    BranchFeed,
+    FeedHub,
+    QuietingFeed,
+    RotorFeed,
+    TrackedFrequencyFeed,
+)
 
 FFT_SIZE = 64
 SAMPLE_RATE = 64_000.0
@@ -296,3 +302,78 @@ def test_describe_names_what_is_attached_and_what_is_not():
     assert "spectrum yes" in full
     assert "radio yes" in full
     assert "rotor yes" in full
+
+
+class FakeBranch:
+    """One branch, as a display sees it. Satisfies BranchSource."""
+
+    def __init__(self, label, quieting=None, is_open=None, listened=False):
+        self.label = label
+        self.listened = listened
+        self.live_quieting_db = quieting
+        self.live_squelch_open = is_open
+
+
+class TestBranchFeed:
+    def test_it_forwards_the_levels(self):
+        feed = BranchFeed(FakeBranch("A", quieting=12.5, is_open=True))
+
+        assert feed.live_quieting_db == 12.5
+        assert feed.live_squelch_open is True
+
+    def test_it_carries_the_label(self):
+        assert BranchFeed(FakeBranch("A - Left Arrow")).label == "A - Left Arrow"
+
+    def test_the_ear_is_read_live_not_captured(self):
+        # With a combiner running it moves mid-pass, which is the whole
+        # reason a per-branch display is worth having. A marker fixed at
+        # construction would be wrong for most of a run.
+        branch = FakeBranch("A", listened=False)
+        feed = BranchFeed(branch)
+        assert feed.is_listening is False
+
+        branch.listened = True
+
+        assert feed.is_listening is True
+
+    def test_it_exposes_nothing_beyond_the_four(self):
+        # A wrapper rather than the branch itself, same reasoning
+        # QuietingFeed gives: a panel that draws one bar must not also
+        # be able to demodulate or start anything.
+        feed = BranchFeed(FakeBranch("A"))
+
+        assert not hasattr(feed, "demodulate")
+        assert not hasattr(feed, "start")
+        assert not hasattr(feed, "stop_reading")
+
+
+class TestHubBranches:
+    def test_no_branches_by_default(self):
+        # A rotor-only evening, or a shell with nothing attached.
+        assert FeedHub().branches == ()
+
+    def test_one_feed_per_branch_in_declaration_order(self):
+        hub = FeedHub(branches=[FakeBranch("A"), FakeBranch("B")])
+
+        assert [feed.label for feed in hub.branches] == ["A", "B"]
+
+    def test_the_same_feeds_come_back_every_call(self):
+        # A level, not a stream: there is nothing to divide, so two
+        # callers get the same feed rather than two subscriptions.
+        hub = FeedHub(branches=[FakeBranch("A")])
+
+        assert hub.branches is hub.branches
+
+    def test_branches_are_independent_of_the_session_wide_feed(self):
+        # `radio` publishes the LISTENING branch's levels; a per-branch
+        # display needs the ones nobody is hearing, which is where a
+        # fade shows up before the combiner acts on it.
+        hub = FeedHub(radio=FakeRadio(), branches=[FakeBranch("A"), FakeBranch("B")])
+
+        assert hub.quieting is not None
+        assert len(hub.branches) == 2
+
+    def test_a_single_branch_is_still_reported(self):
+        # The hub reports what exists; whether one meter is worth
+        # drawing is the tab's decision, not this one's.
+        assert len(FeedHub(branches=[FakeBranch("A")]).branches) == 1

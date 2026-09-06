@@ -386,6 +386,15 @@ ppm = 0
 # meters are titled with, and the antenna is what you are deciding
 # about when you read one.
 #
+# Name it something that cannot mean two things. An Arrow II carries
+# its 2m and 70cm elements at right angles on one boom, so an antenna
+# mounted "vertical" on 70cm is HORIZONTAL on 2m — a label like
+# "Arrow V" is therefore true on one band and false on the other, and
+# you will read it mid-pass on whichever band you are not thinking
+# about. Naming the physical antenna instead ("Left Arrow") cannot
+# invert, and the meters tell you which one is hearing better anyway,
+# which is what you actually wanted the label for.
+#
 # 'ppm' is optional per branch and overrides [sdr] ppm above. Two
 # dongles have two oscillators, so once you have measured them and they
 # differ, this is where the difference goes.
@@ -401,12 +410,12 @@ ppm = 0
 #
 #[[sdr.branch]]
 #serial = "LEFT"
-#label = "A - Arrow V"
+#label = "A - Left Arrow"
 #ppm = 0
 #
 #[[sdr.branch]]
 #serial = "RIGHT"
-#label = "B - Arrow H"
+#label = "B - Right Arrow"
 #ppm = 0
 
 

@@ -794,11 +794,29 @@ class ReceiveSession:
     def spectrum(self) -> SpectrumStream | None:
         """The spectrum stream, for a widget that needs to be handed one.
 
-        The listening branch's, because the waterfall shows what you are
-        hearing. A branch nobody is listening to is given no spectrum
-        factory at all, so there is nothing else this could return.
+        **Whichever branch holds one, not the branch being heard.** Those
+        were the same thing until a combiner could move the ear, and
+        reading it off the listening branch is a defect this found the
+        hard way: with `--combine` the ear left the branch that had the
+        spectrum, so this returned ``None`` and the end-of-run report
+        said "no waterfall was attached this run" while a waterfall was
+        visibly running -- contradicted, in the same report, by that
+        branch's own ``consumer waterfall`` line.
+
+        A subscription belongs to one branch's stream and cannot be
+        moved, so **the waterfall is fixed at construction and does not
+        follow the ear.** That is a real limitation rather than a
+        choice: with the combiner running you may be watching one
+        antenna's spectrum while hearing the other's audio. Saying so
+        here is the cheapest honest option; making the display follow
+        the ear would mean a second spectrum worker on every branch,
+        computing frames nobody sees for whichever branch is currently
+        silent.
         """
-        return self._listening.spectrum
+        for branch in self._branches:
+            if branch.spectrum is not None:
+                return branch.spectrum
+        return None
 
     def tracking_error(self) -> BaseException | None:
         """What killed the range-rate thread, if anything killed it.
@@ -1110,7 +1128,7 @@ class ReceiveSession:
         """Assemble a snapshot from each owner's own accounting."""
         with self._lock:
             updates = self._range_rate_updates
-        spectrum = self._listening.spectrum
+        spectrum = self.spectrum
         return ReceiveStats(
             branches=tuple(branch.stats for branch in self._branches),
             range_rate_updates=updates,

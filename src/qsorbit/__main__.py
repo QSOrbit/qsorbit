@@ -1970,18 +1970,32 @@ def _run_receive(
 
 
 def _window_title(satellite: Satellite, session: ReceiveSession) -> str:
-    """The window's title, naming the branch being heard when there is a choice.
+    """The window's title, naming the branch being heard when it is fixed.
 
-    Silent on a single-branch station, where a label would be noise.
-    Named as soon as there are two, because otherwise ``--listen`` has
-    no visible effect at all: both branches are tuned to the same
-    downlink, so the waterfall of one is pixel-for-pixel the waterfall
-    of the other and nothing on screen could tell an operator which
-    radio they are watching. "Off" and "broken" must never look the
-    same, and neither must "A" and "B".
+    Three cases, and the third was a defect before it was a case.
+
+    One branch: no label, because there is no choice to report and
+    naming the only antenna would imply one.
+
+    Two branches with ``--listen``: named, because otherwise the flag
+    has no visible effect at all -- both branches are tuned to the same
+    downlink, so one's waterfall is pixel-for-pixel the other's and
+    nothing on screen could say which radio you were hearing.
+
+    **Two branches with the combiner running: not named.** A title is
+    evaluated once when the window is built, and the combiner moves the
+    ear within the first second; the first version of this function
+    named the starting branch and then went on asserting it for the rest
+    of the run, which is worse than the silence it replaced -- a wrong
+    antenna stated confidently. Making the title follow the ear was the
+    other option and is worse again: a window title that changes under
+    you while you are reading it. The per-branch meters carry the live
+    answer, and they carry it in the one place that can update.
     """
     if len(session.branches) < 2:
         return f"QSOrbit - receiving {satellite.name}"
+    if session.selector is not None:
+        return f"QSOrbit - receiving {satellite.name} (combining)"
     return f"QSOrbit - receiving {satellite.name} on {session.listening.label}"
 
 
@@ -2547,6 +2561,11 @@ def _run_shell(
         radio=session,
         tracking=loop,
         tracking_fault=ticker.fault if ticker is not None else _no_tracking_fault,
+        # Every branch, not just the one being heard. `radio=session`
+        # already publishes the listening branch's levels; a per-branch
+        # display needs the ones nobody is listening to, because those
+        # are where a fade shows up before the combiner acts on it.
+        branches=session.branches,
     )
     print(hub.describe())
     print(

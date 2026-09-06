@@ -73,6 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The Rotor tab no longer cuts its own readings off mid-word. With a rotor connected, four of the six rows were clipped by a column that had been given a fixed width - the range row read "39131 km, approaching at 0." with the rate itself missing, which is a readout dropping the number it exists to show. Columns now size to what they are actually holding.
 - The Plan tab's ground-track map is no longer squeezed to a sliver. The card showed its flat/globe toggle above a few pixels of map: the map never stated how much room it needs, and a card that sizes itself to its contents obliged by giving it almost none. It now asks for the size the design intends, and declares a floor below which a coastline stops being a coastline.
+- The end-of-run report no longer claims no waterfall was attached when one was. The spectrum belongs to whichever branch was being heard when the run started, and the report looked for it on the branch being heard *now* — so the moment the combiner switched, a running waterfall was reported as absent, contradicted in the same report by that branch's own consumer line. The waterfall is fixed at the branch that has it, and that is now stated rather than assumed: with combining on you may be watching one antenna's spectrum while hearing the other's audio.
+- The window no longer names the wrong antenna. A title is written once when the window opens, and the combiner moves the speaker within the first second — so a title naming the starting branch went on asserting it for the rest of the run. A combining run now says so instead of naming a branch; a run with a fixed branch still names it, since otherwise choosing one has no visible effect at all.
 
 ### Changed
 
@@ -194,6 +196,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Combining is **off by default**, and that is a measurement decision rather than caution: "combined beats either branch alone" is a comparison, and the control for it is the same command without the flag. `--combine-margin` tunes the threshold, and zero is accepted deliberately as the no-hysteresis control that shows why hysteresis is needed.
 - A branch whose radio stops is dropped from the running immediately, margin or not. A dead receiver keeps reporting its last measurement forever, and by value alone that is indistinguishable from a live one — so staleness is judged by how long ago a branch last produced audio, not by whether its number still looks plausible. Holding the speaker on a silent radio is the one case where refusing to switch is the failure.
 - The end-of-run report says how many times the combiner switched, at what margin, and how much of the run each branch held the speaker. "Combining was off" and "the combiner ran and never needed to switch" are different facts and the report distinguishes them.
+- The Radio tab now shows a live meter per receive branch, replacing the greyed placeholder the mockup has carried since Chunk C. Each is titled with the antenna's name from station config, and the one currently reaching the speaker is marked — so a polarisation fade is visible as it happens, on the branch nobody is listening to, before the combiner acts on it.
+- A station with one dongle keeps the placeholder rather than gaining a single meter. One panel titled with an antenna's name says nothing the existing quieting card did not, and a "Branches" card showing one branch would imply a comparison that is not being made.
+- The "heard" marker is read on every poll rather than fixed when the panel is built, because with the combiner running it moves mid-pass — which is the entire reason a per-branch display is worth having.
 
 ### Fixed
 

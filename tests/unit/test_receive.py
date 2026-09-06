@@ -1498,3 +1498,76 @@ class TestStaleBranchGuard:
         finally:
             device.finish()
             quietly_stop(session)
+
+
+class TestSpectrumSurvivesASwitch:
+    """The waterfall is fixed at construction; the ear is not.
+
+    Found at the bench: with the combiner running, the ear left the
+    branch holding the spectrum and the end-of-run report announced "no
+    waterfall was attached this run" while one was visibly running --
+    contradicted by that branch's own ``consumer waterfall`` line in the
+    same report.
+    """
+
+    def a_pair_with_a_waterfall_on_a(self):
+        devices = (
+            SteppedFakeDevice([TUNING_OFFSET_HZ] * 4),
+            SteppedFakeDevice([TUNING_OFFSET_HZ] * 4),
+        )
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        audio = RecordingAudio()
+        branches = [
+            a_branch(
+                devices[0],
+                label="A",
+                clock=BlockClock(),
+                squelch=NoiseSquelch(),
+                spectrum_factory=a_spectrum_factory(),
+            ),
+            a_branch(devices[1], label="B", clock=BlockClock(), squelch=NoiseSquelch()),
+        ]
+        session = ReceiveSession(branches=branches, audio=audio, range_rate=source)
+        return devices, session, audio
+
+    def test_the_spectrum_is_found_on_whichever_branch_holds_it(self):
+        _, session, _ = self.a_pair_with_a_waterfall_on_a()
+
+        assert session.spectrum is session.branches[0].spectrum
+        assert session.spectrum is not None
+
+    def test_it_survives_the_ear_moving_to_a_branch_without_one(self):
+        # The defect exactly: reading the spectrum off the LISTENING
+        # branch returns None the moment the combiner switches away from
+        # the branch that has it.
+        _, session, _ = self.a_pair_with_a_waterfall_on_a()
+
+        session.listen_to(session.branches[1])
+
+        assert session.listening.label == "B"
+        assert session.branches[1].spectrum is None
+        assert session.spectrum is not None
+
+    def test_the_report_still_says_a_waterfall_was_attached(self):
+        # The number that lied. "off" and "running" must not read the
+        # same, and here "running" was reading as "off".
+        _, session, _ = self.a_pair_with_a_waterfall_on_a()
+
+        session.listen_to(session.branches[1])
+
+        assert session.stats.spectrum is not None
+        assert "no waterfall was attached" not in session.stats.describe()
+
+    def test_no_spectrum_anywhere_still_reports_none(self):
+        # The guard must not turn "genuinely headless" into a false
+        # positive by finding a spectrum that does not exist.
+        devices = (SteppedFakeDevice([TUNING_OFFSET_HZ]), SteppedFakeDevice([TUNING_OFFSET_HZ]))
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        branches = [
+            a_branch(device, label=label, clock=BlockClock())
+            for device, label in zip(devices, ("A", "B"), strict=True)
+        ]
+        session = ReceiveSession(branches=branches, audio=RecordingAudio(), range_rate=source)
+
+        assert session.spectrum is None
+        assert "no waterfall was attached" in session.stats.describe()
