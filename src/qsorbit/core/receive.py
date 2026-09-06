@@ -5,25 +5,52 @@ What was missing was the wiring, and the wiring is where the interesting
 failures live, because it is the only place where the tracking side and
 the receiving side have to agree about anything.
 
-**What runs where.** Three threads, and the division is not arbitrary:
+**A branch is one radio's whole chain.** :class:`Branch` owns a device's
+stream, its Doppler tracker, its demodulator settings and its squelch;
+:class:`ReceiveSession` owns a list of them, one speaker, and one
+range-rate source. A single-device station is **one branch, not a
+branchless special case** — two code paths would drift, and the one
+exercised least would be the one every existing station uses.
+
+Three things are per-branch and none of them look like it at first.
+The **Doppler tracker**, because it is built against the centre
+frequency *that* tuner actually reached, and two PLLs quantise a request
+differently — the same predicted curve, two different corrections. The
+**squelch**, because it is stateful, and one shared between two radios
+would mix two signals' histories into one decision. And the **spectrum**,
+because the waterfall shows what you are hearing.
+
+**What runs where.** Two threads per branch plus one for the session,
+and the division is not arbitrary:
 
 ``IqStream``'s reader
-    Owned by :mod:`qsorbit.core.sdr.stream`. Reads the device and fans
-    each block out to every subscription. Nothing here touches it.
+    One per branch, owned by :mod:`qsorbit.core.sdr.stream`. Reads that
+    branch's device and fans each block out to its subscriptions.
+    Nothing here touches it.
 
-the demodulating thread
+a demodulating thread per branch
     Owned by this module. Pulls :class:`~qsorbit.core.sdr.stream.TimedBlock`
-    from the ``"audio"`` subscription, asks the Doppler tracker where the
-    downlink is *at that block's midpoint*, demodulates, and writes the
-    audio out. This is the closest thing here to a real-time path, so it
-    shares a thread with nothing else — in particular not with the rotor,
-    whose serial round trips take 0.15 s of RS-485 turnaround apiece.
+    from that branch's ``"audio"`` subscription, asks its Doppler tracker
+    where the downlink is *at that block's midpoint*, demodulates, and —
+    if that branch currently holds the ear — writes the audio out. This
+    is the closest thing here to a real-time path, so it shares a thread
+    with nothing else: not with the rotor, whose serial round trips take
+    0.15 s of RS-485 turnaround apiece, and **not with the other
+    branch**, which would make each one's latency depend on the other's.
+
+    Every branch runs the full chain whether or not anyone is listening.
+    Skipping the work on a silent branch would save CPU and destroy the
+    squelch measurements a combiner selects on — and would also make the
+    cost of running two branches unmeasurable, which is the one thing a
+    first dual-device run exists to find out.
 
 the range-rate thread
     Feeds the Doppler tracker on its own cadence, from
     :class:`TargetRangeRate` -- the TLE and the observer's location,
-    which is where a range rate actually comes from. **No rotor is
-    involved and none ever was**: for a while this thread also held the
+    which is where a range rate actually comes from. One thread for the
+    whole session, feeding every branch's tracker from the same sample:
+    a range rate is a property of the pass, not of any radio. **No rotor
+    is involved and none ever was**: for a while this thread also held the
     rotor's tick, by way of a range-rate source that ticked the loop to
     get its number, and the side effect was that the rotor was commanded
     at *this* cadence rather than at the one its tracking profile
@@ -32,8 +59,8 @@ the range-rate thread
     makes "this module does not insist on owning the tracking side" true
     rather than aspirational.
 
-A ``SpectrumStream``, when one is given, gets the ``"waterfall"``
-subscription and runs its own worker as it always has.
+A ``SpectrumStream``, when one is given, gets the listening branch's
+``"waterfall"`` subscription and runs its own worker as it always has.
 
 **The rotor is optional, and that is a design statement rather than a
 convenience.** Doppler correction needs a range rate, and a range rate
@@ -44,13 +71,13 @@ could be wrong at once, a rotor fault therefore does not cost you the
 pass. It also matches ``point``'s standing asymmetry: computing is the
 default, moving is opt-in.
 
-**The tracker is primed before the reader starts.**
+**The trackers are primed before any reader starts.**
 :meth:`~qsorbit.core.dsp.tuning.DopplerTracker.offset_at` raises if it
 has never been given a range rate, and the demodulating thread can reach
 its first block before the tracking side has produced anything. Rather
 than skip those blocks and count them, :meth:`ReceiveSession.start`
-takes one sample up front. Priming deletes the race; counting would only
-have measured it.
+takes one sample up front and gives it to every branch. Priming deletes
+the race; counting would only have measured it.
 
 **Nothing here counts what something else already counts.** Stale Doppler
 queries live in :class:`~qsorbit.core.dsp.tuning.DopplerStats`, buffer
@@ -65,10 +92,12 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Final, Protocol
+
+import numpy as np
 
 from qsorbit.core.dsp.audio import AudioOutput, AudioStats
 from qsorbit.core.dsp.demod import NbfmConfig, demodulate_nbfm
@@ -76,7 +105,7 @@ from qsorbit.core.dsp.iq import unpack_uint8_iq
 from qsorbit.core.dsp.spectrum_stream import SpectrumStream, SpectrumStreamStats
 from qsorbit.core.dsp.squelch import NoiseSquelch, SquelchStats
 from qsorbit.core.dsp.tuning import DopplerStats, DopplerTracker
-from qsorbit.core.sdr.stream import IqStream, StreamStats
+from qsorbit.core.sdr.stream import IqStream, StreamStats, TimedBlock
 from qsorbit.core.tracker.observer import ObserverLocation
 from qsorbit.core.tracker.target import Target
 
@@ -170,33 +199,90 @@ class TargetRangeRate:
 
 
 @dataclass(frozen=True)
+class BranchStats:
+    """What one receive branch did, in the pieces that have owners.
+
+    Args:
+        label: The branch's name, from station config. Names the
+            antenna rather than the dongle, because that is what a
+            reader of this report is comparing.
+        listened: Whether this branch's audio reached the speaker.
+            Recorded because a branch that was measured and a branch
+            that was heard are different claims, and with no combiner
+            yet only one of them can be both.
+        blocks_demodulated: Blocks that went through
+            :func:`~qsorbit.core.dsp.demod.demodulate_nbfm`.
+        stream: The IQ side for this branch's own device, including
+            per-consumer drop accounting.
+        doppler: Correction range and stale-query count. One per
+            branch and not one per session, because a tracker is built
+            against the centre frequency *its own* tuner reached — two
+            PLLs quantise differently, and two dongles have two
+            crystals.
+        squelch: Present only if this branch had a squelch.
+    """
+
+    label: str
+    listened: bool
+    blocks_demodulated: int
+    stream: StreamStats
+    doppler: DopplerStats
+    squelch: SquelchStats | None
+
+    def describe(self) -> str:
+        """Summarise this branch, one owner per section."""
+        ear = " (heard)" if self.listened else ""
+        squelch = (
+            self.squelch.describe()
+            if self.squelch is not None
+            else "squelch: off, so no quieting was measured this run."
+        )
+        return (
+            f"branch {self.label}{ear}: {self.blocks_demodulated:,} block(s) demodulated\n"
+            f"{self.stream.describe()}"
+            f"{self.doppler.describe()}\n"
+            f"{squelch}"
+        )
+
+
+@dataclass(frozen=True)
 class ReceiveStats:
     """What one receive session did, in the pieces that have owners.
 
     Args:
-        blocks_demodulated: Blocks that went through
-            :func:`~qsorbit.core.dsp.demod.demodulate_nbfm`.
-        range_rate_updates: Samples handed to the Doppler tracker,
-            including the priming one.
-        stream: The IQ side, including per-consumer drop accounting.
-        audio: Playback, including underruns.
-        doppler: Correction range and how many queries ran on a stale
-            range rate. **This is where staleness is reported** — the
-            session does not keep its own count of it.
-        squelch: Present only if a squelch was in use.
+        branches: One entry per receive branch, in the order they were
+            declared. A single-device station has exactly one, which is
+            why there is no separate single-device shape here: two code
+            paths would drift, and the one that got exercised less
+            would be the one every existing station uses.
+        range_rate_updates: Samples handed to the Doppler trackers,
+            including the priming one. Session-level because there is
+            one predicted curve and one range-rate thread however many
+            branches consume it.
+        audio: Playback, including underruns. Session-level because
+            there is one speaker.
         spectrum: Present only if a waterfall was being fed.
-        stopped_cleanly: Whether both of this module's threads exited
-            within their join timeout.
+        stopped_cleanly: Whether every thread this module started exited
+            within its join timeout.
     """
 
-    blocks_demodulated: int
+    branches: tuple[BranchStats, ...]
     range_rate_updates: int
-    stream: StreamStats
     audio: AudioStats
-    doppler: DopplerStats
-    squelch: SquelchStats | None
     spectrum: SpectrumStreamStats | None
     stopped_cleanly: bool
+
+    @property
+    def blocks_demodulated(self) -> int:
+        """Blocks demodulated across every branch.
+
+        A convenience over :attr:`branches`, kept because "did the
+        receive path do any work at all" is a question worth answering
+        without summing by hand. It is deliberately **not** the number
+        that reached the speaker — with two branches running, most of
+        this was demodulated and measured and never heard.
+        """
+        return sum(branch.blocks_demodulated for branch in self.branches)
 
     def describe(self) -> str:
         """Summarise the whole slice, one owner per section.
@@ -204,116 +290,96 @@ class ReceiveStats:
         Printed at the end of a bench run, so this *is* the measurement
         record. Sections that were not in use say so rather than being
         omitted: a missing line reads as zero, and "the squelch was off"
-        and "the squelch never opened" are different facts.
+        and "the squelch never opened" are different facts. With more
+        than one branch each gets its own section, because a combined
+        number would hide exactly the per-branch difference a dual-SDR
+        run exists to measure.
         """
         clean = "" if self.stopped_cleanly else "receive: threads DID NOT stop cleanly\n"
-        squelch = (
-            self.squelch.describe()
-            if self.squelch is not None
-            else "squelch: off, so no quieting was measured this run."
-        )
         spectrum = (
             self.spectrum.describe()
             if self.spectrum is not None
             else "spectrum: no waterfall was attached this run.\n"
         )
+        branches = "".join(
+            f"\n--- {branch.label} ---\n{branch.describe()}\n" for branch in self.branches
+        )
         return (
             f"{clean}"
-            f"receive: {self.blocks_demodulated:,} block(s) demodulated, "
+            f"receive: {len(self.branches)} branch(es), "
             f"{self.range_rate_updates:,} range-rate update(s)\n"
-            f"\n--- iq ---\n{self.stream.describe()}"
+            f"{branches}"
             f"\n--- audio ---\n{self.audio.describe()}\n"
-            f"\n--- doppler ---\n{self.doppler.describe()}\n"
-            f"\n--- squelch ---\n{squelch}\n"
             f"\n--- spectrum ---\n{spectrum}"
         )
 
 
-class ReceiveSession:
-    """Runs the tracking side and the receive chain together.
+class Branch:
+    """One complete receive chain: a device, a demodulator, and a name.
 
-    Usage::
+    A branch is what :class:`ReceiveSession` is a list of. It owns
+    everything that is *per-radio* — the stream, the Doppler tracker
+    built against that tuner's own centre frequency, the demodulator
+    settings, and the squelch, which is stateful and cannot be shared.
+    It deliberately owns no thread: threads, the stop signal, and error
+    recording stay with the session, so that :meth:`demodulate` is a
+    plain function of one block and can be tested without starting
+    anything.
 
-        session = ReceiveSession(
-            stream=IqStream(sdr),
-            nbfm=nbfm_config,
-            doppler=DopplerTracker(downlink_hz, applied.center_hz),
-            audio=AudioOutput(nbfm_config.audio_rate_hz),
-            range_rate=TargetRangeRate(satellite, observer),
-        )
-        with session:
-            time.sleep(300)
-        print(session.stats.describe())
+    **A single-device station is one branch, not a special case.** The
+    alternative — a branch-free path alongside a branched one — would
+    leave the route every existing station takes as the one exercised
+    least.
 
     Args:
-        stream: An :class:`~qsorbit.core.sdr.stream.IqStream` over a
-            configured device. **Must not have been started or
-            subscribed to** — this session subscribes once or
-            twice, and subscriptions have to exist before the reader
-            does. The spectrum consumer is subscribed only when a
-            ``spectrum_factory`` is given, so a headless run never offers
-            blocks to a consumer that will not drain them.
+        label: What to call this branch in reports and on screen. From
+            station config, where it names the antenna.
+        stream: An :class:`~qsorbit.core.sdr.stream.IqStream` over this
+            branch's configured device. **Must not have been started or
+            subscribed to** — the subscription is made here, and
+            subscriptions have to exist before the reader does.
         nbfm: Demodulation settings. ``channel_offset_hz`` is replaced
             per block with the Doppler-corrected offset, so whatever it
             holds here is ignored; everything else is used as given.
-        doppler: The tracker, built against the centre frequency the
-            tuner **actually reached**.
-        audio: Where the recovered audio goes.
-        range_rate: Where range-rate samples come from. See
-            :class:`RangeRateSource`.
-        squelch: Optional noise gate, off by default — see
-            :mod:`qsorbit.core.dsp.squelch` for why a mute enabled by
-            default is a liability. One per session; it is stateful.
-            Passing one always turns on *measurement*, whether or not
-            ``mute_squelch`` also turns on muting - see that argument.
-        mute_squelch: Whether a closed gate actually silences audio.
-            Ignored when ``squelch`` is ``None``. Defaults to ``True``,
-            matching this class's behaviour before this parameter
-            existed. ``False`` measures and reports quieting exactly as
-            if muting were on (:attr:`live_quieting_db`, and
-            :class:`~qsorbit.core.dsp.squelch.SquelchStats` in the final
-            report), without ever letting the gate's decision reach the
-            speaker - see :func:`~qsorbit.core.dsp.demod.demodulate_nbfm`
-            for the mechanics this threads through to.
-        spectrum: Optional. When given it is started with the
-            ``"waterfall"`` subscription and stopped with the session.
-        tracking_interval_s: Seconds between range-rate samples.
-        join_timeout_s: How long :meth:`stop` waits per thread.
-
-    Raises:
-        ValueError: If ``tracking_interval_s`` is not positive.
+        doppler: This branch's tracker, built against the centre
+            frequency **its own** tuner actually reached.
+        squelch: Optional noise gate for this branch, off by default.
+            One per branch: it is stateful, and sharing one between two
+            radios would mix two signals' histories into one decision.
+        mute_squelch: Whether a closed gate actually silences this
+            branch's audio. Ignored when ``squelch`` is ``None``.
+        spectrum_factory: Optional. When given, this branch also takes
+            the ``"waterfall"`` subscription and drives a spectrum
+            stream. Only the branch being listened to is given one, so
+            a branch nobody is watching never pays for frames nobody
+            sees — the same reasoning that made the subscription
+            conditional in the first place.
+        listened: Whether this branch's audio reaches the speaker.
+            Mutable, and set through :meth:`ReceiveSession.listen_to`
+            rather than directly, because exactly one branch may hold
+            it at a time.
     """
 
     def __init__(
         self,
         *,
+        label: str,
         stream: IqStream,
         nbfm: NbfmConfig,
         doppler: DopplerTracker,
-        audio: AudioOutput,
-        range_rate: RangeRateSource,
         squelch: NoiseSquelch | None = None,
         mute_squelch: bool = True,
         spectrum_factory: Callable[[Iterable[bytes]], SpectrumStream] | None = None,
-        tracking_interval_s: float = DEFAULT_TRACKING_INTERVAL_S,
-        join_timeout_s: float = DEFAULT_JOIN_TIMEOUT_S,
-        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        if tracking_interval_s <= 0.0:
-            raise ValueError(f"tracking_interval_s must be positive, got {tracking_interval_s!r}.")
-
+        self.label = label
+        self.listened = False
         self._stream = stream
         self._nbfm = nbfm
         self._doppler = doppler
-        self._audio = audio
-        self._range_rate = range_rate
         self._squelch = squelch
         self._mute_squelch = mute_squelch
-        self._tracking_interval_s = tracking_interval_s
-        self._join_timeout_s = join_timeout_s
-        self._sleep = sleep
 
-        # Subscribed here rather than in start(), because subscriptions
+        # Subscribed here rather than at start(), because subscriptions
         # must exist before the reader thread does and a caller is
         # entitled to hold the waterfall subscription before starting.
         self._audio_blocks = stream.subscribe(AUDIO_SUBSCRIBER)
@@ -332,74 +398,69 @@ class ReceiveSession:
             self._waterfall_blocks = stream.subscribe(WATERFALL_SUBSCRIBER)
             self._spectrum = spectrum_factory(self._waterfall_blocks.blocks())
 
-        self._stop = threading.Event()
-        self._demod_thread: threading.Thread | None = None
-        self._tracking_thread: threading.Thread | None = None
-        self._error: BaseException | None = None
-        # Kept apart from _error deliberately: see tracking_error().
-        self._tracking_error: BaseException | None = None
-        self._stopped_cleanly = True
-
         self._lock = threading.Lock()
         self._blocks_demodulated = 0
-        self._range_rate_updates = 0
 
     # ------------------------------------------------------------------
-    # Lifecycle
+    # Properties
     # ------------------------------------------------------------------
-
-    @property
-    def is_running(self) -> bool:
-        """``True`` while the demodulating thread is alive."""
-        return self._demod_thread is not None and self._demod_thread.is_alive()
 
     @property
     def spectrum(self) -> SpectrumStream | None:
-        """The spectrum stream, for a widget that needs to be handed one."""
+        """This branch's spectrum stream, or ``None`` if it has none."""
         return self._spectrum
 
-    def tracking_error(self) -> BaseException | None:
-        """Whatever stopped the range-rate thread, or ``None`` if nothing has.
+    @property
+    def doppler(self) -> DopplerTracker:
+        """This branch's Doppler tracker, for the range-rate thread to feed."""
+        return self._doppler
 
-        **This is no longer a rotor fault, and the change of meaning is
-        worth stating rather than leaving to be inferred.** While this
-        thread also held the rotor's tick, a fault here usually *was* a
-        serial fault, and a readout took it as one. The tick now belongs
-        to :class:`~qsorbit.core.tracking_thread.TrackingThread`, whose
-        own :meth:`~qsorbit.core.tracking_thread.TrackingThread.fault`
-        is what a rotor readout should ask. What is left here is the
-        Doppler side: a range-rate source that stopped producing, which
-        on the receive path means propagation rather than hardware.
+    @property
+    def stats(self) -> BranchStats:
+        """This branch's contribution to the run's report."""
+        with self._lock:
+            blocks = self._blocks_demodulated
+        return BranchStats(
+            label=self.label,
+            listened=self.listened,
+            blocks_demodulated=blocks,
+            stream=self._stream.stats,
+            doppler=self._doppler.stats,
+            squelch=self._squelch.stats if self._squelch is not None else None,
+        )
 
-        **Deliberately separate from the demodulating thread's error**,
-        which :meth:`stop` re-raises. They are different faults with
-        different consequences -- losing range rates leaves the audio
-        playing, uncorrected and drifting, which is a degradation to
-        report rather than a reason to tear the session down mid-pass.
+    @property
+    def live_quieting_db(self) -> float | None:
+        """This branch's most recent quieting measurement, or ``None``.
 
-        A method rather than a property so it can be handed to a widget
-        as a plain callable, without the caller having to wrap it.
+        See :attr:`ReceiveSession.live_quieting_db` for the polling
+        contract and why this is not guarded by a lock.
         """
-        return self._tracking_error
+        if self._squelch is None:
+            return None
+        return self._squelch.stats.last_quieting_db
+
+    @property
+    def live_squelch_open(self) -> bool | None:
+        """Whether this branch's gate is open right now, or ``None``."""
+        if self._squelch is None:
+            return None
+        return self._squelch.is_open
+
+    @property
+    def live_tracked_frequency_hz(self) -> float | None:
+        """Where this branch's downlink sits in RF right now, or ``None``."""
+        offset_hz = self._doppler.stats.last_offset_hz
+        if offset_hz is None:
+            return None
+        return self._doppler.center_hz + offset_hz
+
+    # ------------------------------------------------------------------
+    # Lifecycle and work
+    # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Prime the tracker, then start everything. Starting twice is an error.
-
-        Order matters and is the opposite of the obvious one. The tracker
-        is primed **before** any thread starts, so that by the time the
-        first block can possibly arrive there is already a range rate to
-        correct it with. Starting the reader first and priming after
-        would reintroduce exactly the race the priming exists to remove,
-        just with a smaller window.
-        """
-        if self._demod_thread is not None:
-            raise RuntimeError("This session has already been started; build a new one.")
-
-        when, range_rate_km_s = self._range_rate.prime()
-        self._doppler.update(when, range_rate_km_s)
-        self._range_rate_updates = 1
-
-        self._audio.start()
+        """Start this branch's reader and, if it has one, its spectrum."""
         # Started here rather than left to whichever consumer reaches its
         # first block first. Both would call the same start-if-needed
         # path, and starting it explicitly means the reader is running
@@ -409,23 +470,267 @@ class ReceiveSession:
         if self._spectrum is not None:
             self._spectrum.start()
 
-        self._demod_thread = threading.Thread(
-            target=self._demod_loop, name="qsorbit-receive-demod", daemon=True
+    def stop_reading(self) -> None:
+        """Stop the reader and the spectrum worker.
+
+        Separate from joining the demodulating thread, and called for
+        every branch before any thread is joined, so that no branch is
+        still being fed while another is being waited on.
+
+        Returns nothing, because neither owner forgets: an
+        :class:`~qsorbit.core.sdr.stream.IqStream` keeps reporting the
+        run's statistics after it has stopped, and so does a
+        :class:`~qsorbit.core.dsp.spectrum_stream.SpectrumStream`. A
+        cached copy here would be a second place for the same numbers to
+        live, with a second chance to disagree.
+        """
+        self._stream.stop()
+        if self._spectrum is not None:
+            self._spectrum.stop()
+
+    def timed_blocks(self) -> Iterator[TimedBlock]:
+        """This branch's audio-side blocks, as they arrive."""
+        return self._audio_blocks.timed_blocks()
+
+    def demodulate(self, block: TimedBlock) -> np.ndarray:
+        """Demodulate one block at its own Doppler-corrected offset.
+
+        Args:
+            block: One block from :meth:`timed_blocks`.
+
+        Returns:
+            Mono audio at ``nbfm.audio_rate_hz``. Returned rather than
+            written anywhere, because whether this branch is the one
+            being heard is the session's decision and not this
+            object's — and a branch nobody is listening to still has to
+            do all of this, or its squelch metrics would mean nothing.
+        """
+        # The block's MIDPOINT, not either edge: it removes a
+        # systematic half-block bias for free, and TimedBlock computes
+        # it so no caller can get the sign wrong.
+        offset_hz = self._doppler.offset_at(block.midpoint)
+        config = replace(self._nbfm, channel_offset_hz=offset_hz)
+        audio = demodulate_nbfm(
+            unpack_uint8_iq(block.data),
+            config,
+            squelch=self._squelch,
+            mute=self._mute_squelch,
         )
+        with self._lock:
+            self._blocks_demodulated += 1
+        return audio
+
+
+class ReceiveSession:
+    """Runs the tracking side and the receive chains together.
+
+    Usage::
+
+        branch = Branch(
+            label="A - Arrow V",
+            stream=IqStream(sdr),
+            nbfm=nbfm_config,
+            doppler=DopplerTracker(downlink_hz, applied.center_hz),
+        )
+        session = ReceiveSession(
+            branches=[branch],
+            audio=AudioOutput(nbfm_config.audio_rate_hz),
+            range_rate=TargetRangeRate(satellite, observer),
+        )
+        with session:
+            time.sleep(300)
+        print(session.stats.describe())
+
+    Args:
+        branches: The receive chains to run, in declaration order. One
+            for a single-device station, two for dual-SDR. Must not be
+            empty. Each gets its own demodulating thread, because the
+            demodulating path is the closest thing here to real time and
+            two branches sharing a thread would make each one's latency
+            depend on the other's.
+        audio: Where the recovered audio goes. **One per session**, not
+            one per branch, because there is one speaker — which is the
+            whole reason a branch has to be selected.
+        range_rate: Where range-rate samples come from. See
+            :class:`RangeRateSource`. One per session: a range rate
+            comes from the TLE and the observer's location, so it is a
+            property of the pass and not of any radio.
+        listening: Index of the branch whose audio reaches the speaker.
+            Defaults to the first. See :meth:`listen_to`.
+        tracking_interval_s: Seconds between range-rate samples.
+        join_timeout_s: How long :meth:`stop` waits per thread.
+
+    Raises:
+        ValueError: If ``branches`` is empty, if ``listening`` is not a
+            valid index into it, or if ``tracking_interval_s`` is not
+            positive.
+    """
+
+    def __init__(
+        self,
+        *,
+        branches: Sequence[Branch],
+        audio: AudioOutput,
+        range_rate: RangeRateSource,
+        listening: int = 0,
+        tracking_interval_s: float = DEFAULT_TRACKING_INTERVAL_S,
+        join_timeout_s: float = DEFAULT_JOIN_TIMEOUT_S,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if not branches:
+            raise ValueError(
+                "A receive session needs at least one branch. A single-device "
+                "station is one branch, not a branchless special case."
+            )
+        if not 0 <= listening < len(branches):
+            raise ValueError(
+                f"listening must index one of the {len(branches)} branch(es), got {listening!r}."
+            )
+        if tracking_interval_s <= 0.0:
+            raise ValueError(f"tracking_interval_s must be positive, got {tracking_interval_s!r}.")
+
+        self._branches = tuple(branches)
+        self._audio = audio
+        self._range_rate = range_rate
+        self._tracking_interval_s = tracking_interval_s
+        self._join_timeout_s = join_timeout_s
+        self._sleep = sleep
+
+        self._listening = self._branches[listening]
+        for branch in self._branches:
+            branch.listened = branch is self._listening
+
+        self._stop = threading.Event()
+        self._demod_threads: list[threading.Thread] = []
+        self._tracking_thread: threading.Thread | None = None
+        self._started = False
+        self._error: BaseException | None = None
+        # Kept apart from _error deliberately: see tracking_error().
+        self._tracking_error: BaseException | None = None
+        self._stopped_cleanly = True
+
+        self._lock = threading.Lock()
+        self._range_rate_updates = 0
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    @property
+    def branches(self) -> tuple[Branch, ...]:
+        """The branches this session runs, in declaration order."""
+        return self._branches
+
+    @property
+    def listening(self) -> Branch:
+        """The branch whose audio is currently reaching the speaker."""
+        return self._listening
+
+    def listen_to(self, branch: Branch) -> None:
+        """Send ``branch``'s audio to the speaker, and no other's.
+
+        Args:
+            branch: One of this session's own branches.
+
+        Raises:
+            ValueError: If ``branch`` does not belong to this session.
+
+        Exactly one branch holds the ear at a time, enforced here rather
+        than by whoever sets the flag, because two branches writing to
+        one :class:`~qsorbit.core.dsp.audio.AudioOutput` would interleave
+        two half-rate audio streams into something that sounds like a
+        fault in the radio.
+
+        Safe to call while running: the demodulating threads read the
+        flag once per block, so a switch takes effect within one block
+        without anything being torn down. Nothing calls it live yet —
+        that is the combiner's job — but the flag is the mechanism it
+        will use.
+        """
+        if branch not in self._branches:
+            raise ValueError(f"{branch.label!r} is not a branch of this session.")
+        for candidate in self._branches:
+            candidate.listened = candidate is branch
+        self._listening = branch
+
+    @property
+    def is_running(self) -> bool:
+        """``True`` while any demodulating thread is alive."""
+        return any(thread.is_alive() for thread in self._demod_threads)
+
+    @property
+    def spectrum(self) -> SpectrumStream | None:
+        """The spectrum stream, for a widget that needs to be handed one.
+
+        The listening branch's, because the waterfall shows what you are
+        hearing. A branch nobody is listening to is given no spectrum
+        factory at all, so there is nothing else this could return.
+        """
+        return self._listening.spectrum
+
+    def tracking_error(self) -> BaseException | None:
+        """What killed the range-rate thread, if anything killed it.
+
+        Kept apart from the fault :meth:`stop` re-raises, because a
+        tracking side that has stopped feeding is a *degradation* — the
+        Doppler tracker extrapolates, then holds, and says how long it
+        did so — while a demodulating fault means the radio job itself
+        has stopped. A readout that conflated them would report a rotor
+        problem as a receiver problem.
+        """
+        return self._tracking_error
+
+    def start(self) -> None:
+        """Prime the trackers, then start everything. Starting twice is an error.
+
+        Order matters and is the opposite of the obvious one. Every
+        branch's tracker is primed **before** any thread starts, so that
+        by the time the first block can possibly arrive there is already
+        a range rate to correct it with. Starting the readers first and
+        priming after would reintroduce exactly the race the priming
+        exists to remove, just with a smaller window.
+
+        One sample primes every branch. They share a predicted curve —
+        the same TLE, the same observer — and differ only in the centre
+        frequency each tuner reached, which is baked into the tracker
+        rather than into the sample.
+        """
+        if self._started:
+            raise RuntimeError("This session has already been started; build a new one.")
+        self._started = True
+
+        when, range_rate_km_s = self._range_rate.prime()
+        for branch in self._branches:
+            branch.doppler.update(when, range_rate_km_s)
+        self._range_rate_updates = 1
+
+        self._audio.start()
+        for branch in self._branches:
+            branch.start()
+
+        for branch in self._branches:
+            thread = threading.Thread(
+                target=self._demod_loop,
+                args=(branch,),
+                name=f"qsorbit-receive-demod-{branch.label}",
+                daemon=True,
+            )
+            self._demod_threads.append(thread)
         self._tracking_thread = threading.Thread(
             target=self._tracking_loop, name="qsorbit-receive-tracking", daemon=True
         )
-        self._demod_thread.start()
+        for thread in self._demod_threads:
+            thread.start()
         self._tracking_thread.start()
 
     def wait(self, timeout_s: float | None = None) -> bool:
         """Block until the demodulating thread ends, or until ``timeout_s``.
 
-        The demodulating thread ends when the blocks stop — the device
-        was unplugged, the fake source ran out, or :meth:`stop` was
-        called. So a caller that would otherwise sleep out a fixed
+        A demodulating thread ends when its branch's blocks stop — the
+        device was unplugged, the fake source ran out, or :meth:`stop`
+        was called. So a caller that would otherwise sleep out a fixed
         duration can wait on this instead and **find out promptly that
-        the radio died**, rather than sitting through the rest of a pass
+        a radio died**, rather than sitting through the rest of a pass
         with nothing arriving. Whatever it died of is then raised by
         :meth:`stop`.
 
@@ -433,18 +738,27 @@ class ReceiveSession:
             timeout_s: Seconds to wait, or ``None`` to wait indefinitely.
 
         Returns:
-            ``True`` if the thread has ended, ``False`` if the timeout
-            expired with it still running — which is the normal outcome
-            of a run that lasted its full duration.
+            ``True`` if any branch's thread has ended, ``False`` if the
+            timeout expired with all of them still running — which is
+            the normal outcome of a run that lasted its full duration.
 
         Raises:
             RuntimeError: If the session was never started.
         """
-        thread = self._demod_thread
-        if thread is None:
+        if not self._demod_threads:
             raise RuntimeError("This session has not been started, so there is nothing to wait on.")
-        thread.join(timeout_s)
-        return not thread.is_alive()
+        # Waits on the FIRST branch to finish, not the last. A branch
+        # whose blocks stop has lost its radio, and with two of them a
+        # caller wants to hear about that while the other is still
+        # running -- waiting for both would turn "one dongle fell off
+        # the bus" into a wait that only ends when the pass does.
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        for thread in self._demod_threads:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            thread.join(remaining)
+            if not thread.is_alive():
+                return True
+        return False
 
     def stop(self) -> ReceiveStats:
         """Stop everything this session started, and return the statistics.
@@ -465,18 +779,23 @@ class ReceiveSession:
             Whatever killed the demodulating thread.
         """
         self._stop.set()
-        stream_stats = self._stream.stop()
-        spectrum_stats = self._spectrum.stop() if self._spectrum is not None else None
+        # Every reader stops before any thread is joined. Stopping and
+        # joining one branch at a time would leave the other still
+        # filling its buffers while nothing drained them, and the drops
+        # that produced would be an artifact of the shutdown order
+        # rather than of anything that happened during the run.
+        for branch in self._branches:
+            branch.stop_reading()
 
         clean = True
-        for thread in (self._demod_thread, self._tracking_thread):
+        for thread in (*self._demod_threads, self._tracking_thread):
             if thread is not None:
                 thread.join(self._join_timeout_s)
                 clean = clean and not thread.is_alive()
         self._stopped_cleanly = clean
 
         audio_stats = self._audio.stop()
-        stats = self._build_stats(stream_stats, audio_stats, spectrum_stats)
+        stats = self._build_stats(audio_stats)
 
         error = self._error
         if error is not None:
@@ -486,70 +805,78 @@ class ReceiveSession:
     @property
     def stats(self) -> ReceiveStats:
         """The run's statistics. Stable once :meth:`stop` has returned."""
-        return self._build_stats(
-            self._stream.stats,
-            self._audio.stats,
-            self._spectrum.stats if self._spectrum is not None else None,
-        )
+        return self._build_stats(self._audio.stats)
 
     @property
     def live_quieting_db(self) -> float | None:
-        """The squelch's most recent quieting measurement, for a live display.
+        """The listening branch's most recent quieting measurement.
 
-        ``None`` when no squelch was given at all - there is nothing to
-        show. Otherwise this is the number a live "quieting" readout
-        polls, updating every block regardless of ``mute_squelch``: see
-        that argument's docstring for why a run with muting off still
-        has a real, moving number here.
+        ``None`` when that branch has no squelch at all - there is
+        nothing to show. Otherwise this is the number a live "quieting"
+        readout polls, updating every block regardless of
+        ``mute_squelch``: see :class:`Branch` for why a run with muting
+        off still has a real, moving number here.
+
+        **The listening branch's, not every branch's.** With two
+        branches running, one number cannot describe both, and the one
+        worth putting next to the audio is the one that made it. Each
+        branch carries its own — see :attr:`Branch.live_quieting_db` —
+        and the per-branch meters read those directly.
 
         Unlike :attr:`stats` (**not** safe to call this "live" - its own
         docstring says it is stable only once :meth:`stop` has
         returned), this property is meant to be polled *while the
         session is running*, from a different thread than the one
-        updating the squelch. It is deliberately not guarded by
-        :attr:`_lock`: the value it reads is a single float, reassigned
-        as a whole on every block by
+        updating the squelch. It is deliberately not guarded by a lock:
+        the value it reads is a single float, reassigned as a whole on
+        every block by
         :meth:`~qsorbit.core.dsp.squelch.NoiseSquelch.update`, so a
         concurrent read can only ever see the value from just before or
         just after an update, never a torn one - the CPython GIL makes a
         single attribute assignment atomic. A live gauge redrawn several
-        times a second tolerates being one block stale; :attr:`_lock`
-        exists for the counters that end up in a report and have to add
-        up exactly, which this number does not.
+        times a second tolerates being one block stale; the session's
+        lock exists for the counters that end up in a report and have to
+        add up exactly, which this number does not.
         """
-        if self._squelch is None:
-            return None
-        return self._squelch.stats.last_quieting_db
+        return self._listening.live_quieting_db
 
     @property
     def live_squelch_open(self) -> bool | None:
-        """Whether the gate is open right now, or ``None`` if there is no squelch.
+        """Whether the listening branch's gate is open right now.
 
-        The gate's *decision*, exactly as :attr:`live_quieting_db` is its
-        *measurement* - both real even when ``mute_squelch=False`` never
-        lets that decision reach the speaker. Same polling contract as
+        ``None`` if that branch has no squelch. The gate's *decision*,
+        exactly as :attr:`live_quieting_db` is its *measurement* - both
+        real even when ``mute_squelch=False`` never lets that decision
+        reach the speaker. Same polling contract as
         :attr:`live_quieting_db`: a single attribute read, safe enough
         for a live display, not for a report that has to add up.
         """
-        if self._squelch is None:
-            return None
-        return self._squelch.is_open
+        return self._listening.live_squelch_open
 
     @property
     def live_tracked_frequency_hz(self) -> float | None:
-        """The tracked downlink's true RF frequency right now, or ``None``.
+        """The listening branch's downlink frequency in RF right now, or ``None``.
 
-        ``None`` until the tracking loop has supplied the Doppler
-        tracker its first sample - :attr:`~qsorbit.core.dsp.tuning.DopplerTracker.stats`
-        reports that as ``last_offset_hz is None``, and there is no
-        honest frequency to report before then. Once a sample has
-        landed, this is the tuner's own centre
+        ``None`` until the tracking loop has supplied that branch's
+        Doppler tracker its first sample -
+        :attr:`~qsorbit.core.dsp.tuning.DopplerTracker.stats` reports
+        that as ``last_offset_hz is None``, and there is no honest
+        frequency to report before then. Once a sample has landed, this
+        is that tuner's own centre
         (:attr:`~qsorbit.core.dsp.tuning.DopplerTracker.center_hz`, fixed
         for the run) plus the most recent Doppler offset - the same two
-        numbers :meth:`_demod_loop` combines every block to pick the
-        demod's own ``channel_offset_hz``, so this property always
-        matches where the audio the user is hearing actually sits, not
-        a separately recomputed estimate.
+        numbers :meth:`Branch.demodulate` combines every block to pick
+        the demod's own ``channel_offset_hz``, so this property always
+        matches where the audio the user is hearing actually sits, not a
+        separately recomputed estimate.
+
+        **The listening branch's**, though with two branches every branch
+        answers the same here and that is correct: this is the
+        downlink's RF frequency, which is a property of the pass and not
+        of any receiver. What differs per branch is the *baseband*
+        offset each tuner needs to put that frequency at zero, which is
+        exactly why the tracker is per-branch even though this number is
+        not.
 
         Same live-polling contract as :attr:`live_quieting_db`: meant to
         be read from a different thread than the one updating it, while
@@ -557,10 +884,7 @@ class ReceiveSession:
         already takes its own lock to hand back a consistent snapshot,
         so no additional locking is needed here.
         """
-        offset_hz = self._doppler.stats.last_offset_hz
-        if offset_hz is None:
-            return None
-        return self._doppler.center_hz + offset_hz
+        return self._listening.live_tracked_frequency_hz
 
     # ------------------------------------------------------------------
     # Context manager
@@ -589,28 +913,32 @@ class ReceiveSession:
     # Internals
     # ------------------------------------------------------------------
 
-    def _demod_loop(self) -> None:
-        """Demodulate every block at its own Doppler-corrected offset."""
+    def _demod_loop(self, branch: Branch) -> None:
+        """Demodulate one branch's blocks, and play them if it has the ear.
+
+        Every branch does the full chain whether or not anyone is
+        listening to it. That is not waste: the squelch metrics are the
+        measurement a combiner will eventually select on, and a branch
+        that skipped demodulation to save CPU would have nothing to
+        report and would also make the CPU cost of running two branches
+        unmeasurable, which is the one thing a first dual-device run
+        exists to find out.
+        """
         try:
-            for block in self._audio_blocks.timed_blocks():
+            for block in branch.timed_blocks():
                 if self._stop.is_set():
                     break
-                # The block's MIDPOINT, not either edge: it removes a
-                # systematic half-block bias for free, and TimedBlock
-                # computes it so no caller can get the sign wrong.
-                offset_hz = self._doppler.offset_at(block.midpoint)
-                config = replace(self._nbfm, channel_offset_hz=offset_hz)
-                audio = demodulate_nbfm(
-                    unpack_uint8_iq(block.data),
-                    config,
-                    squelch=self._squelch,
-                    mute=self._mute_squelch,
-                )
-                self._audio.write(audio)
-                with self._lock:
-                    self._blocks_demodulated += 1
+                audio = branch.demodulate(block)
+                # Read per block rather than captured once, so a live
+                # switch takes effect within one block.
+                if branch.listened:
+                    self._audio.write(audio)
         except BaseException as exc:  # noqa: BLE001 - re-raised from stop()
-            self._error = exc
+            # First fault wins. With two branches a failing radio can
+            # take its neighbour down a moment later, and the second
+            # exception would be a consequence of the first.
+            if self._error is None:
+                self._error = exc
 
     def _tracking_loop(self) -> None:
         """Feed the Doppler tracker on a cadence until asked to stop.
@@ -629,7 +957,8 @@ class ReceiveSession:
                 if pending is None:
                     continue
                 when, range_rate_km_s = pending
-                self._doppler.update(when, range_rate_km_s)
+                for branch in self._branches:
+                    branch.doppler.update(when, range_rate_km_s)
                 with self._lock:
                     self._range_rate_updates += 1
         except BaseException as exc:  # noqa: BLE001 - re-raised from stop()
@@ -641,23 +970,15 @@ class ReceiveSession:
             if self._error is None:
                 self._error = exc
 
-    def _build_stats(
-        self,
-        stream_stats: StreamStats,
-        audio_stats: AudioStats,
-        spectrum_stats: SpectrumStreamStats | None,
-    ) -> ReceiveStats:
+    def _build_stats(self, audio_stats: AudioStats) -> ReceiveStats:
         """Assemble a snapshot from each owner's own accounting."""
         with self._lock:
-            blocks = self._blocks_demodulated
             updates = self._range_rate_updates
+        spectrum = self._listening.spectrum
         return ReceiveStats(
-            blocks_demodulated=blocks,
+            branches=tuple(branch.stats for branch in self._branches),
             range_rate_updates=updates,
-            stream=stream_stats,
             audio=audio_stats,
-            doppler=self._doppler.stats,
-            squelch=self._squelch.stats if self._squelch is not None else None,
-            spectrum=spectrum_stats,
+            spectrum=spectrum.stats if spectrum is not None else None,
             stopped_cleanly=self._stopped_cleanly,
         )

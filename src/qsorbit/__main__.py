@@ -47,10 +47,10 @@ import contextlib
 import signal
 import sys
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Final, Protocol
 
 from qsorbit import __version__
 from qsorbit.core.dsp import (
@@ -80,6 +80,7 @@ from qsorbit.core.profiles import (
 )
 from qsorbit.core.receive import (
     DEFAULT_TRACKING_INTERVAL_S,
+    Branch,
     ReceiveSession,
     TargetRangeRate,
 )
@@ -318,7 +319,11 @@ def _spectrum_factory(
 
 
 RotorFactory = Callable[[StationConfig, Callable[[float], None]], Rotor]
-SdrFactory = Callable[[StationConfig], RtlSdr]
+SdrFactory = Callable[[StationConfig, SdrBranch | None], RtlSdr]
+
+#: What a single-device station's one branch is called in reports, when
+#: there is no ``[[sdr.branch]]`` entry naming the antenna it is on.
+UNNAMED_BRANCH_LABEL: Final = "radio"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -645,6 +650,18 @@ def _add_radio_arguments(parser: argparse.ArgumentParser, *, required: bool) -> 
         help=(
             "Actually move the rotor to follow the pass. Without this nothing "
             "is transmitted to the controller and the serial port is not opened."
+        ),
+    )
+    parser.add_argument(
+        "--listen",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "Which receive branch reaches the speaker, by the label it was "
+            "given in [[sdr.branch]]. Defaults to the first declared. Every "
+            "branch demodulates and measures either way -- this chooses what "
+            "you hear, and the waterfall follows it. Means nothing on a "
+            "station with one dongle, which has one branch."
         ),
     )
     parser.add_argument(
@@ -1184,7 +1201,8 @@ def _command_sdr(args: argparse.Namespace, config: StationConfig, factory: SdrFa
 
 
 def _command_sdr_info(config: StationConfig, factory: SdrFactory) -> int:
-    with factory(config) as sdr:
+    _note_single_device(config)
+    with factory(config, None) as sdr:
         info = sdr.info
         gains = sdr.supported_gains_db()
 
@@ -1230,7 +1248,8 @@ def _command_sdr_capture(
             "thing to look at."
         )
 
-    with factory(config) as sdr:
+    _note_single_device(config)
+    with factory(config, None) as sdr:
         print(f"Device:    {sdr.info.describe()}")
         result = capture_to_file(
             sdr,
@@ -1283,53 +1302,85 @@ def _command_receive(
     downlink_hz = args.downlink * 1e6
     center_hz = downlink_hz - args.offset * 1e3
 
-    sdr_config = SdrConfig(
-        center_hz=center_hz,
-        sample_rate_hz=args.rate,
-        gain_db=AUTO_GAIN if args.auto_gain else args.gain,
-        ppm=_sdr_ppm(config),
-    )
+    declared = _declared_branches(config)
+    try:
+        listening = _listening_index(args.listen, declared)
+    except ValueError as exc:
+        print(f"{exc}", file=sys.stderr)
+        return 2
 
-    with sdr_factory(config) as sdr:
-        applied = sdr.configure(sdr_config)
-        print(f"Target:    {satellite.name}")
-        print(f"Device:    {sdr.info.describe()}")
-        print(
-            f"Tuned:     {applied.center_hz / 1e6:.4f} MHz, downlink "
-            f"{applied.offset_from(downlink_hz) / 1e3:+.1f} kHz from centre "
-            f"(before Doppler)"
-        )
-        if applied.reports_zero_gain:
+    with contextlib.ExitStack() as devices:
+        radios: list[_Radio] = []
+        for index, branch in enumerate(declared):
+            label = _branch_label(branch)
+            # Its own ppm, because a crystal correction is a property of
+            # one oscillator and two dongles have two of them.
+            sdr_config = SdrConfig(
+                center_hz=center_hz,
+                sample_rate_hz=args.rate,
+                gain_db=AUTO_GAIN if args.auto_gain else args.gain,
+                ppm=_branch_ppm(config, branch),
+            )
+            sdr = devices.enter_context(sdr_factory(config, branch))
+            applied = sdr.configure(sdr_config)
+            heard = " <- audio" if index == listening else ""
+            print(f"Target:    {satellite.name}" if index == 0 else "")
+            print(f"Branch:    {label}{heard}")
+            print(f"Device:    {sdr.info.describe()}")
             print(
-                "\nWARNING: the tuner reports 0.0 dB of gain, which nearly "
-                "always means you will hear nothing. Set a manual gain."
+                f"Tuned:     {applied.center_hz / 1e6:.4f} MHz, downlink "
+                f"{applied.offset_from(downlink_hz) / 1e3:+.1f} kHz from centre "
+                f"(before Doppler)"
+            )
+            if applied.reports_zero_gain:
+                print(
+                    f"\nWARNING: {label}'s tuner reports 0.0 dB of gain, which "
+                    "nearly always means you will hear nothing. Set a manual gain."
+                )
+
+            # channel_offset_hz is left at its default here on purpose:
+            # the branch replaces it on every block with the
+            # Doppler-corrected value, and seeding it with a static
+            # offset would only invite someone to believe the static one
+            # mattered.
+            nbfm = NbfmConfig(
+                sample_rate_hz=applied.sample_rate_hz,
+                if_rate_hz=args.if_rate,
+                audio_rate_hz=args.audio_rate,
+                deviation_hz=args.deviation,
+            )
+            if index == 0:
+                print(
+                    f"Chain:     {applied.sample_rate_hz:,.0f} -> {nbfm.if_rate_hz:,.0f} Hz IF "
+                    f"(/{nbfm.channel_decimation_factor}) -> "
+                    f"{nbfm.audio_rate_hz:,.0f} Hz audio "
+                    f"(/{nbfm.audio_decimation_factor})"
+                )
+            radios.append(
+                _Radio(
+                    label=label,
+                    sdr=sdr,
+                    applied=applied,
+                    nbfm=nbfm,
+                    # Against the centre the tuner ACTUALLY reached,
+                    # never the one it was asked for: the PLL quantises,
+                    # and an offset computed from the requested
+                    # frequency is wrong by exactly the amount nobody
+                    # thinks to check. Per branch for the same reason -
+                    # two PLLs quantise differently.
+                    doppler=DopplerTracker(downlink_hz, applied.center_hz),
+                    # Built unconditionally now - see
+                    # _squelch_status_line's own docstring for why.
+                    # --squelch only decides whether its decision reaches
+                    # the speaker. One per branch: it is stateful, and a
+                    # shared one would mix two signals' histories into
+                    # one decision.
+                    squelch=NoiseSquelch(
+                        open_above_db=args.squelch_open, close_below_db=args.squelch_close
+                    ),
+                )
             )
 
-        # channel_offset_hz is left at its default here on purpose: the
-        # session replaces it on every block with the Doppler-corrected
-        # value, and seeding it with a static offset would only invite
-        # someone to believe the static one mattered.
-        nbfm = NbfmConfig(
-            sample_rate_hz=applied.sample_rate_hz,
-            if_rate_hz=args.if_rate,
-            audio_rate_hz=args.audio_rate,
-            deviation_hz=args.deviation,
-        )
-        print(
-            f"Chain:     {applied.sample_rate_hz:,.0f} -> {nbfm.if_rate_hz:,.0f} Hz IF "
-            f"(/{nbfm.channel_decimation_factor}) -> {nbfm.audio_rate_hz:,.0f} Hz audio "
-            f"(/{nbfm.audio_decimation_factor})"
-        )
-
-        # Against the centre the tuner ACTUALLY reached, never the one it
-        # was asked for: the PLL quantises, and an offset computed from
-        # the requested frequency is wrong by exactly the amount nobody
-        # thinks to check.
-        doppler = DopplerTracker(downlink_hz, applied.center_hz)
-        # Built unconditionally now - see _squelch_status_line's own
-        # docstring for why. --squelch only decides whether its decision
-        # reaches the speaker (ReceiveSession's mute_squelch below).
-        squelch = NoiseSquelch(open_above_db=args.squelch_open, close_below_db=args.squelch_close)
         print(
             _squelch_status_line(
                 mute=args.squelch,
@@ -1355,7 +1406,7 @@ def _command_receive(
                 "Rotor:     not being moved. Doppler correction needs the TLE and "
                 "your location, not the rotor, so this is a complete receive."
             )
-            return run(args, config, satellite, applied, nbfm, doppler, squelch, sdr)
+            return run(args, config, satellite, radios, listening)
 
         with _Connected(config, rotor_factory) as rotor:
             print(f"Rotor:     connected, {rotor.firmware_version}")
@@ -1374,7 +1425,7 @@ def _command_receive(
                 on_stall=_report_stall,
                 on_profile_change=_profile_pusher(rotor, config),
             )
-            return run(args, config, satellite, applied, nbfm, doppler, squelch, sdr, loop=loop)
+            return run(args, config, satellite, radios, listening, loop=loop)
 
 
 def _range_rate_interval(args: argparse.Namespace) -> float:
@@ -1680,46 +1731,73 @@ def _tracking_profile(args: argparse.Namespace, config: StationConfig) -> Tracki
     return profile
 
 
+def _build_branches(
+    args: argparse.Namespace, radios: Sequence[_Radio], listening: int, *, window: bool
+) -> list[Branch]:
+    """Turn configured radios into receive branches.
+
+    Only the listening branch is given a spectrum factory, so the
+    waterfall shows what is being heard and a branch nobody is watching
+    never computes frames nobody sees.
+
+    Args:
+        args: The parsed command line, for the demod and squelch
+            settings shared by every branch.
+        radios: One per configured device, in declaration order.
+        listening: Index of the branch whose audio reaches the speaker.
+        window: Whether anything will drain spectrum frames. ``receive``
+            passes ``--window``; the shell passes ``True`` always,
+            because a shell has a Radio tab in every configuration.
+    """
+    spectrum_config = SpectrumConfig(
+        fft_size=RECEIVE_FFT_SIZE,
+        sample_rate_hz=radios[listening].applied.sample_rate_hz,
+        center_freq_hz=radios[listening].applied.center_hz,
+    )
+    factory = _spectrum_factory(window, spectrum_config)
+    return [
+        Branch(
+            label=radio.label,
+            stream=IqStream(radio.sdr),
+            nbfm=radio.nbfm,
+            doppler=radio.doppler,
+            squelch=radio.squelch,
+            # args.squelch is "let the gate's decision reach the
+            # speaker" - the gate itself is always deciding now, see
+            # _squelch_status_line.
+            mute_squelch=args.squelch,
+            spectrum_factory=factory if index == listening else None,
+        )
+        for index, radio in enumerate(radios)
+    ]
+
+
 def _run_receive(
     args: argparse.Namespace,
     config: StationConfig,
     satellite: Satellite,
-    applied: AppliedSettings,
-    nbfm: NbfmConfig,
-    doppler: DopplerTracker,
-    squelch: NoiseSquelch,
-    sdr: RtlSdr,
+    radios: Sequence[_Radio],
+    listening: int,
     *,
     loop: TrackingLoop | None = None,
 ) -> int:
     """Build and run the session. Split out so the rotor's ``with`` stays thin."""
-    stream = IqStream(sdr)
-    spectrum_config = SpectrumConfig(
-        fft_size=RECEIVE_FFT_SIZE,
-        sample_rate_hz=applied.sample_rate_hz,
-        center_freq_hz=applied.center_hz,
-    )
     track_log = TrackLog(args.track_log) if args.track_log is not None else None
     if track_log is not None:
         track_log.open()
     ticker = TrackingThread(loop, log=track_log) if loop is not None else None
 
     session = ReceiveSession(
-        stream=stream,
-        nbfm=nbfm,
-        doppler=doppler,
-        audio=AudioOutput(nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)),
+        branches=_build_branches(args, radios, listening, window=args.window),
+        audio=AudioOutput(
+            radios[listening].nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)
+        ),
         # Always from the target, never from the rotor. A range rate
         # comes from the TLE and the observer's location; taking it from
         # a rotor tick was what made the rotor follow this cadence
         # instead of its own profile's.
         range_rate=TargetRangeRate(satellite, config.observer),
-        squelch=squelch,
-        # args.squelch is "let the gate's decision reach the speaker" -
-        # the gate itself is always deciding now, see
-        # _squelch_status_line.
-        mute_squelch=args.squelch,
-        spectrum_factory=_spectrum_factory(args.window, spectrum_config),
+        listening=listening,
         tracking_interval_s=_range_rate_interval(args),
     )
 
@@ -1811,6 +1889,22 @@ def _run_receive(
         print(ticker.describe())
         _print_track_log(ticker, track_log)
     return 0
+
+
+def _window_title(satellite: Satellite, session: ReceiveSession) -> str:
+    """The window's title, naming the branch being heard when there is a choice.
+
+    Silent on a single-branch station, where a label would be noise.
+    Named as soon as there are two, because otherwise ``--listen`` has
+    no visible effect at all: both branches are tuned to the same
+    downlink, so the waterfall of one is pixel-for-pixel the waterfall
+    of the other and nothing on screen could tell an operator which
+    radio they are watching. "Off" and "broken" must never look the
+    same, and neither must "A" and "B".
+    """
+    if len(session.branches) < 2:
+        return f"QSOrbit - receiving {satellite.name}"
+    return f"QSOrbit - receiving {satellite.name} on {session.listening.label}"
 
 
 def _show_instruments(
@@ -1946,7 +2040,7 @@ def _show_instruments(
         waterfall=WaterfallWidget(waterfall_feed, themes=themes, zoom=zoom_controller, scale=scale),
         zoom_controller=zoom_controller,
         themes=themes,
-        title=f"QSOrbit - receiving {satellite.name}",
+        title=_window_title(satellite, session),
     )
     window.show()
 
@@ -2317,11 +2411,8 @@ def _run_shell(
     args: argparse.Namespace,
     config: StationConfig,
     satellite: Satellite,
-    applied: AppliedSettings,
-    nbfm: NbfmConfig,
-    doppler: DopplerTracker,
-    squelch: NoiseSquelch,
-    sdr: RtlSdr,
+    radios: Sequence[_Radio],
+    listening: int,
     *,
     loop: TrackingLoop | None = None,
 ) -> int:
@@ -2352,28 +2443,20 @@ def _run_shell(
     from qsorbit.ui.feed_hub import FeedHub
     from qsorbit.ui.shell_window import ShellWindow
 
-    stream = IqStream(sdr)
-    spectrum_config = SpectrumConfig(
-        fft_size=RECEIVE_FFT_SIZE,
-        sample_rate_hz=applied.sample_rate_hz,
-        center_freq_hz=applied.center_hz,
-    )
     track_log = TrackLog(args.track_log) if args.track_log is not None else None
     if track_log is not None:
         track_log.open()
     ticker = TrackingThread(loop, log=track_log) if loop is not None else None
     session = ReceiveSession(
-        stream=stream,
-        nbfm=nbfm,
-        doppler=doppler,
-        audio=AudioOutput(nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)),
+        # window=True unconditionally here, unlike `receive`, where it
+        # follows --window: a shell always has a Radio tab, so there is
+        # always something that would drain the frames.
+        branches=_build_branches(args, radios, listening, window=True),
+        audio=AudioOutput(
+            radios[listening].nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)
+        ),
         range_rate=TargetRangeRate(satellite, config.observer),
-        squelch=squelch,
-        mute_squelch=args.squelch,
-        # Unconditional here, unlike `receive`, where it follows
-        # --window: a shell always has a Radio tab, so there is always
-        # something that would drain the frames.
-        spectrum_factory=_spectrum_factory(True, spectrum_config),
+        listening=listening,
         tracking_interval_s=_range_rate_interval(args),
     )
 
@@ -2405,7 +2488,7 @@ def _run_shell(
         tle_dir=config.planning.tle_dir,
         observer=config.observer,
         horizon=config.horizon,
-        title=f"QSOrbit - receiving {satellite.name}",
+        title=_window_title(satellite, session),
     )
     # show(), not showMaximized(), and the difference was measured
     # rather than debated. Maximizing this window costs 28x the USB
@@ -2500,6 +2583,73 @@ def _open_rotor(config: StationConfig, on_homing_wait: Callable[[float], None]) 
     return Rotor(port, config.capabilities, on_homing_wait=on_homing_wait)
 
 
+@dataclass(frozen=True)
+class _Radio:
+    """One configured device and everything built against it.
+
+    A staging record between :func:`_command_receive`, which opens and
+    tunes the hardware, and the runner, which builds the
+    :class:`~qsorbit.core.receive.Branch` objects. Every field here is
+    per-device, and two of them look shareable and are not:
+    ``doppler`` is built against the centre frequency *this* tuner
+    reached, and ``squelch`` is stateful.
+    """
+
+    label: str
+    sdr: RtlSdr
+    applied: AppliedSettings
+    nbfm: NbfmConfig
+    doppler: DopplerTracker
+    squelch: NoiseSquelch
+
+
+def _declared_branches(config: StationConfig) -> tuple[SdrBranch | None, ...]:
+    """The branches to open, or one ``None`` for a station with none declared.
+
+    The ``None`` is what keeps a single-device station on the same code
+    path as a dual-SDR one. A separate branchless route would leave the
+    path every existing station takes as the one exercised least.
+    """
+    return config.sdr.branches or (None,)
+
+
+def _branch_label(branch: SdrBranch | None) -> str:
+    """What to call a branch in reports and on screen."""
+    return UNNAMED_BRANCH_LABEL if branch is None else branch.label
+
+
+def _branch_ppm(config: StationConfig, branch: SdrBranch | None) -> int:
+    """The crystal correction for one branch's dongle."""
+    return config.sdr.ppm if branch is None else config.sdr.ppm_for(branch)
+
+
+def _listening_index(listen: str | None, branches: tuple[SdrBranch | None, ...]) -> int:
+    """Which branch gets the speaker, from ``--listen``.
+
+    Args:
+        listen: The requested branch label, or ``None`` for the first.
+        branches: What the station declared.
+
+    Returns:
+        An index into ``branches``.
+
+    Raises:
+        ValueError: If ``listen`` names no declared branch. The message
+            lists the labels, because a label with a space in it is easy
+            to mistype and the config file is the only place they exist.
+    """
+    if listen is None:
+        return 0
+    labels = [_branch_label(branch) for branch in branches]
+    if listen in labels:
+        return labels.index(listen)
+    offered = ", ".join(repr(label) for label in labels)
+    raise ValueError(
+        f"--listen {listen!r} matches no declared branch. This station has: {offered}. "
+        "Labels come from [[sdr.branch]] in your station config and are matched exactly."
+    )
+
+
 def _active_branch(config: StationConfig) -> SdrBranch | None:
     """The branch a single-device command works with, or ``None``.
 
@@ -2522,8 +2672,33 @@ def _sdr_ppm(config: StationConfig) -> int:
     return config.sdr.ppm if branch is None else config.sdr.ppm_for(branch)
 
 
-def _open_sdr(config: StationConfig) -> RtlSdr:
+def _note_single_device(config: StationConfig) -> None:
+    """Say which branch a one-device command took, when there is a choice.
+
+    Said out loud rather than assumed: on a station cabled for two,
+    silence would look exactly like both being used. Printed by the
+    commands that open one device, not by :func:`_open_sdr`, which is a
+    factory and has no business writing to the console — and which the
+    receive path calls once per branch, where the note would be false.
+    """
+    branch = _active_branch(config)
+    if branch is None or len(config.sdr.branches) < 2:
+        return
+    print(
+        f"Note: {len(config.sdr.branches)} branches are declared and this command "
+        f"opens one. Using {branch.label} (serial {branch.serial})."
+    )
+
+
+def _open_sdr(config: StationConfig, branch: SdrBranch | None = None) -> RtlSdr:
     """Build an :class:`RtlSdr` from the station's ``[sdr]`` settings.
+
+    Args:
+        config: The station.
+        branch: Which declared branch to open. ``None`` means "whichever
+            this station's single-device commands use" — the first
+            declared branch if there are any, the configured index
+            otherwise.
 
     Addresses the device by EEPROM serial when branches are declared,
     and by index otherwise — the second path is what every config
@@ -2538,18 +2713,10 @@ def _open_sdr(config: StationConfig) -> RtlSdr:
     is left open deliberately — closing it means opening the device
     here, outside the context manager that owns its lifetime.
     """
-    branch = _active_branch(config)
+    if branch is None:
+        branch = _active_branch(config)
     if branch is None:
         return RtlSdr(config.sdr.device_index, driver_dir=config.sdr.driver_dir)
-    if len(config.sdr.branches) > 1:
-        # Said out loud rather than assumed: with two branches declared
-        # and one device opened, silence would look exactly like
-        # dual-branch receive working.
-        print(
-            f"Note: {len(config.sdr.branches)} branches are declared and this "
-            f"command opens one. Using {branch.label} (serial {branch.serial}); "
-            "receiving on both comes later."
-        )
     lib = LibRtlSdr.load(config.sdr.driver_dir)
     return RtlSdr(index_for_serial(lib, branch.serial), driver_dir=config.sdr.driver_dir)
 

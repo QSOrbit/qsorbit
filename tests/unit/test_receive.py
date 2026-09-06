@@ -50,6 +50,7 @@ from qsorbit.core.pointing import TravelGuardError
 from qsorbit.core.receive import (
     AUDIO_SUBSCRIBER,
     WATERFALL_SUBSCRIBER,
+    Branch,
     ReceiveSession,
     TargetRangeRate,
 )
@@ -284,20 +285,71 @@ class FakeTarget:
         )
 
 
+def a_branch(
+    device: SteppedFakeDevice,
+    *,
+    label: str = "A",
+    clock: BlockClock | None = None,
+    center_hz: float = CENTER_HZ,
+    **overrides,
+) -> Branch:
+    """Build one receive branch over a stepped device."""
+    stream = IqStream(device, block_bytes=BLOCK_BYTES, queue_blocks=8, now=clock or BlockClock())
+    settings = {
+        "label": label,
+        "stream": stream,
+        "nbfm": an_nbfm_config(),
+        "doppler": DopplerTracker(DOWNLINK_HZ, center_hz),
+    }
+    return Branch(**{**settings, **overrides})
+
+
 def a_session(
     device: SteppedFakeDevice, source, *, clock: BlockClock | None = None, **overrides
 ) -> tuple[ReceiveSession, RecordingAudio]:
-    """Build a session over a stepped device, with everything faked."""
+    """Build a one-branch session over a stepped device, everything faked.
+
+    Branch settings and session settings are told apart by name, so a
+    test can pass ``squelch=`` or ``tracking_interval_s=`` without
+    knowing which object ends up holding it.
+    """
+    branch_keys = {
+        "label",
+        "center_hz",
+        "nbfm",
+        "doppler",
+        "squelch",
+        "mute_squelch",
+        "spectrum_factory",
+    }
+    branch_overrides = {k: v for k, v in overrides.items() if k in branch_keys}
+    session_overrides = {k: v for k, v in overrides.items() if k not in branch_keys}
     audio = RecordingAudio()
-    stream = IqStream(device, block_bytes=BLOCK_BYTES, queue_blocks=8, now=clock or BlockClock())
+    branch = a_branch(device, clock=clock, **branch_overrides)
     session = ReceiveSession(
-        stream=stream,
-        nbfm=an_nbfm_config(),
-        doppler=DopplerTracker(DOWNLINK_HZ, CENTER_HZ),
+        branches=[branch],
         audio=audio,
         range_rate=source,
-        **overrides,
+        **session_overrides,
     )
+    return session, audio
+
+
+def a_dual_session(
+    devices: tuple[SteppedFakeDevice, SteppedFakeDevice], source, **overrides
+) -> tuple[ReceiveSession, RecordingAudio]:
+    """Build a two-branch session, labelled A and B, over two fake devices.
+
+    Each branch gets its own clock, because two real dongles stamp their
+    own blocks and a shared one here would hide a branch reading another
+    branch's timestamps.
+    """
+    audio = RecordingAudio()
+    branches = [
+        a_branch(device, label=label, clock=BlockClock())
+        for device, label in zip(devices, ("A", "B"), strict=True)
+    ]
+    session = ReceiveSession(branches=branches, audio=audio, range_rate=source, **overrides)
     return session, audio
 
 
@@ -410,7 +462,7 @@ class TestSessionWiring:
         source = ScriptedRangeRate([(AN_INSTANT, -3.0)])
         session, _ = a_session(device, source, spectrum_factory=a_spectrum_factory())
 
-        names = [entry.name for entry in session.stats.stream.subscribers]
+        names = [entry.name for entry in session.stats.branches[0].stream.subscribers]
 
         assert names == [AUDIO_SUBSCRIBER, WATERFALL_SUBSCRIBER]
 
@@ -427,10 +479,10 @@ class TestSessionWiring:
         source = ScriptedRangeRate([(AN_INSTANT, -3.0)])
         session, _ = a_session(device, source)
 
-        names = [entry.name for entry in session.stats.stream.subscribers]
+        names = [entry.name for entry in session.stats.branches[0].stream.subscribers]
 
         assert names == [AUDIO_SUBSCRIBER]
-        assert session.stats.stream.blocks_dropped == 0
+        assert session.stats.branches[0].stream.blocks_dropped == 0
 
     def test_the_tracker_is_primed_before_anything_streams(self):
         # offset_at() raises if it has never been given a range rate, and
@@ -444,7 +496,7 @@ class TestSessionWiring:
         session.start()
         try:
             assert source.primed
-            assert session.stats.doppler.updates == 1
+            assert session.stats.branches[0].doppler.updates == 1
         finally:
             device.finish()
             quietly_stop(session)
@@ -548,13 +600,13 @@ class TestDopplerFollowsThePass:
         try:
             device.step()
             assert audio.wait_for(1), "the first block was never demodulated"
-            first = session.stats.doppler.last_offset_hz
+            first = session.stats.branches[0].doppler.last_offset_hz
 
             # The pass turns over: approaching becomes receding.
-            session._doppler.update(AN_INSTANT + timedelta(seconds=1.5), +6.0)
+            session.branches[0].doppler.update(AN_INSTANT + timedelta(seconds=1.5), +6.0)
             device.step()
             assert audio.wait_for(2), "the second block was never demodulated"
-            second = session.stats.doppler.last_offset_hz
+            second = session.stats.branches[0].doppler.last_offset_hz
         finally:
             device.finish()
             assert session.wait(5.0), "the demodulating thread never noticed the stream ending"
@@ -577,7 +629,7 @@ class TestDopplerFollowsThePass:
     def test_the_offset_range_spans_the_pass_rather_than_one_instant(self):
         _, _, session = self.run_a_turnover()
 
-        stats = session.stats.doppler
+        stats = session.stats.branches[0].doppler
         assert stats.min_offset_hz is not None
         assert stats.max_offset_hz is not None
         assert stats.max_offset_hz - stats.min_offset_hz > 1_000.0
@@ -603,9 +655,10 @@ class TestStatsPresentation:
 
         text = session.stats.describe()
 
-        assert "--- iq ---" in text
+        assert "--- A ---" in text
         assert "--- audio ---" in text
-        assert "--- doppler ---" in text
+        assert "blocks read" in text
+        assert "doppler:" in text
         assert "squelch: off" in text
         assert "no waterfall was attached" in text
 
@@ -775,7 +828,7 @@ class TestLiveTrackedFrequency:
             assert audio.wait_for(1), "the first block was never demodulated"
 
             # Force a specific, non-trivial offset.
-            session._doppler.update(AN_INSTANT + timedelta(seconds=1.0), -6.0)
+            session.branches[0].doppler.update(AN_INSTANT + timedelta(seconds=1.0), -6.0)
             device.step()
             assert audio.wait_for(2), "the second block was never demodulated"
         finally:
@@ -784,10 +837,329 @@ class TestLiveTrackedFrequency:
             with pytest.raises(DeviceError, match="exhausted"):
                 session.stop()
 
-        offset_hz = session.stats.doppler.last_offset_hz
+        offset_hz = session.stats.branches[0].doppler.last_offset_hz
         assert offset_hz is not None
         assert session.live_tracked_frequency_hz == pytest.approx(CENTER_HZ + offset_hz)
         # Approaching (negative range rate) pushes the downlink above
         # its nominal tuning offset -- the same sign
         # TestDopplerFollowsThePass pins for the raw offset.
         assert session.live_tracked_frequency_hz > DOWNLINK_HZ
+
+
+# ---------------------------------------------------------------------------
+# Two branches
+# ---------------------------------------------------------------------------
+
+
+def wait_until(predicate, timeout_s: float = 5.0) -> bool:
+    """Poll ``predicate`` until it holds or the deadline passes.
+
+    The same shape ``TestTrackingError`` already uses. Needed here
+    because a *silent* branch offers no barrier: ``RecordingAudio`` can
+    say when the listening branch has finished a block, and nothing can
+    say when the other one has. Stepping a device only proves a block
+    reached its queue.
+
+    It matters more than it looks. :meth:`ReceiveSession.stop` sets the
+    stop flag and each demodulating loop checks it *before* taking the
+    next block, so a block still queued when the session stops is
+    dropped on purpose -- which is right, and which means a test that
+    stops without waiting reads three demodulated blocks where it meant
+    four, intermittently.
+    """
+    deadline = time.monotonic() + timeout_s
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    return predicate()
+
+
+def step_both(devices, session, count):
+    """Advance both fake devices one block and wait for BOTH to demodulate it.
+
+    ``count`` is the cumulative number of blocks each branch should have
+    demodulated once this returns -- not the number that reached the
+    speaker, which is only ever the listening branch's.
+    """
+    for device in devices:
+        device.step()
+    assert wait_until(
+        lambda: all(branch.stats.blocks_demodulated >= count for branch in session.branches)
+    ), (
+        "branches reached "
+        f"{[branch.stats.blocks_demodulated for branch in session.branches]}, wanted {count}"
+    )
+
+
+class TestTwoBranches:
+    """Two devices, both demodulating, with one speaker between them."""
+
+    def a_pair(self, **overrides):
+        devices = (
+            SteppedFakeDevice([TUNING_OFFSET_HZ] * 3),
+            SteppedFakeDevice([TUNING_OFFSET_HZ] * 3),
+        )
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        session, audio = a_dual_session(devices, source, **overrides)
+        return devices, session, audio
+
+    def test_both_branches_demodulate_every_block(self):
+        # The point of the whole PR: a branch nobody is listening to
+        # still runs the full chain, because its squelch metrics are
+        # what a combiner will select on and because the CPU cost of
+        # running two is the thing a dual-device run measures.
+        devices, session, audio = self.a_pair()
+
+        session.start()
+        try:
+            # Two blocks each. The audio barrier only proves the
+            # LISTENING branch has finished a block, so the counts are
+            # read after stop(), where both demodulating threads have
+            # been joined and the numbers are final.
+            step_both(devices, session, 1)
+            step_both(devices, session, 2)
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
+        counts = [branch.blocks_demodulated for branch in session.stats.branches]
+        assert counts == [2, 2]
+
+    def test_only_the_listening_branch_reaches_the_speaker(self):
+        devices, session, audio = self.a_pair()
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+            step_both(devices, session, 2)
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
+        # Two blocks demodulated per branch, four in total, and exactly
+        # two of them played. If both branches wrote, the speaker would
+        # have four blocks of two different signals interleaved.
+        assert session.stats.blocks_demodulated == 4
+        assert len(audio.blocks) == 2
+
+    def test_exactly_one_branch_is_marked_as_heard(self):
+        _, session, _ = self.a_pair()
+
+        heard = [branch.listened for branch in session.stats.branches]
+
+        assert heard == [True, False]
+
+    def test_the_second_branch_can_be_the_one_heard(self):
+        devices, session, audio = self.a_pair(listening=1)
+
+        assert session.listening.label == "B"
+        assert [branch.listened for branch in session.stats.branches] == [False, True]
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
+        assert len(audio.blocks) == 1
+
+    def test_the_stats_name_every_branch(self):
+        _, session, _ = self.a_pair()
+
+        assert [branch.label for branch in session.stats.branches] == ["A", "B"]
+
+    def test_describe_gives_each_branch_its_own_section(self):
+        # A combined number would hide exactly the per-branch difference
+        # a dual-SDR run exists to measure.
+        _, session, _ = self.a_pair()
+
+        text = session.stats.describe()
+
+        assert "--- A ---" in text
+        assert "--- B ---" in text
+        assert "(heard)" in text
+
+    def test_one_range_rate_sample_feeds_every_branch(self):
+        # One predicted curve, one thread, two trackers. Priming counts
+        # as an update, which is why this is 1 rather than 0.
+        devices, session, audio = self.a_pair()
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+            updates = [branch.doppler.updates for branch in session.stats.branches]
+            assert updates == [1, 1]
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
+    def test_each_branch_corrects_against_its_own_tuner(self):
+        # Not a detail: a DopplerTracker is built against the centre
+        # frequency its own PLL reached, and two PLLs quantise the same
+        # request differently. One shared tracker would put one dongle's
+        # baseband offset on the other dongle's samples.
+        #
+        # The quantity that differs is the BASEBAND offset, not the RF
+        # frequency: a tuner sitting 137 Hz higher needs the downlink
+        # pushed 137 Hz further down to reach zero. This test asserted
+        # the RF frequency first and found it identical on both
+        # branches, which is correct and was the wrong thing to check --
+        # the RF frequency is a property of the pass.
+        devices = (SteppedFakeDevice([TUNING_OFFSET_HZ]), SteppedFakeDevice([TUNING_OFFSET_HZ]))
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        audio = RecordingAudio()
+        branches = [
+            a_branch(devices[0], label="A", center_hz=CENTER_HZ),
+            a_branch(devices[1], label="B", center_hz=CENTER_HZ + 137.0),
+        ]
+        session = ReceiveSession(branches=branches, audio=audio, range_rate=source)
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+            at = AN_INSTANT + timedelta(seconds=1.0)
+            first, second = (branch.doppler.offset_at(at) for branch in session.branches)
+            assert second - first == pytest.approx(-137.0)
+
+            # And the RF frequency they report is the same, because it
+            # describes the satellite rather than either receiver.
+            heard = [branch.live_tracked_frequency_hz for branch in session.branches]
+            assert heard[0] == pytest.approx(heard[1])
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
+    def test_only_the_listening_branch_gets_a_waterfall(self):
+        # A branch nobody is watching never computes frames nobody sees,
+        # which is the same reasoning that made the subscription
+        # conditional in the first place (Session 24).
+        devices = (SteppedFakeDevice([TUNING_OFFSET_HZ]), SteppedFakeDevice([TUNING_OFFSET_HZ]))
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        audio = RecordingAudio()
+        branches = [
+            a_branch(devices[0], label="A", spectrum_factory=a_spectrum_factory()),
+            a_branch(devices[1], label="B"),
+        ]
+        session = ReceiveSession(branches=branches, audio=audio, range_rate=source)
+
+        names = [
+            [entry.name for entry in branch.stats.stream.subscribers] for branch in session.branches
+        ]
+
+        assert names == [[AUDIO_SUBSCRIBER, WATERFALL_SUBSCRIBER], [AUDIO_SUBSCRIBER]]
+        assert session.spectrum is not None
+
+    def test_a_failure_on_one_branch_reaches_the_caller(self):
+        # A dead radio must not be something the run walks past. With
+        # two of them the *first* fault is the real one; a second is
+        # usually a consequence.
+        devices, session, audio = self.a_pair()
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+        finally:
+            devices[1].finish()
+            devices[0].finish()
+            with pytest.raises(DeviceError, match="exhausted"):
+                session.stop()
+
+
+class TestListeningTo:
+    """Which branch holds the ear, and how that changes."""
+
+    def a_pair(self):
+        devices = (
+            SteppedFakeDevice([TUNING_OFFSET_HZ] * 3),
+            SteppedFakeDevice([TUNING_OFFSET_HZ] * 3),
+        )
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        session, audio = a_dual_session(devices, source)
+        return devices, session, audio
+
+    def test_switching_moves_the_ear_and_leaves_nobody_else_holding_it(self):
+        # The mechanism PR2's combiner will drive. Enforced on the
+        # session rather than by whoever sets the flag: two branches
+        # writing to one AudioOutput would interleave two half-rate
+        # streams into something that sounds like a broken radio.
+        _, session, _ = self.a_pair()
+
+        session.listen_to(session.branches[1])
+
+        assert session.listening is session.branches[1]
+        assert [branch.listened for branch in session.branches] == [False, True]
+
+    def test_switching_takes_effect_while_running(self):
+        devices, session, audio = self.a_pair()
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+            session.listen_to(session.branches[1])
+            step_both(devices, session, 2)
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
+        # Still exactly one block per step reaching the speaker -- the
+        # ear moved, it did not multiply. The second of those came from
+        # B, which had written nothing before the switch.
+        assert len(audio.blocks) == 2
+        assert session.stats.blocks_demodulated == 4
+
+    def test_a_branch_from_somewhere_else_is_refused(self):
+        _, session, _ = self.a_pair()
+        stranger = a_branch(SteppedFakeDevice([TUNING_OFFSET_HZ]), label="C")
+
+        with pytest.raises(ValueError, match="not a branch of this session"):
+            session.listen_to(stranger)
+
+    def test_the_waterfall_follows_the_ear(self):
+        _, session, _ = self.a_pair()
+
+        # Neither branch has a spectrum here, which is the honest answer
+        # for a headless run -- the point is that it is read off the
+        # listening branch rather than cached at construction.
+        session.listen_to(session.branches[1])
+
+        assert session.spectrum is session.branches[1].spectrum
+
+
+class TestBranchListValidation:
+    def test_a_session_with_no_branches_is_refused(self):
+        with pytest.raises(ValueError, match="at least one branch"):
+            ReceiveSession(
+                branches=[],
+                audio=RecordingAudio(),
+                range_rate=ScriptedRangeRate([(AN_INSTANT, 0.0)]),
+            )
+
+    def test_a_listening_index_past_the_end_is_refused(self):
+        branch = a_branch(SteppedFakeDevice([TUNING_OFFSET_HZ]))
+
+        with pytest.raises(ValueError, match="listening"):
+            ReceiveSession(
+                branches=[branch],
+                audio=RecordingAudio(),
+                range_rate=ScriptedRangeRate([(AN_INSTANT, 0.0)]),
+                listening=1,
+            )
+
+    def test_a_negative_listening_index_is_refused(self):
+        # Python would happily read -1 as "the last one", which is a
+        # plausible off-by-one arriving as a working program.
+        branch = a_branch(SteppedFakeDevice([TUNING_OFFSET_HZ]))
+
+        with pytest.raises(ValueError, match="listening"):
+            ReceiveSession(
+                branches=[branch],
+                audio=RecordingAudio(),
+                range_rate=ScriptedRangeRate([(AN_INSTANT, 0.0)]),
+                listening=-1,
+            )
