@@ -105,6 +105,7 @@ from qsorbit.core.dsp.iq import unpack_uint8_iq
 from qsorbit.core.dsp.spectrum_stream import SpectrumStream, SpectrumStreamStats
 from qsorbit.core.dsp.squelch import NoiseSquelch, SquelchStats
 from qsorbit.core.dsp.tuning import DopplerStats, DopplerTracker
+from qsorbit.core.quieting_log import QuietingLog
 from qsorbit.core.sdr.stream import IqStream, StreamStats, TimedBlock
 from qsorbit.core.tracker.observer import ObserverLocation
 from qsorbit.core.tracker.target import Target
@@ -354,6 +355,11 @@ class Branch:
             a branch nobody is watching never pays for frames nobody
             sees — the same reasoning that made the subscription
             conditional in the first place.
+        log: Optional :class:`~qsorbit.core.quieting_log.QuietingLog`,
+            shared with every other branch in the session. When given,
+            this branch writes one row per block. Nothing is written if
+            it has no ``squelch``, because there is no measurement to
+            write -- see :meth:`demodulate`.
         listened: Whether this branch's audio reaches the speaker.
             Mutable, and set through :meth:`ReceiveSession.listen_to`
             rather than directly, because exactly one branch may hold
@@ -370,6 +376,7 @@ class Branch:
         squelch: NoiseSquelch | None = None,
         mute_squelch: bool = True,
         spectrum_factory: Callable[[Iterable[bytes]], SpectrumStream] | None = None,
+        log: QuietingLog | None = None,
     ) -> None:
         self.label = label
         self.listened = False
@@ -378,6 +385,7 @@ class Branch:
         self._doppler = doppler
         self._squelch = squelch
         self._mute_squelch = mute_squelch
+        self._log = log
 
         # Subscribed here rather than at start(), because subscriptions
         # must exist before the reader thread does and a caller is
@@ -504,6 +512,19 @@ class Branch:
             being heard is the session's decision and not this
             object's — and a branch nobody is listening to still has to
             do all of this, or its squelch metrics would mean nothing.
+
+        Writes one row to the quieting log, if there is one, **after**
+        demodulating rather than before: the squelch is updated by
+        :func:`~qsorbit.core.dsp.demod.demodulate_nbfm` as it runs, so
+        reading it first would record the previous block's measurement
+        against this block's timestamp. The row is stamped with the
+        block's own midpoint, which is the instant the measurement
+        describes.
+
+        A branch with no squelch writes nothing at all rather than a
+        row of zeroes -- "not measured" and "measured as zero" are
+        different facts, and a combiner sized from the second would be
+        sized from nothing.
         """
         # The block's MIDPOINT, not either edge: it removes a
         # systematic half-block bias for free, and TimedBlock computes
@@ -518,6 +539,15 @@ class Branch:
         )
         with self._lock:
             self._blocks_demodulated += 1
+        if self._log is not None and self._squelch is not None:
+            quieting_db = self._squelch.stats.last_quieting_db
+            if quieting_db is not None:
+                self._log.record(
+                    block.midpoint,
+                    self.label,
+                    quieting_db,
+                    gate_open=self._squelch.is_open,
+                )
         return audio
 
 

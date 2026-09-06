@@ -28,8 +28,10 @@ from qsorbit.__main__ import (
     _describe_mechanics,
     _listening_index,
     _note_single_device,
+    _open_quieting_log,
     _open_sdr,
     _parse_audio_device,
+    _print_quieting_log,
     _profile_pusher,
     _push_profile_gains,
     _quit_on_sigint,
@@ -46,6 +48,7 @@ from qsorbit.__main__ import (
 from qsorbit.core.dsp.spectrum import SpectrumConfig
 from qsorbit.core.dsp.spectrum_stream import SpectrumStream
 from qsorbit.core.profiles import CATALOG_MANIFEST_FILENAME
+from qsorbit.core.quieting_log import QuietingLog
 from qsorbit.core.receive import DEFAULT_TRACKING_INTERVAL_S
 from qsorbit.core.rotor import Arrival, HomingError, Position, Rotor, RotorErrorCode, RotorStatus
 from qsorbit.core.sdr import (
@@ -2451,3 +2454,91 @@ class TestWindowTitle:
         title = _window_title(SimpleNamespace(name="AO-91"), session)
 
         assert title == "QSOrbit - receiving AO-91 on B - Arrow H"
+
+
+class TestQuietingLogWiring:
+    """The flag, and the one log every branch shares."""
+
+    def branches_with(self, tmp_path, tle_path, *extra, log=None):
+        def run(args, config, satellite, radios, listening, *, loop=None):
+            run.branches = _build_branches(args, radios, listening, window=False, log=log)
+            run.listening = listening
+            return 0
+
+        run.branches = None
+        _command_receive(
+            receive_args(tle_path, *extra),
+            config_with(tmp_path, TWO_BRANCHES),
+            None,
+            branch_sdr_factory(),
+            runner=run,
+        )
+        return run.branches
+
+    def test_the_flag_defaults_to_off(self, tle_path):
+        assert receive_args(tle_path).quieting_log is None
+
+    def test_the_flag_takes_a_path(self, tle_path, tmp_path):
+        target = tmp_path / "q.csv"
+
+        assert receive_args(tle_path, "--quieting-log", str(target)).quieting_log == str(target)
+
+    def test_the_shell_takes_it_too(self, tmp_path):
+        # Both commands run the same receive path, so a flag on one and
+        # not the other would be a difference with no reason behind it.
+        args = build_parser().parse_args(
+            [
+                "shell",
+                "--tle",
+                "x",
+                "--downlink",
+                "145.95",
+                "--gain",
+                "32.8",
+                "--quieting-log",
+                str(tmp_path / "q.csv"),
+            ]
+        )
+
+        assert args.quieting_log == str(tmp_path / "q.csv")
+
+    def test_every_branch_shares_one_log(self, tmp_path, tle_path):
+        # One log and not one per branch: the whole point is a
+        # difference between two series, and two files would be two
+        # time origins.
+        log = QuietingLog(tmp_path / "q.csv")
+        log.open()
+
+        branches = self.branches_with(tmp_path, tle_path, log=log)
+
+        assert [branch._log for branch in branches] == [log, log]
+        log.close()
+
+    def test_no_flag_means_no_log_on_any_branch(self, tmp_path, tle_path):
+        branches = self.branches_with(tmp_path, tle_path)
+
+        assert [branch._log for branch in branches] == [None, None]
+
+    def test_open_quieting_log_returns_none_without_the_flag(self, tle_path):
+        assert _open_quieting_log(receive_args(tle_path)) is None
+
+    def test_open_quieting_log_creates_the_file_before_anything_streams(self, tmp_path, tle_path):
+        # Opened early on purpose: its time origin has to be fixed
+        # before a block can arrive, or the two branches would not
+        # share one.
+        target = tmp_path / "q.csv"
+
+        log = _open_quieting_log(receive_args(tle_path, "--quieting-log", str(target)))
+
+        assert target.exists()
+        log.close()
+
+    def test_the_report_names_the_file_and_says_nothing_without_one(self, tmp_path, capsys):
+        _print_quieting_log(None)
+        assert capsys.readouterr().out == ""
+
+        log = QuietingLog(tmp_path / "q.csv")
+        log.open()
+        _print_quieting_log(log)
+
+        assert "q.csv" in capsys.readouterr().out

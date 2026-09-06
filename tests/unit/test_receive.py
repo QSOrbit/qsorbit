@@ -47,6 +47,7 @@ from qsorbit.core.dsp.squelch import NoiseSquelch
 from qsorbit.core.dsp.tuning import DopplerTracker
 from qsorbit.core.geometry import AzEl
 from qsorbit.core.pointing import TravelGuardError
+from qsorbit.core.quieting_log import QuietingLog
 from qsorbit.core.receive import (
     AUDIO_SUBSCRIBER,
     WATERFALL_SUBSCRIBER,
@@ -321,6 +322,7 @@ def a_session(
         "squelch",
         "mute_squelch",
         "spectrum_factory",
+        "log",
     }
     branch_overrides = {k: v for k, v in overrides.items() if k in branch_keys}
     session_overrides = {k: v for k, v in overrides.items() if k not in branch_keys}
@@ -1163,3 +1165,140 @@ class TestBranchListValidation:
                 range_rate=ScriptedRangeRate([(AN_INSTANT, 0.0)]),
                 listening=-1,
             )
+
+
+# ---------------------------------------------------------------------------
+# The quieting log
+# ---------------------------------------------------------------------------
+
+
+def logged_rows(path):
+    import csv
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+class TestQuietingLogging:
+    """What a branch writes, and when."""
+
+    def a_logged_pair(self, tmp_path, **overrides):
+        log = QuietingLog(tmp_path / "quieting.csv")
+        log.open()
+        devices = (
+            SteppedFakeDevice([TUNING_OFFSET_HZ] * 3),
+            SteppedFakeDevice([TUNING_OFFSET_HZ] * 3),
+        )
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        audio = RecordingAudio()
+        branches = [
+            a_branch(
+                device,
+                label=label,
+                clock=BlockClock(),
+                squelch=NoiseSquelch(),
+                log=log,
+                **overrides,
+            )
+            for device, label in zip(devices, ("A", "B"), strict=True)
+        ]
+        session = ReceiveSession(branches=branches, audio=audio, range_rate=source)
+        return devices, session, audio, log
+
+    def test_both_branches_write_their_own_rows(self, tmp_path):
+        devices, session, audio, log = self.a_logged_pair(tmp_path)
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+            step_both(devices, session, 2)
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+            log.close()
+
+        assert log.rows_per_branch == {"A": 2, "B": 2}
+
+    def test_a_row_carries_the_branch_label_and_a_real_measurement(self, tmp_path):
+        devices, session, audio, log = self.a_logged_pair(tmp_path)
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+            log.close()
+
+        rows = logged_rows(log.path)
+        assert {row["branch"] for row in rows} == {"A", "B"}
+        # A quieting figure that is present and finite, not a placeholder.
+        assert all(float(row["quieting_db"]) == float(row["quieting_db"]) for row in rows)
+        assert all(row["gate_open"] in {"0", "1"} for row in rows)
+
+    def test_a_branch_with_no_squelch_writes_nothing(self, tmp_path):
+        # "Not measured" and "measured as zero" are different facts, and
+        # a margin sized from the second would be sized from nothing.
+        log = QuietingLog(tmp_path / "quieting.csv")
+        log.open()
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ])
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        session, audio = a_session(device, source, log=log)
+
+        session.start()
+        try:
+            device.step()
+            assert audio.wait_for(1), "the block was never demodulated"
+        finally:
+            device.finish()
+            quietly_stop(session)
+            log.close()
+
+        assert log.rows == 0
+
+    def test_no_log_means_no_file_and_no_cost(self, tmp_path):
+        # A run without the flag must behave exactly as it did before
+        # the flag existed.
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ])
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        session, audio = a_session(device, source, squelch=NoiseSquelch())
+
+        session.start()
+        try:
+            device.step()
+            assert audio.wait_for(1), "the block was never demodulated"
+        finally:
+            device.finish()
+            quietly_stop(session)
+
+        assert not (tmp_path / "quieting.csv").exists()
+
+    def test_the_row_is_written_after_the_squelch_has_seen_the_block(self, tmp_path):
+        # Reading the squelch before demodulating would record the
+        # PREVIOUS block's measurement against this block's timestamp -
+        # a whole-block skew, invisible in any single run, and fatal to
+        # a difference between two series.
+        log = QuietingLog(tmp_path / "quieting.csv")
+        log.open()
+        device = SteppedFakeDevice([TUNING_OFFSET_HZ])
+        source = ScriptedRangeRate([(AN_INSTANT, 0.0)])
+        session, audio = a_session(device, source, squelch=NoiseSquelch(), log=log)
+
+        session.start()
+        try:
+            device.step()
+            assert audio.wait_for(1), "the block was never demodulated"
+            assert wait_until(lambda: log.rows >= 1)
+            branch = session.branches[0]
+            # The row matches what the squelch is reporting now, which
+            # it could not if the read had happened first: before the
+            # first block there was no measurement at all.
+            assert float(logged_rows(log.path)[0]["quieting_db"]) == pytest.approx(
+                branch.live_quieting_db, abs=0.005
+            )
+        finally:
+            device.finish()
+            quietly_stop(session)
+            log.close()
