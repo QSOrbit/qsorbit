@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from qsorbit.ui.quieting_formatting import (
     AWAITING_FIRST_MEASUREMENT_LABEL,
+    HEARD_LABEL,
     NO_SQUELCH_LABEL,
     QuietingText,
     quieting_text,
@@ -89,3 +90,52 @@ class TestAMeasuredReading:
         with_defaults = quieting_text(7.5, True)
         with_explicit = quieting_text(7.5, True, floor_db=-5.0, ceiling_db=20.0)
         assert with_defaults.bar_fraction == with_explicit.bar_fraction
+
+
+class TestTheEarMarker:
+    """Which branch is actually reaching the speaker.
+
+    Qt-free like everything else in this module, which matters more than
+    usual here: the widget tests next door need libEGL and cannot run in
+    every environment, so the rules worth arguing about live where they
+    always run.
+    """
+
+    def test_a_single_branch_station_is_not_marked(self):
+        # None means "no choice is being made". Marking the only panel
+        # on screen would imply one, and there is nothing it could be
+        # distinguished from.
+        assert quieting_text(12.0, True).ear_label == ""
+        assert quieting_text(12.0, True, listening=None).ear_label == ""
+
+    def test_the_listening_branch_is_marked(self):
+        assert quieting_text(12.0, True, listening=True).ear_label == HEARD_LABEL
+
+    def test_a_branch_that_is_not_heard_is_blank(self):
+        assert quieting_text(12.0, True, listening=False).ear_label == ""
+
+    def test_the_marker_survives_having_no_squelch(self):
+        # A branch can hold the speaker with no squelch attached at all.
+        text = quieting_text(None, None, listening=True)
+
+        assert text.quieting_label == NO_SQUELCH_LABEL
+        assert text.ear_label == HEARD_LABEL
+
+    def test_the_marker_survives_having_no_measurement_yet(self):
+        # And it holds the speaker for the first block of every run,
+        # before anything has been measured -- which is exactly when a
+        # marker applied only to the measured branch would vanish.
+        text = quieting_text(None, False, listening=True)
+
+        assert text.quieting_label == AWAITING_FIRST_MEASUREMENT_LABEL
+        assert text.ear_label == HEARD_LABEL
+
+    def test_the_marker_does_not_disturb_anything_else(self):
+        # The reading, the gate and the bar are what they were before
+        # this parameter existed.
+        without = quieting_text(12.0, True)
+        with_ear = quieting_text(12.0, True, listening=True)
+
+        assert with_ear.quieting_label == without.quieting_label
+        assert with_ear.gate_label == without.gate_label
+        assert with_ear.bar_fraction == without.bar_fraction

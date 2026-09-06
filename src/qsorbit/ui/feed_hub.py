@@ -62,7 +62,7 @@ eyeball judgement Session 25 replaced with arithmetic.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Protocol
 
 from qsorbit.core.dsp.spectrum_stream import SpectrumStream, SpectrumSubscription
@@ -112,6 +112,76 @@ class RadioSource(Protocol):
     def live_tracked_frequency_hz(self) -> float | None:
         """See :attr:`~qsorbit.core.receive.ReceiveSession.live_tracked_frequency_hz`."""
         ...
+
+
+class BranchSource(Protocol):
+    """One receive branch, as a display needs to see it.
+
+    Structural like every other source protocol in this package, so a
+    test double satisfies it with four attributes and no radio.
+    """
+
+    label: str
+    listened: bool
+
+    @property
+    def live_quieting_db(self) -> float | None:
+        """See :attr:`~qsorbit.core.receive.Branch.live_quieting_db`."""
+        ...
+
+    @property
+    def live_squelch_open(self) -> bool | None:
+        """See :attr:`~qsorbit.core.receive.Branch.live_squelch_open`."""
+        ...
+
+
+class BranchFeed:
+    """A level feed for one branch: its levels, its name, and the ear.
+
+    Satisfies :class:`~qsorbit.ui.quieting_widget.QuietingSource`, so a
+    :class:`~qsorbit.ui.quieting_widget.QuietingWidget` takes one
+    unchanged -- which is the Session 19 widget rule paying off rather
+    than a coincidence. The widget was written against a session; it
+    works against a branch because it never learned what a session was.
+
+    **A wrapper rather than the branch itself**, for exactly the reason
+    :class:`QuietingFeed` gives: handing a panel that draws one bar a
+    real :class:`~qsorbit.core.receive.Branch` would give it
+    ``demodulate()`` and ``start()`` as well, and a branch is very much
+    a container.
+
+    :attr:`is_listening` is read live rather than captured, because with
+    a combiner running it changes mid-pass -- which is the whole reason
+    a per-branch display is worth having.
+
+    Args:
+        source: The branch to read.
+    """
+
+    __slots__ = ("_source",)
+
+    def __init__(self, source: BranchSource) -> None:
+        self._source = source
+
+    @property
+    def label(self) -> str:
+        """What this branch is called, from station config."""
+        return self._source.label
+
+    @property
+    def is_listening(self) -> bool:
+        """Whether this branch's audio is reaching the speaker right now."""
+        return self._source.listened
+
+    @property
+    def live_quieting_db(self) -> float | None:
+        """How far the channel is quieted, in dB, or ``None`` if unmeasured."""
+        return self._source.live_quieting_db
+
+    @property
+    def live_squelch_open(self) -> bool | None:
+        """Whether the gate is open right now, or ``None`` if there is no squelch."""
+        return self._source.live_squelch_open
 
 
 class QuietingFeed:
@@ -285,6 +355,15 @@ class FeedHub:
             died. Ignored when ``tracking`` is ``None``. Defaults to a
             source that never reports one, for a caller that ticks the
             loop itself.
+        branches: The receive branches, in declaration order, or empty
+            when nothing is being received. Separate from ``radio``
+            rather than derived from it: ``radio`` is the *session's*
+            levels, which are the listening branch's, and a per-branch
+            display needs every branch including the ones nobody is
+            hearing. A single-branch station passes one, and the tabs
+            below fall back to the whole-session panel for it -- one
+            meter titled with an antenna's name says nothing the plain
+            "Quieting / squelch" card did not.
     """
 
     def __init__(
@@ -295,10 +374,12 @@ class FeedHub:
         tracking: TrackingLoop | None = None,
         tracking_fault: Callable[[], BaseException | None] = _no_fault,
         tracking_profiles: tuple[TrackingProfile, ...] = (),
+        branches: Sequence[BranchSource] = (),
     ) -> None:
         self._spectrum = spectrum
         self._radio = radio
         self._claimed: list[str] = []
+        self._branches = tuple(BranchFeed(branch) for branch in branches)
 
         self._quieting = QuietingFeed(radio) if radio is not None else None
         self._tracked_frequency = TrackedFrequencyFeed(radio) if radio is not None else None
@@ -307,6 +388,18 @@ class FeedHub:
             if tracking is not None
             else None
         )
+
+    @property
+    def branches(self) -> tuple[BranchFeed, ...]:
+        """A feed per receive branch, in declaration order.
+
+        Empty when nothing is being received. **A tuple and not a
+        single feed**, because the point of the display is comparison:
+        a panel showing only the branch you are already hearing cannot
+        show you the fade the combiner is riding through, which is the
+        thing the chunk's acceptance asks to see.
+        """
+        return self._branches
 
     # ------------------------------------------------------------------
     # Streams — claimed

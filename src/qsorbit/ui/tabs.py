@@ -192,8 +192,13 @@ class RadioTab(QWidget):
                     index=0,
                 )
             )
+        # Only when there is no per-branch card to supersede it. With
+        # two branches this card reads identically to whichever branch
+        # is being heard -- the session's levels ARE the listening
+        # branch's -- so it is a duplicate that silently changes which
+        # branch it is duplicating whenever the combiner switches.
         quieting = hub.quieting
-        if quieting is not None:
+        if quieting is not None and len(hub.branches) < 2:
             right_layout.addWidget(
                 Card("Quieting / squelch", QuietingWidget(quieting), themes=themes, index=1)
             )
@@ -210,22 +215,36 @@ class RadioTab(QWidget):
                 )
             )
 
-        # Present, greyed, and honest about why. The mockup carries this
-        # card with branch B greyed out until Chunk E's second SDR
-        # exists; leaving it out entirely would make the Radio tab look
-        # finished when it is not, and inventing a meter with nothing
-        # behind it would be worse than either.
-        right_layout.addWidget(
-            Card(
-                "Branches",
-                Placeholder(
-                    "Single SDR. Branch B lights up with Chunk E's second dongle.",
-                    compact=True,
-                ),
-                themes=themes,
-                index=2,
+        # The mockup's greyed second meter, now lit -- but only when
+        # there is genuinely a second branch. A station with one dongle
+        # keeps the placeholder, because one meter titled with an
+        # antenna's name says nothing the "Quieting / squelch" card
+        # above it does not, and a "Branches" card showing a single
+        # branch would imply a comparison that is not being made.
+        branches = hub.branches
+        if len(branches) > 1:
+            for offset, branch in enumerate(branches):
+                right_layout.addWidget(
+                    Card(
+                        branch.label,
+                        QuietingWidget(branch),
+                        themes=themes,
+                        index=2 + offset,
+                    )
+                )
+        else:
+            right_layout.addWidget(
+                Card(
+                    "Branches",
+                    Placeholder(
+                        "Single SDR. A second branch appears here when station "
+                        "config declares one.",
+                        compact=True,
+                    ),
+                    themes=themes,
+                    index=2,
+                )
             )
-        )
         right_layout.addStretch(1)
 
         layout.addWidget(left, 1)
