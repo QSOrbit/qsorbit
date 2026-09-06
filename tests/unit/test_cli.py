@@ -12,6 +12,7 @@ import argparse
 import json
 import signal
 import textwrap
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,7 +21,13 @@ from qsorbit import __version__
 from qsorbit.__main__ import (
     DEFAULT_PLAN_HOURS,
     DEFAULT_TUNING_OFFSET_KHZ,
+    UNNAMED_BRANCH_LABEL,
+    _build_branches,
+    _command_receive,
+    _declared_branches,
     _describe_mechanics,
+    _listening_index,
+    _note_single_device,
     _open_sdr,
     _parse_audio_device,
     _profile_pusher,
@@ -32,6 +39,7 @@ from qsorbit.__main__ import (
     _spectrum_factory,
     _squelch_status_line,
     _stall_guard,
+    _window_title,
     build_parser,
     main,
 )
@@ -1054,8 +1062,8 @@ class FakeSdr:
     nothing about real hardware.
     """
 
-    def __init__(self, *, max_blocks=8, gain_db=None):
-        self.index = 0
+    def __init__(self, *, max_blocks=8, gain_db=None, index=0, serial=""):
+        self.index = index
         self.is_open = False
         self.applied = None
         self.configured = []
@@ -1063,11 +1071,11 @@ class FakeSdr:
         self._max_blocks = max_blocks
         self._forced_gain = gain_db
         self.info = DeviceInfo(
-            index=0,
+            index=index,
             name="Generic RTL2832U OEM",
             manufacturer="RTLSDRBlog",
             product="Blog V4",
-            serial="",
+            serial=serial,
             tuner=TunerType.R828D,
         )
 
@@ -1108,11 +1116,13 @@ def sdr_factory(device=None):
     """An SDR factory that records its calls and hands back one device."""
     device = device or FakeSdr()
 
-    def build(config):
+    def build(config, branch=None):
         build.calls.append(config)
+        build.branches.append(branch)
         return device
 
     build.calls = []
+    build.branches = []
     build.device = device
     return build
 
@@ -2095,22 +2105,83 @@ class TestOpenSdr:
 
         assert _open_sdr(config).index == 1
 
-    def test_two_branches_say_out_loud_that_one_is_opened(self, tmp_path, on_the_bus, capsys):
-        # Silence here would look exactly like dual-branch receive
-        # working.
+    def test_an_explicit_branch_overrides_the_default_one(self, tmp_path, on_the_bus):
+        # What the receive path does: it opens every branch by name
+        # rather than taking whichever the single-device commands would.
+        on_the_bus("LEFT", "RIGHT")
+        config = config_with(tmp_path, TWO_BRANCHES)
+
+        opened = [_open_sdr(config, branch).index for branch in config.sdr.branches]
+
+        assert opened == [1, 0]
+
+    def test_it_prints_nothing(self, tmp_path, on_the_bus, capsys):
+        # A factory has no business writing to the console, and the
+        # receive path calls this once per branch, where a note about
+        # opening one of two would be false.
         on_the_bus("LEFT", "RIGHT")
 
         _open_sdr(config_with(tmp_path, TWO_BRANCHES))
+
+        assert capsys.readouterr().out == ""
+
+
+class TestSingleDeviceNote:
+    """What a one-device command says on a station cabled for two."""
+
+    def test_it_names_the_branch_it_took(self, tmp_path, capsys):
+        # Silence here would look exactly like both branches being used.
+        _note_single_device(config_with(tmp_path, TWO_BRANCHES))
 
         out = capsys.readouterr().out
         assert "A - Arrow V" in out
         assert "RIGHT" in out
 
-    def test_one_branch_says_nothing(self, tmp_path, on_the_bus, capsys):
-        on_the_bus("LEFT")
-        _open_sdr(config_with(tmp_path, '\n[[sdr.branch]]\nserial = "LEFT"\nlabel = "B"\n'))
+    def test_one_branch_says_nothing(self, tmp_path, capsys):
+        _note_single_device(
+            config_with(tmp_path, '\n[[sdr.branch]]\nserial = "LEFT"\nlabel = "B"\n')
+        )
 
         assert capsys.readouterr().out == ""
+
+    def test_no_branches_says_nothing(self, tmp_path, capsys):
+        _note_single_device(config_with(tmp_path, "\n[sdr]\ndevice_index = 1\n"))
+
+        assert capsys.readouterr().out == ""
+
+
+class TestListeningIndex:
+    """Which branch --listen selects."""
+
+    def test_no_flag_takes_the_first_declared(self, tmp_path):
+        config = config_with(tmp_path, TWO_BRANCHES)
+
+        assert _listening_index(None, config.sdr.branches) == 0
+
+    def test_a_label_selects_its_branch(self, tmp_path):
+        config = config_with(tmp_path, TWO_BRANCHES)
+
+        assert _listening_index("B - Arrow H", config.sdr.branches) == 1
+
+    def test_an_unknown_label_lists_the_real_ones(self, tmp_path):
+        config = config_with(tmp_path, TWO_BRANCHES)
+
+        with pytest.raises(ValueError, match="A - Arrow V"):
+            _listening_index("Arrow V", config.sdr.branches)
+
+    def test_matching_is_exact(self, tmp_path):
+        # Labels have spaces in them and come from a file nobody has
+        # open at the time, so a near miss must not silently succeed.
+        config = config_with(tmp_path, TWO_BRANCHES)
+
+        with pytest.raises(ValueError):
+            _listening_index("b - arrow h", config.sdr.branches)
+
+    def test_a_station_with_no_branches_has_one_unnamed_one(self, tmp_path):
+        config = config_with(tmp_path, "\n[sdr]\n")
+
+        assert _listening_index(None, _declared_branches(config)) == 0
+        assert _listening_index(UNNAMED_BRANCH_LABEL, _declared_branches(config)) == 0
 
 
 class TestSdrPpm:
@@ -2126,3 +2197,257 @@ class TestSdrPpm:
         )
 
         assert _sdr_ppm(config) == -3
+
+
+# ---------------------------------------------------------------------------
+# Opening a device per branch
+# ---------------------------------------------------------------------------
+
+
+def branch_sdr_factory():
+    """A factory that hands out a distinct device per branch and records both."""
+
+    def build(config, branch=None):
+        device = FakeSdr(
+            index=len(build.opened),
+            serial="none" if branch is None else branch.serial,
+        )
+        build.opened.append(branch)
+        build.devices.append(device)
+        return device
+
+    build.opened = []
+    build.devices = []
+    return build
+
+
+def receive_args(tle_path, *extra):
+    return build_parser().parse_args(
+        ["receive", "--tle", str(tle_path), "--downlink", "145.95", "--gain", "32.8", *extra]
+    )
+
+
+def capturing_runner():
+    """Stand in for _run_receive, keeping what it was handed."""
+
+    def run(args, config, satellite, radios, listening, *, loop=None):
+        run.radios = radios
+        run.listening = listening
+        return 0
+
+    run.radios = None
+    run.listening = None
+    return run
+
+
+class TestReceiveOpensEveryBranch:
+    def test_a_station_with_no_branches_opens_one_unnamed_device(self, tmp_path, tle_path):
+        # The path every config written before branches existed takes,
+        # and it goes through the same code as a two-branch station
+        # rather than around it.
+        config = config_with(tmp_path, "\n[sdr]\n")
+        factory = branch_sdr_factory()
+        runner = capturing_runner()
+
+        code = _command_receive(receive_args(tle_path), config, None, factory, runner=runner)
+
+        assert code == 0
+        assert factory.opened == [None]
+        assert [radio.label for radio in runner.radios] == [UNNAMED_BRANCH_LABEL]
+
+    def test_two_branches_open_two_devices_named_by_serial(self, tmp_path, tle_path):
+        config = config_with(tmp_path, TWO_BRANCHES)
+        factory = branch_sdr_factory()
+        runner = capturing_runner()
+
+        _command_receive(receive_args(tle_path), config, None, factory, runner=runner)
+
+        assert [branch.serial for branch in factory.opened] == ["RIGHT", "LEFT"]
+        assert [radio.label for radio in runner.radios] == ["A - Arrow V", "B - Arrow H"]
+
+    def test_every_device_is_configured(self, tmp_path, tle_path):
+        config = config_with(tmp_path, TWO_BRANCHES)
+        factory = branch_sdr_factory()
+
+        _command_receive(receive_args(tle_path), config, None, factory, runner=capturing_runner())
+
+        assert [len(device.configured) for device in factory.devices] == [1, 1]
+
+    def test_each_branch_is_tuned_with_its_own_ppm(self, tmp_path, tle_path):
+        # A crystal correction belongs to one oscillator. The first
+        # branch declares 4; the second declares none and falls back to
+        # the station's -3.
+        config = config_with(tmp_path, "\n[sdr]\nppm = -3\n" + TWO_BRANCHES)
+        factory = branch_sdr_factory()
+
+        _command_receive(receive_args(tle_path), config, None, factory, runner=capturing_runner())
+
+        assert [device.configured[0].ppm for device in factory.devices] == [4, -3]
+
+    def test_every_branch_gets_its_own_squelch_and_tracker(self, tmp_path, tle_path):
+        # Both are stateful or tuner-specific, and sharing either would
+        # mix two radios into one decision.
+        config = config_with(tmp_path, TWO_BRANCHES)
+        runner = capturing_runner()
+
+        _command_receive(receive_args(tle_path), config, None, branch_sdr_factory(), runner=runner)
+
+        first, second = runner.radios
+        assert first.squelch is not second.squelch
+        assert first.doppler is not second.doppler
+
+    def test_it_closes_every_device_it_opened(self, tmp_path, tle_path):
+        config = config_with(tmp_path, TWO_BRANCHES)
+        factory = branch_sdr_factory()
+
+        _command_receive(receive_args(tle_path), config, None, factory, runner=capturing_runner())
+
+        assert [device.is_open for device in factory.devices] == [False, False]
+
+    def test_the_first_branch_is_heard_by_default(self, tmp_path, tle_path):
+        config = config_with(tmp_path, TWO_BRANCHES)
+        runner = capturing_runner()
+
+        _command_receive(receive_args(tle_path), config, None, branch_sdr_factory(), runner=runner)
+
+        assert runner.listening == 0
+
+    def test_listen_selects_a_branch_by_label(self, tmp_path, tle_path):
+        config = config_with(tmp_path, TWO_BRANCHES)
+        runner = capturing_runner()
+
+        _command_receive(
+            receive_args(tle_path, "--listen", "B - Arrow H"),
+            config,
+            None,
+            branch_sdr_factory(),
+            runner=runner,
+        )
+
+        assert runner.listening == 1
+
+    def test_an_unknown_listen_label_fails_before_any_device_opens(
+        self, tmp_path, tle_path, capsys
+    ):
+        # Checked before the hardware, so a mistyped label costs nothing
+        # and the message can list the real ones.
+        config = config_with(tmp_path, TWO_BRANCHES)
+        factory = branch_sdr_factory()
+
+        code = _command_receive(
+            receive_args(tle_path, "--listen", "Arrow H"),
+            config,
+            None,
+            factory,
+            runner=capturing_runner(),
+        )
+
+        assert code == 2
+        assert factory.opened == []
+        assert "A - Arrow V" in capsys.readouterr().err
+
+    def test_it_says_which_branch_is_being_heard(self, tmp_path, tle_path, capsys):
+        config = config_with(tmp_path, TWO_BRANCHES)
+
+        _command_receive(
+            receive_args(tle_path, "--listen", "B - Arrow H"),
+            config,
+            None,
+            branch_sdr_factory(),
+            runner=capturing_runner(),
+        )
+
+        out = capsys.readouterr().out
+        assert "B - Arrow H <- audio" in out
+        assert "A - Arrow V\n" in out
+
+
+def branch_capturing_runner(*, window):
+    """Stand in for _run_receive, building the branches where it does.
+
+    Inside the runner rather than after it, because that is the only
+    place the devices are still open -- _command_receive holds them in
+    an ExitStack, and an IqStream over a closed device refuses.
+    """
+
+    def run(args, config, satellite, radios, listening, *, loop=None):
+        run.branches = _build_branches(args, radios, listening, window=window)
+        run.listening = listening
+        return 0
+
+    run.branches = None
+    run.listening = None
+    return run
+
+
+class TestBranchWiring:
+    """What _build_branches hands each branch, which no bench run can see.
+
+    Both branches are tuned to the same downlink, so their waterfalls are
+    pixel-for-pixel identical -- looking at the window cannot tell you
+    which one is feeding it. That makes this the wrong claim to check at
+    the bench and the right one to check here.
+    """
+
+    def branches(self, tmp_path, tle_path, *extra, window=True):
+        runner = branch_capturing_runner(window=window)
+        _command_receive(
+            receive_args(tle_path, *extra),
+            config_with(tmp_path, TWO_BRANCHES),
+            None,
+            branch_sdr_factory(),
+            runner=runner,
+        )
+        return runner.branches, runner.listening
+
+    def test_the_waterfall_goes_to_the_branch_being_heard(self, tmp_path, tle_path):
+        branches, listening = self.branches(
+            tmp_path, tle_path, "--listen", "B - Arrow H", "--window"
+        )
+
+        assert listening == 1
+        assert branches[1].spectrum is not None
+        assert branches[0].spectrum is None
+
+    def test_the_first_branch_gets_it_by_default(self, tmp_path, tle_path):
+        branches, _ = self.branches(tmp_path, tle_path, "--window")
+
+        assert branches[0].spectrum is not None
+        assert branches[1].spectrum is None
+
+    def test_no_window_means_no_spectrum_on_any_branch(self, tmp_path, tle_path):
+        # A headless run must not compute frames nobody will see, on
+        # either branch.
+        branches, _ = self.branches(tmp_path, tle_path, window=False)
+
+        assert [branch.spectrum for branch in branches] == [None, None]
+
+    def test_every_branch_is_labelled_from_config(self, tmp_path, tle_path):
+        branches, _ = self.branches(tmp_path, tle_path, window=False)
+
+        assert [branch.label for branch in branches] == ["A - Arrow V", "B - Arrow H"]
+
+
+class TestWindowTitle:
+    """The title is the only thing on screen that names the branch."""
+
+    def test_one_branch_is_not_labelled(self, tmp_path, tle_path):
+        # A label would be noise on a station with one dongle.
+        session = SimpleNamespace(branches=(object(),), listening=None)
+
+        title = _window_title(SimpleNamespace(name="AO-91"), session)
+
+        assert title == "QSOrbit - receiving AO-91"
+
+    def test_two_branches_name_the_one_being_heard(self, tmp_path, tle_path):
+        # Without this, --listen has no visible effect whatever: both
+        # branches are tuned to the same downlink, so their waterfalls
+        # are identical and nothing on screen distinguishes them.
+        session = SimpleNamespace(
+            branches=(object(), object()),
+            listening=SimpleNamespace(label="B - Arrow H"),
+        )
+
+        title = _window_title(SimpleNamespace(name="AO-91"), session)
+
+        assert title == "QSOrbit - receiving AO-91 on B - Arrow H"

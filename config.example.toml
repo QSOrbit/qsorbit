@@ -394,6 +394,11 @@ ppm = 0
 # rejected rather than one of them silently ignored, so delete
 # device_index above if you uncomment these.
 #
+# With two declared, `receive` and `shell` open both and demodulate
+# both. The first one listed is the one you hear; `--listen "B - Arrow
+# H"` picks the other. The one you are hearing is also the one the
+# waterfall shows.
+#
 #[[sdr.branch]]
 #serial = "LEFT"
 #label = "A - Arrow V"
