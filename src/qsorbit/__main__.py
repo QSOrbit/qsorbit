@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Final, Protocol
 
 from qsorbit import __version__
+from qsorbit.core.combiner import DEFAULT_MARGIN_DB, BranchSelector
 from qsorbit.core.dsp import (
     DEFAULT_AUDIO_RATE_HZ,
     DEFAULT_CLOSE_BELOW_DB,
@@ -663,6 +664,28 @@ def _add_radio_arguments(parser: argparse.ArgumentParser, *, required: bool) -> 
             "branch demodulates and measures either way -- this chooses what "
             "you hear, and the waterfall follows it. Means nothing on a "
             "station with one dongle, which has one branch."
+        ),
+    )
+    parser.add_argument(
+        "--combine",
+        action="store_true",
+        help=(
+            "Let the combiner choose which branch you hear, switching when "
+            "another beats it by the margin. Off by default, and deliberately: "
+            "'combined beats either branch alone' is a comparison, and the "
+            "control for it is this same command without this flag."
+        ),
+    )
+    parser.add_argument(
+        "--combine-margin",
+        type=float,
+        default=DEFAULT_MARGIN_DB,
+        metavar="DB",
+        help=(
+            f"How far a branch must beat the current one before the speaker "
+            f"moves (default {DEFAULT_MARGIN_DB:.1f} dB, measured rather than "
+            "assumed - see core/combiner.py). Zero means no hysteresis at all, "
+            "which is the control that shows why hysteresis is needed."
         ),
     )
     parser.add_argument(
@@ -1506,6 +1529,13 @@ def _readout_poll_interval_ms(args: argparse.Namespace, default_ms: int) -> int:
     return default_ms
 
 
+def _build_selector(args: argparse.Namespace) -> BranchSelector | None:
+    """The combiner, or ``None`` when this run holds one branch fixed."""
+    if not args.combine:
+        return None
+    return BranchSelector(margin_db=args.combine_margin)
+
+
 def _open_quieting_log(args: argparse.Namespace) -> QuietingLog | None:
     """Open the quieting log if one was asked for, else ``None``.
 
@@ -1844,6 +1874,7 @@ def _run_receive(
         # instead of its own profile's.
         range_rate=TargetRangeRate(satellite, config.observer),
         listening=listening,
+        selector=_build_selector(args),
         tracking_interval_s=_range_rate_interval(args),
     )
 
@@ -2505,6 +2536,7 @@ def _run_shell(
         ),
         range_rate=TargetRangeRate(satellite, config.observer),
         listening=listening,
+        selector=_build_selector(args),
         tracking_interval_s=_range_rate_interval(args),
     )
 
