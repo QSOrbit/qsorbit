@@ -56,12 +56,95 @@ from __future__ import annotations
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Final
 
 #: The switching margin, in dB of quieting. Derived in the module
 #: docstring from measurement rather than assumed; see there before
 #: changing it.
 DEFAULT_MARGIN_DB: Final = 3.0
+
+
+@dataclass(frozen=True)
+class BranchReading:
+    """One branch's most recent quieting measurement, and when it was taken.
+
+    Args:
+        quieting_db: The measurement.
+        at: The **block midpoint** the measurement describes -- the
+            instant halfway through the samples it was computed from, not
+            the wall-clock instant the decision is being made. Two
+            branches receiving the same sky stamp near-identical
+            midpoints (the acceptance capture paired them to within
+            1.0 ms), so a midpoint is what lets :func:`pair_simultaneous`
+            decide whether two branches' readings describe the same
+            moment.
+    """
+
+    quieting_db: float
+    at: datetime
+
+
+def pair_simultaneous(
+    current: str,
+    latest: Mapping[str, BranchReading | None],
+    *,
+    tolerance_s: float,
+) -> dict[str, float | None]:
+    """Reduce per-branch readings to what :meth:`BranchSelector.choose` may compare.
+
+    ``choose`` is a pure comparison of magnitudes and stays that way; it
+    has no way to know that two numbers it is handed came from blocks
+    tens of milliseconds apart. **That gap is the whole defect this
+    guards.** The switching margin was measured on the difference between
+    *simultaneous* branch readings, so a difference built from
+    non-simultaneous ones is not the quantity the margin sizes -- and on
+    the 2026-09-06 acceptance pass a one-block skew reached 3.09 dB where
+    no simultaneous pair ever exceeded 2.93 dB, manufacturing the run's
+    only switch.
+
+    Args:
+        current: The branch holding the speaker now.
+        latest: Each branch's most recent reading, or ``None`` for a
+            branch with no fresh one -- the caller has already applied
+            staleness, exactly as it does for :meth:`BranchSelector.choose`.
+        tolerance_s: How far apart two block midpoints may be and still
+            count as the same moment. One half of a block period cleanly
+            separates aligned blocks (~1 ms apart, measured) from the
+            block behind (~one full period).
+
+    Returns:
+        A ``{label: quieting_db | None}`` mapping to hand straight to
+        :meth:`BranchSelector.choose`. ``None`` here means "no opinion
+        for this comparison" -- the same contract ``choose`` already
+        reads ``None`` under.
+
+    Two rules, and the first is the one the incumbent depends on:
+
+    1. **The incumbent's own reading is always kept.** Simultaneity gates
+       *challengers*; nulling the current branch for it would make an
+       alive incumbent look dead and hand its speaker away on rule 2 of
+       ``choose`` -- a spurious switch worse than the skew. When the
+       incumbent has genuinely stopped (``None`` in ``latest``), every
+       survivor is kept instead, because there is no incumbent block left
+       to be simultaneous with and the handoff must still happen.
+    2. **A challenger is kept only if its block is within ``tolerance_s``
+       of the incumbent's block.** Alive but not simultaneous is
+       ``None``: a real difference will switch the moment a simultaneous
+       block confirms it, one block later.
+    """
+    incumbent = latest.get(current)
+    readings: dict[str, float | None] = {}
+    for label, reading in latest.items():
+        if reading is None:
+            readings[label] = None
+        elif label == current or incumbent is None:
+            readings[label] = reading.quieting_db
+        elif abs((reading.at - incumbent.at).total_seconds()) <= tolerance_s:
+            readings[label] = reading.quieting_db
+        else:
+            readings[label] = None
+    return readings
 
 
 @dataclass(frozen=True)
