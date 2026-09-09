@@ -17,12 +17,16 @@ measured at the bench rather than assumed. See
 
 from qsorbit.core.combiner.selector import (
     DEFAULT_MARGIN_DB,
+    BranchReading,
     BranchSelector,
     SelectorStats,
+    pair_simultaneous,
 )
 
 __all__ = [
     "DEFAULT_MARGIN_DB",
+    "BranchReading",
     "BranchSelector",
     "SelectorStats",
+    "pair_simultaneous",
 ]

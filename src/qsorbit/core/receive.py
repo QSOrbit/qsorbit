@@ -99,7 +99,12 @@ from typing import Final, Protocol
 
 import numpy as np
 
-from qsorbit.core.combiner import BranchSelector, SelectorStats
+from qsorbit.core.combiner import (
+    BranchReading,
+    BranchSelector,
+    SelectorStats,
+    pair_simultaneous,
+)
 from qsorbit.core.dsp.audio import AudioOutput, AudioStats
 from qsorbit.core.dsp.demod import NbfmConfig, demodulate_nbfm
 from qsorbit.core.dsp.iq import unpack_uint8_iq
@@ -132,6 +137,14 @@ DEFAULT_TRACKING_INTERVAL_S: Final = 1.0
 #: contention, short enough that a radio which has actually stopped
 #: cannot hold the speaker for a meaningful part of a pass.
 DEFAULT_STALE_AFTER_S: Final = 2.0
+
+#: How close two branches' block midpoints must be to count as the same
+#: moment, as a fraction of one block period. Half a block cleanly
+#: separates aligned blocks (~1 ms apart, measured on the acceptance
+#: capture) from the block behind (~one full period), which is the skew
+#: that manufactured a switch on 2026-09-06. See
+#: :func:`~qsorbit.core.combiner.pair_simultaneous`.
+PAIRING_WINDOW_FRACTION: Final = 0.5
 
 #: How long :meth:`ReceiveSession.stop` waits for each of its threads.
 #: The demodulating thread checks for the stop signal between blocks, so
@@ -432,6 +445,12 @@ class Branch:
         # elapsed comparison, and monotonic cannot be moved by an NTP
         # step in the middle of a pass.
         self._last_block_at: float | None = None
+        # The most recent quieting measurement paired with the block
+        # midpoint it describes -- the combiner needs both together to
+        # tell whether two branches' readings are simultaneous. Stored
+        # atomically under the lock so the value and its timestamp can
+        # never be read torn apart.
+        self._last_reading: BranchReading | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -472,30 +491,49 @@ class Branch:
             return None
         return self._squelch.stats.last_quieting_db
 
-    def fresh_quieting_db(self, *, now: float, stale_after_s: float) -> float | None:
-        """This branch's quieting, or ``None`` if it has stopped producing.
+    def latest_reading(self, *, now: float, stale_after_s: float) -> BranchReading | None:
+        """This branch's most recent reading, or ``None`` if it has stopped.
 
         Args:
             now: A ``time.monotonic()`` reading.
             stale_after_s: How long without a block counts as stopped.
 
         Returns:
-            The most recent measurement, or ``None``.
+            The most recent quieting measurement paired with the block
+            midpoint it describes, or ``None``.
 
         **The staleness check is the point of this method existing at
-        all.** A branch whose radio has died keeps reporting its last
-        measurement forever, and by value alone a stale reading is
-        indistinguishable from a live one — so a combiner reading
-        :attr:`live_quieting_db` directly could hold the speaker on a
-        dead radio for the rest of a pass, with a plausible number on
-        the meter the whole time. ``None`` here is what lets the
-        selector move the ear away instead.
+        all.** A branch whose radio has died keeps its last measurement
+        forever, and by value alone a stale reading is indistinguishable
+        from a live one, so a combiner reading it directly could hold
+        the speaker on a dead radio for the rest of a pass with a
+        plausible number on the meter the whole time. ``None`` here is
+        what lets the selector move the ear away instead.
+
+        The value and its block midpoint are read together under the
+        lock, so the combiner can never pair one branch's quieting with
+        another branch's timestamp, which is exactly the mistake the
+        simultaneity guard exists to prevent and would be a poor thing
+        to reintroduce through a torn read.
         """
         with self._lock:
             last = self._last_block_at
+            reading = self._last_reading
         if last is None or (now - last) > stale_after_s:
             return None
-        return self.live_quieting_db
+        return reading
+
+    def fresh_quieting_db(self, *, now: float, stale_after_s: float) -> float | None:
+        """This branch's quieting value alone, or ``None`` if it has stopped.
+
+        A thin wrapper over :meth:`latest_reading` for callers that want
+        the magnitude without the timestamp (the per-branch readout, and
+        the tests that predate the combiner's simultaneity guard). The
+        combiner itself takes the whole :class:`BranchReading`, because
+        it needs the block midpoint to pair branches.
+        """
+        reading = self.latest_reading(now=now, stale_after_s=stale_after_s)
+        return None if reading is None else reading.quieting_db
 
     @property
     def live_squelch_open(self) -> bool | None:
@@ -589,6 +627,10 @@ class Branch:
         with self._lock:
             self._blocks_demodulated += 1
             self._last_block_at = time.monotonic()
+            if self._squelch is not None:
+                quieting_db = self._squelch.stats.last_quieting_db
+                if quieting_db is not None:
+                    self._last_reading = BranchReading(quieting_db=quieting_db, at=block.midpoint)
         if self._log is not None and self._squelch is not None:
             quieting_db = self._squelch.stats.last_quieting_db
             if quieting_db is not None:
@@ -758,31 +800,41 @@ class ReceiveSession:
         """The combiner, or ``None`` if this run has a fixed branch."""
         return self._selector
 
-    def _reselect(self) -> None:
+    def _reselect(self, tolerance_s: float) -> None:
         """Let the combiner move the speaker, if there is one.
 
         Called from every demodulating thread after that thread's branch
         has demodulated, so decisions happen at about twice the block
         rate on a two-branch station.
 
-        **The readings one thread sees may be one block stale on the
-        other branch** -- roughly 64 ms at 2.048 Msps. That is an
-        accepted approximation rather than an oversight: the measured
-        difference between branches wanders with a lag-1 autocorrelation
-        around 0.5, so a neighbouring block's reading is close to the
-        current one, and the margin it is being compared against is
-        several times the whole measurement's standard deviation.
+        **Simultaneity is decided here, not in the selector.** Each
+        branch reports its most recent reading together with the block
+        midpoint it describes; :func:`~qsorbit.core.combiner.pair_simultaneous`
+        then withholds any challenger whose block is not within
+        ``tolerance_s`` of the branch currently holding the ear, so the
+        selector only ever compares readings that describe the same
+        moment. Comparing a branch's reading against another branch's
+        *neighbouring* block is what let a one-block skew cross the
+        margin on 2026-09-06 and manufacture the run's only switch --
+        the same class of error, one level deeper, as reading a level
+        off the wrong branch.
+
+        ``tolerance_s`` is passed in from the triggering block's own
+        duration rather than stored, because it is a fact about the data
+        rate and the caller is holding the block.
         """
         if self._selector is None:
             return
         with self._select_lock:
             now = time.monotonic()
-            readings = {
-                branch.label: branch.fresh_quieting_db(now=now, stale_after_s=self._stale_after_s)
+            current_label = self._listening.label
+            latest = {
+                branch.label: branch.latest_reading(now=now, stale_after_s=self._stale_after_s)
                 for branch in self._branches
             }
-            chosen = self._selector.choose(self._listening.label, readings)
-            if chosen != self._listening.label:
+            readings = pair_simultaneous(current_label, latest, tolerance_s=tolerance_s)
+            chosen = self._selector.choose(current_label, readings)
+            if chosen != current_label:
                 self.listen_to(self._by_label[chosen])
 
     @property
@@ -1081,8 +1133,9 @@ class ReceiveSession:
                 audio = branch.demodulate(block)
                 # Decided BEFORE the listened check, so a switch takes
                 # effect on the very block that justified it rather than
-                # the next one.
-                self._reselect()
+                # the next one. The block's own duration sets how close
+                # two branches' readings must be to count as simultaneous.
+                self._reselect(block.duration_s * PAIRING_WINDOW_FRACTION)
                 # Read per block rather than captured once, so a live
                 # switch takes effect within one block.
                 if branch.listened:

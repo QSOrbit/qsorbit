@@ -11,10 +11,17 @@ directly instead of arranging for a device to stop.
 from __future__ import annotations
 
 import threading
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from qsorbit.core.combiner import DEFAULT_MARGIN_DB, BranchSelector, SelectorStats
+from qsorbit.core.combiner import (
+    DEFAULT_MARGIN_DB,
+    BranchReading,
+    BranchSelector,
+    SelectorStats,
+    pair_simultaneous,
+)
 
 
 class TestMargin:
@@ -207,3 +214,135 @@ class TestSelectorStats:
         described = stats.describe()
         assert "A - Arrow V 75.0%" in described
         assert "B - Arrow H 25.0%" in described
+
+
+# ---------------------------------------------------------------------------
+# Simultaneity: which readings choose() is even allowed to compare
+# ---------------------------------------------------------------------------
+
+#: A block period at the station's 2.048 Msps with 256 KiB blocks, and the
+#: half-block window the session pairs on. Real numbers, so the RS-44
+#: regression below is checked at the tolerance the live run used.
+_BLOCK_S = 0.064
+_TOL_S = _BLOCK_S * 0.5
+
+_T0 = datetime(2026, 9, 6, 1, 40, 0, tzinfo=UTC)
+
+
+def _at(offset_s: float) -> datetime:
+    return _T0 + timedelta(seconds=offset_s)
+
+
+class TestSimultaneousPairing:
+    """The gate that keeps a skewed pair from ever reaching the margin.
+
+    ``pair_simultaneous`` is a pure function of readings and their block
+    times, tested here without a session, a thread, or a radio -- the
+    same discipline as ``choose`` itself. Staleness has already been
+    applied by the caller, so a ``None`` in means a dead branch.
+    """
+
+    def test_an_aligned_challenger_is_kept(self):
+        latest = {
+            "A": BranchReading(quieting_db=2.0, at=_at(0.001)),
+            "B": BranchReading(quieting_db=-1.0, at=_at(0.000)),
+        }
+        readings = pair_simultaneous("B", latest, tolerance_s=_TOL_S)
+        assert readings == {"A": 2.0, "B": -1.0}
+
+    def test_a_skewed_challenger_is_withheld(self):
+        # A one-block-behind challenger is not a comparison: its reading
+        # describes a different moment than the incumbent's.
+        latest = {
+            "A": BranchReading(quieting_db=2.0, at=_at(_BLOCK_S)),
+            "B": BranchReading(quieting_db=-1.0, at=_at(0.000)),
+        }
+        readings = pair_simultaneous("B", latest, tolerance_s=_TOL_S)
+        assert readings == {"A": None, "B": -1.0}
+
+    def test_the_incumbent_is_never_withheld_for_skew(self):
+        # The incumbent defines the reference instant, so it is always
+        # kept -- nulling it would make an alive branch look dead and
+        # hand the ear away on choose()'s rule 2.
+        latest = {
+            "A": BranchReading(quieting_db=2.0, at=_at(_BLOCK_S)),
+            "B": BranchReading(quieting_db=-1.0, at=_at(0.000)),
+        }
+        readings = pair_simultaneous("B", latest, tolerance_s=_TOL_S)
+        assert readings["B"] == -1.0
+
+    def test_a_stopped_incumbent_keeps_every_survivor(self):
+        # Nothing left to be simultaneous with, and the handoff still has
+        # to happen, so simultaneity does not apply.
+        latest = {
+            "A": None,
+            "B": BranchReading(quieting_db=-1.0, at=_at(5.0)),
+            "C": BranchReading(quieting_db=4.0, at=_at(0.0)),
+        }
+        readings = pair_simultaneous("A", latest, tolerance_s=_TOL_S)
+        assert readings == {"A": None, "B": -1.0, "C": 4.0}
+
+    def test_a_dead_branch_stays_none(self):
+        latest = {
+            "A": BranchReading(quieting_db=2.0, at=_at(0.0)),
+            "B": None,
+        }
+        readings = pair_simultaneous("A", latest, tolerance_s=_TOL_S)
+        assert readings == {"A": 2.0, "B": None}
+
+    def test_exactly_at_the_window_still_counts(self):
+        latest = {
+            "A": BranchReading(quieting_db=2.0, at=_at(_TOL_S)),
+            "B": BranchReading(quieting_db=-1.0, at=_at(0.0)),
+        }
+        readings = pair_simultaneous("B", latest, tolerance_s=_TOL_S)
+        assert readings["A"] == 2.0
+
+
+class TestRs44SkewRegression:
+    """The 2026-09-06 acceptance pass, at the block pair that switched.
+
+    Numbers are from ``e-accept-rs44-a.csv`` (RS-44, TCA ~t=381 s), not a
+    reconstruction. The ear was on branch B. Branch A rose near TCA; at
+    t=377.078 A read +2.19 dB. Its *simultaneous* B block (t=377.094,
+    -0.64) is 2.83 dB away -- under the 3.0 dB margin. Its *one-block
+    earlier* B block (t=377.030, -0.90) is 3.09 dB away -- over it. The
+    run compared A against that earlier block and switched. It must not.
+    """
+
+    A = "A - Arrow V"
+    B = "B - Arrow H"
+
+    def test_the_skewed_pair_would_have_switched(self):
+        # The control: fed the skewed difference directly, choose() does
+        # switch. This is what the run did, and what the guard prevents.
+        selector = BranchSelector(margin_db=3.0)
+        assert selector.choose(self.B, {self.A: 2.19, self.B: -0.90}) == self.A
+
+    def test_the_guard_withholds_the_skewed_block(self):
+        # A's block at 377.078; B's latest is its 377.030 block, 48 ms
+        # earlier -- past the 32 ms window, so A is no comparison yet.
+        latest = {
+            self.A: BranchReading(quieting_db=2.19, at=_at(377.078)),
+            self.B: BranchReading(quieting_db=-0.90, at=_at(377.030)),
+        }
+        readings = pair_simultaneous(self.B, latest, tolerance_s=_TOL_S)
+        assert readings == {self.A: None, self.B: -0.90}
+
+        selector = BranchSelector(margin_db=3.0)
+        assert selector.choose(self.B, readings) == self.B
+
+    def test_the_simultaneous_block_still_does_not_switch(self):
+        # One block later B produces its 377.094 block, 16 ms from A's --
+        # inside the window, a real comparison, and 2.83 dB apart, so the
+        # margin correctly holds. The guard does not merely defer the
+        # switch; simultaneously there was never one to make.
+        latest = {
+            self.A: BranchReading(quieting_db=2.19, at=_at(377.078)),
+            self.B: BranchReading(quieting_db=-0.64, at=_at(377.094)),
+        }
+        readings = pair_simultaneous(self.B, latest, tolerance_s=_TOL_S)
+        assert readings == {self.A: 2.19, self.B: -0.64}
+
+        selector = BranchSelector(margin_db=3.0)
+        assert selector.choose(self.B, readings) == self.B

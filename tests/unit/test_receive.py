@@ -1400,6 +1400,52 @@ class TestCombinerWiring:
         _, readings = stub.seen[-1]
         assert set(readings) == {"A", "B"}
 
+    def test_aligned_blocks_are_both_offered(self):
+        # When both branches' latest blocks share a midpoint, the
+        # selector may compare them -- both reach it as real numbers.
+        stub = StubSelector()
+        devices, session, audio = self.a_pair(selector=stub)
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
+        assert any(r.get("A") is not None and r.get("B") is not None for _, r in stub.seen), (
+            "aligned branches were not both offered to the selector"
+        )
+
+    def test_a_non_simultaneous_challenger_is_withheld(self):
+        # The skew defect, at the wiring level. Advancing only branch A
+        # puts its latest block one period ahead of B's, so the two are
+        # no longer the same moment. B is still alive -- fresh by the
+        # wall clock -- yet it must reach the selector as None, because a
+        # difference against a non-simultaneous block is what crossed the
+        # margin and switched on 2026-09-06.
+        stub = StubSelector()
+        devices, session, audio = self.a_pair(selector=stub)
+
+        session.start()
+        try:
+            step_both(devices, session, 1)
+            devices[0].step()
+            assert wait_until(
+                lambda: any(r.get("A") is not None and r.get("B") is None for _, r in stub.seen)
+            ), "a non-simultaneous challenger was not withheld"
+            # ...and it was withheld for skew, not for staleness: B is
+            # still a live branch at this instant.
+            assert (
+                session.branches[1].latest_reading(now=time.monotonic(), stale_after_s=2.0)
+                is not None
+            )
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
     def test_its_answer_moves_the_speaker(self):
         # The claim the pure-function tests cannot make: a decision has
         # to actually reach listen_to().
