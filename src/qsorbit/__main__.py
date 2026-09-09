@@ -50,7 +50,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Final, Protocol
+from typing import TYPE_CHECKING, Final, Protocol
 
 from qsorbit import __version__
 from qsorbit.core.combiner import DEFAULT_MARGIN_DB, BranchSelector
@@ -120,6 +120,9 @@ from qsorbit.core.tracking_profile import (
 )
 from qsorbit.core.tracking_thread import TrackingThread
 from qsorbit.ui.theme import DEFAULT_THEME_NAME
+
+if TYPE_CHECKING:
+    from qsorbit.ui.feed_hub import FeedHub
 
 #: How long ``point --send`` waits for the rotor to settle, in seconds.
 DEFAULT_ARRIVAL_TIMEOUT_S = 90.0
@@ -2499,6 +2502,40 @@ def _run_shell_tracking_only(
     return 0
 
 
+def _receive_shell_hub(
+    session: ReceiveSession,
+    loop: TrackingLoop | None,
+    ticker: TrackingThread | None,
+    tracking_profiles: tuple[TrackingProfile, ...],
+) -> FeedHub:
+    """Build the feed hub for the receive-path shell.
+
+    Extracted so this path and the rotor-only path
+    (:func:`_run_shell_tracking_only`) cannot silently disagree about
+    what the hub carries -- which they did. This one was constructed
+    inline without ``tracking_profiles``, so the Rotor tab reported
+    "declare at least two profiles" on a station that declares three, on
+    the one configuration Chunk E's acceptance runs in (receive path,
+    rotor attached), while the rotor-only path was wired correctly. A
+    named builder is one place to get the wiring right and one place to
+    test it.
+    """
+    from qsorbit.ui.feed_hub import FeedHub
+
+    return FeedHub(
+        spectrum=session.spectrum,
+        radio=session,
+        tracking=loop,
+        tracking_fault=ticker.fault if ticker is not None else _no_tracking_fault,
+        tracking_profiles=tracking_profiles,
+        # Every branch, not just the one being heard. `radio=session`
+        # already publishes the listening branch's levels; a per-branch
+        # display needs the ones nobody is listening to, because those
+        # are where a fade shows up before the combiner acts on it.
+        branches=session.branches,
+    )
+
+
 def _run_shell(
     args: argparse.Namespace,
     config: StationConfig,
@@ -2532,7 +2569,6 @@ def _run_shell(
     """
     from PySide6.QtWidgets import QApplication
 
-    from qsorbit.ui.feed_hub import FeedHub
     from qsorbit.ui.shell_window import ShellWindow
 
     track_log = TrackLog(args.track_log) if args.track_log is not None else None
@@ -2556,17 +2592,7 @@ def _run_shell(
 
     app = QApplication.instance() or QApplication([])
     themes = _shell_theme(args)
-    hub = FeedHub(
-        spectrum=session.spectrum,
-        radio=session,
-        tracking=loop,
-        tracking_fault=ticker.fault if ticker is not None else _no_tracking_fault,
-        # Every branch, not just the one being heard. `radio=session`
-        # already publishes the listening branch's levels; a per-branch
-        # display needs the ones nobody is listening to, because those
-        # are where a fade shows up before the combiner acts on it.
-        branches=session.branches,
-    )
+    hub = _receive_shell_hub(session, loop, ticker, config.tracking.profiles)
     print(hub.describe())
     print(
         "Receiving - Ctrl-C to stop."
