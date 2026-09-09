@@ -491,6 +491,22 @@ class Branch:
             return None
         return self._squelch.stats.last_quieting_db
 
+    @property
+    def has_produced(self) -> bool:
+        """Whether this branch has ever demodulated a block.
+
+        The distinction the combiner needs at startup: a branch that has
+        not produced yet is not a branch that has stopped. ``None`` from
+        :meth:`latest_reading` cannot tell the two apart -- both read as
+        "no opinion" -- so the session gates on this instead, holding the
+        ear on the branch it started on until every branch is under way.
+        Monotonic: once a block has arrived this is true for the rest of
+        the run, so a branch that later goes silent is a *stale* branch,
+        judged by :meth:`latest_reading` as before.
+        """
+        with self._lock:
+            return self._last_block_at is not None
+
     def latest_reading(self, *, now: float, stale_after_s: float) -> BranchReading | None:
         """This branch's most recent reading, or ``None`` if it has stopped.
 
@@ -824,6 +840,20 @@ class ReceiveSession:
         rate and the caller is holding the block.
         """
         if self._selector is None:
+            return
+        # Startup: until every branch has produced a block, the ear stays
+        # on the branch it started on (the declared first, or --listen's
+        # branch). A branch that has not started yet is not one that has
+        # died, and handing the ear to whichever demod thread wins the
+        # race is the defect -- observed landing on the worse branch and
+        # staying there. Once all have produced, has_produced stays true,
+        # so a branch that later dies is a stale branch and choose()'s
+        # rule 2 hands the ear off exactly as before. The cost is that a
+        # branch which never produces a single block keeps the ear it
+        # started with rather than yielding it; the declared first branch
+        # is a rank choice, and a branch that never streams is a broken
+        # run, not a branch to switch away from mid-startup.
+        if not all(branch.has_produced for branch in self._branches):
             return
         with self._select_lock:
             now = time.monotonic()
