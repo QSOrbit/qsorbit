@@ -172,8 +172,18 @@ class TestFormatOutcome:
     def test_commanded(self):
         assert format_outcome(TickOutcome.COMMANDED) == "commanded"
 
-    def test_within_deadband_reads_as_two_words(self):
-        assert format_outcome(TickOutcome.WITHIN_DEADBAND) == "within deadband"
+    def test_within_deadband_describes_the_target_not_the_axis(self):
+        # "within deadband" read as a claim that the axis was within the
+        # deadband of the target -- arrived -- but the tick only checked
+        # that the target moved less than a deadband since the last
+        # command, and never read the axis. It showed steadily while the
+        # rotor was 126 deg off, mid-slew. The label must not assert the
+        # axis has arrived.
+        phrase = format_outcome(TickOutcome.WITHIN_DEADBAND)
+        assert phrase == "target steady"
+        assert "deadband" not in phrase
+        # The machine token in the track log is deliberately unchanged.
+        assert TickOutcome.WITHIN_DEADBAND.value == "within_deadband"
 
     def test_below_horizon_reads_as_two_words(self):
         assert format_outcome(TickOutcome.BELOW_HORIZON) == "below horizon"
