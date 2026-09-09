@@ -1376,13 +1376,17 @@ class TestCombinerWiring:
 
         session.start()
         try:
+            # The first block per branch is the startup gate: the
+            # selector is held off until both branches have produced one,
+            # so decisions accrue from the second block onward -- one per
+            # demodulated block per branch.
             step_both(devices, session, 1)
+            step_both(devices, session, 2)
         finally:
             for device in devices:
                 device.finish()
             quietly_stop(session)
 
-        # One decision per demodulated block per branch.
         assert len(stub.seen) >= 2
 
     def test_it_is_handed_a_reading_for_every_branch(self):
@@ -1441,6 +1445,48 @@ class TestCombinerWiring:
                 session.branches[1].latest_reading(now=time.monotonic(), stale_after_s=2.0)
                 is not None
             )
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
+    def test_the_ear_holds_on_the_first_branch_until_both_have_started(self):
+        # The startup race. Branch A is on the ear at start (declared
+        # first). Before A has produced a block, B may already have one,
+        # and a rule that reads "A has no reading" as "A has died" hands
+        # B the ear -- landing on whichever demod thread wins, observed to
+        # be the worse branch. The selector must not even be consulted
+        # until every branch has produced a block.
+        stub = StubSelector(answers=["B"] * 8)  # would grab the ear if asked
+        devices, session, audio = self.a_pair(selector=stub)
+
+        session.start()
+        try:
+            devices[1].step()  # only B produces a block
+            assert wait_until(lambda: session.branches[1].stats.blocks_demodulated >= 1)
+            # A has not started. The selector has not been asked, and the
+            # ear has not moved off A.
+            assert stub.seen == [], "the selector was consulted before both branches started"
+            assert session.listening.label == "A"
+
+            # Now A produces too; selection resumes and the stub is asked,
+            # so the gate opened rather than latching the ear forever.
+            devices[0].step()
+            assert wait_until(lambda: session.branches[0].stats.blocks_demodulated >= 1)
+            assert wait_until(lambda: session.listening.label == "B")
+        finally:
+            for device in devices:
+                device.finish()
+            quietly_stop(session)
+
+    def test_has_produced_is_false_before_a_block_and_true_after(self):
+        devices, session, audio = self.a_pair(selector=StubSelector())
+
+        session.start()
+        try:
+            assert session.branches[0].has_produced is False
+            step_both(devices, session, 1)
+            assert session.branches[0].has_produced is True
         finally:
             for device in devices:
                 device.finish()
