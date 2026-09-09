@@ -38,6 +38,7 @@ from qsorbit.__main__ import (
     _quit_on_sigint,
     _range_rate_interval,
     _readout_poll_interval_ms,
+    _receive_shell_hub,
     _sdr_ppm,
     _spectrum_factory,
     _squelch_status_line,
@@ -1795,6 +1796,46 @@ def _profile(**overrides):
     }
     fields.update(overrides)
     return TrackingProfile(**fields)
+
+
+class TestReceiveShellHub:
+    """The receive-path feed hub, built by its own function.
+
+    Extracted from ``_run_shell`` so the receive path and the rotor-only
+    path cannot silently disagree about what the hub carries -- which
+    they did, and it is why these tests exist.
+    """
+
+    def test_it_carries_the_station_tracking_profiles(self):
+        # Regression. The receive-path hub was built inline without
+        # tracking_profiles, so the Rotor tab reported "declare at least
+        # two profiles" on a station that declared three, on the exact
+        # configuration Chunk E's acceptance runs in (receive path, rotor
+        # attached). The rotor-only path was wired correctly; this one
+        # had diverged.
+        from qsorbit.core.tracking_profile import TrackingProfile
+
+        session = SimpleNamespace(spectrum=None, branches=())
+        loop = SimpleNamespace(target=SimpleNamespace(name="RS-44"), latest_sample=None)
+        profiles = (
+            TrackingProfile(name="stock", deadband_deg=2.5, interval_s=1.0),
+            TrackingProfile(name="tracking", deadband_deg=0.25, interval_s=0.5),
+            TrackingProfile(name="fast", deadband_deg=0.3, interval_s=0.5),
+        )
+
+        hub = _receive_shell_hub(session, loop, None, profiles)
+
+        assert hub.rotor is not None
+        assert hub.rotor.profiles == profiles
+
+    def test_a_receive_run_without_a_rotor_still_builds_a_hub(self):
+        # No loop, no rotor feed, and no profiles to show -- a plain
+        # receive session, not an error.
+        session = SimpleNamespace(spectrum=None, branches=())
+
+        hub = _receive_shell_hub(session, None, None, ())
+
+        assert hub.rotor is None
 
 
 class TestPushProfileGains:
