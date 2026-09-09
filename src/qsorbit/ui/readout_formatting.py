@@ -176,9 +176,29 @@ def format_range(range_km: float, range_rate_km_s: float) -> str:
     return f"{range_km:.0f} km, {rate}"
 
 
+#: The phrase shown for an outcome whose enum value would mislead if
+#: printed verbatim. ``WITHIN_DEADBAND`` is the one: "within deadband"
+#: reads as a claim that the *axis* is within the deadband of the
+#: target -- that it has arrived -- but the tick only checked that the
+#: *target* moved less than a deadband since the last command. Nothing
+#: here reads the axis. During the 2026-09-06 pass the readout showed
+#: "within deadband" steadily while the rotor was still 126 deg from the
+#: target, mid-slew. The phrase names the quantity actually compared.
+_OUTCOME_PHRASES: dict[TickOutcome, str] = {
+    TickOutcome.WITHIN_DEADBAND: "target steady",
+}
+
+
 def format_outcome(outcome: TickOutcome) -> str:
-    """Format a tick's outcome as a short, readable phrase."""
-    return outcome.value.replace("_", " ")
+    """Format a tick's outcome as a short, readable phrase.
+
+    Most outcomes read straight off the enum value. The exceptions are
+    in :data:`_OUTCOME_PHRASES`, where the enum's own token would assert
+    something the tick never measured -- see that constant. The enum
+    *value* is unchanged, so the machine token written to the track log
+    stays ``within_deadband``; only the human-facing label moves.
+    """
+    return _OUTCOME_PHRASES.get(outcome, outcome.value.replace("_", " "))
 
 
 def readout_text(
