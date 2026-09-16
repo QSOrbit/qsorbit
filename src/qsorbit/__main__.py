@@ -86,6 +86,7 @@ from qsorbit.core.receive import (
     ReceiveSession,
     TargetRangeRate,
 )
+from qsorbit.core.recorder import IqRecorder, safe_filename
 from qsorbit.core.rotor import (
     HomingError,
     Position,
@@ -108,10 +109,17 @@ from qsorbit.core.sdr import (
     capture_to_file,
     index_for_serial,
 )
+from qsorbit.core.sdr.replay import ReplaySdr
 from qsorbit.core.stall_guard import StallGuard
 from qsorbit.core.station import ConfigError, SdrBranch, StationConfig, load_station_config
 from qsorbit.core.track_log import TrackLog
-from qsorbit.core.tracker import Pass, Satellite, TrackerError, predict_passes
+from qsorbit.core.tracker import (
+    ObserverLocation,
+    Pass,
+    Satellite,
+    TrackerError,
+    predict_passes,
+)
 from qsorbit.core.tracking_profile import (
     DESIGN_RATE_DEG_S,
     NOMINAL_TRACKING_RATE_DEG_S,
@@ -122,6 +130,7 @@ from qsorbit.core.tracking_thread import TrackingThread
 from qsorbit.ui.theme import DEFAULT_THEME_NAME
 
 if TYPE_CHECKING:
+    from qsorbit.core.sdr.stream import IqSubscription
     from qsorbit.ui.feed_hub import FeedHub
 
 #: How long ``point --send`` waits for the rotor to settle, in seconds.
@@ -535,6 +544,18 @@ def _add_shell_command(subcommands: argparse._SubParsersAction) -> None:
         ),
     )
     _add_radio_arguments(shell, required=False)
+    shell.add_argument(
+        "--at",
+        default=None,
+        metavar="TIME",
+        help=(
+            "Simulate a pass at this ISO 8601 time instead of tracking in real "
+            "time: the rotor follows the target's geometry as if it were then, so "
+            "you can check rotor behaviour without waiting for a live pass. Past "
+            "or future. Rotor-only -- cannot be combined with --downlink (simulate "
+            "the signal with a replay instead)."
+        ),
+    )
 
 
 def _add_radio_arguments(parser: argparse.ArgumentParser, *, required: bool) -> None:
@@ -714,6 +735,47 @@ def _add_radio_arguments(parser: argparse.ArgumentParser, *, required: bool) -> 
             "Sampling rides the thread that already owns the serial port, so "
             "it adds reads but no contention; a run without this flag pays "
             "nothing for it."
+        ),
+    )
+    parser.add_argument(
+        "--record-iq",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Record every branch's raw IQ to DIR while the pass runs: one "
+            ".iq file plus a sidecar per branch, named for the antenna. The "
+            "recorder is a consumer on each branch's stream, not a second "
+            "process, so it never contends with the demodulator for the "
+            "dongle - which is what lets a capture be made during the same "
+            "run that logs quieting and drives the rotor. Needs --downlink; "
+            "about 4 MB/s per branch, so check the disk before a long pass."
+        ),
+    )
+    parser.add_argument(
+        "--replay",
+        default=None,
+        metavar="LABEL=FILE.iq[,LABEL=FILE.iq]",
+        help=(
+            "Replay a captured .iq through the real receive path instead of "
+            "opening a radio, matching each branch by its config label - or a "
+            "bare FILE.iq for a single unnamed branch. The replay reports what "
+            "the file's sidecar says (a 1.024 Msps capture replays as 1.024 "
+            "even on a 2.048 station) and runs in real time, so audio plays "
+            "and the gate reacts as on the night. A diagnostic: it needs a "
+            "capture, which only --record-iq makes."
+        ),
+    )
+    parser.add_argument(
+        "--replay-attenuate",
+        default=None,
+        metavar="LABEL=DB[,LABEL=DB]",
+        help=(
+            "Attenuate a replayed branch by DB decibels (or a bare DB for a "
+            "single unnamed branch). The known-answer control: feed one "
+            "capture to both branches and pad one down, and a correct "
+            "combiner must sit on the un-padded branch throughout. Needs "
+            "--replay; the effect is a re-quantisation floor, so use a large "
+            "value (20+ dB) for a decisive difference."
         ),
     )
     parser.add_argument(
@@ -938,10 +1000,27 @@ def main(
             return _command_status(config, factory)
         if args.command == "sdr":
             return _command_sdr(args, config, sdr_factory or _open_sdr)
+        replay_factory: SdrFactory | None = None
+        if args.command in ("receive", "shell") and getattr(args, "replay", None):
+            try:
+                attenuation = (
+                    _parse_attenuation_map(args.replay_attenuate)
+                    if getattr(args, "replay_attenuate", None)
+                    else None
+                )
+                replay_factory = _replay_sdr_factory(_parse_replay_map(args.replay), attenuation)
+            except ValueError as exc:
+                print(f"{args.command}: {exc}", file=sys.stderr)
+                return 1
+        elif args.command in ("receive", "shell") and getattr(args, "replay_attenuate", None):
+            print(f"{args.command}: --replay-attenuate needs --replay.", file=sys.stderr)
+            return 1
         if args.command == "receive":
-            return _command_receive(args, config, factory, sdr_factory or _open_sdr)
+            return _command_receive(
+                args, config, factory, sdr_factory or replay_factory or _open_sdr
+            )
         if args.command == "shell":
-            return _command_shell(args, config, factory, sdr_factory or _open_sdr)
+            return _command_shell(args, config, factory, sdr_factory or replay_factory or _open_sdr)
         return _command_stop(config, factory)
     except HomingError as exc:
         # Its own state rather than a generic failure: nothing sent over
@@ -1561,6 +1640,27 @@ def _print_quieting_log(log: QuietingLog | None) -> None:
     log.close()
 
 
+def _print_recordings(session: ReceiveSession, record_dir: Path | None) -> None:
+    """Say where each branch's IQ went, if the run was recording.
+
+    The recorders wrote their own files and sidecars as the run stopped;
+    this only reports what landed, so a capture night ends with a visible
+    confirmation of exactly which files to trim rather than a silent
+    directory the operator has to go and check.
+    """
+    if record_dir is None:
+        return
+    recorders = [branch.recorder for branch in session.branches if branch.recorder is not None]
+    if not recorders:
+        return
+    print(f"Recorded IQ to {record_dir}:")
+    for recorder in recorders:
+        print(
+            f"  {recorder.label}: {recorder.bytes_written:,} bytes "
+            f"-> {recorder.iq_path.name} (+ {recorder.sidecar_path.name})"
+        )
+
+
 def _print_track_log(ticker: TrackingThread, log: TrackLog | None) -> None:
     """Report the track log and close it, if there was one.
 
@@ -1800,6 +1900,35 @@ def _tracking_profile(args: argparse.Namespace, config: StationConfig) -> Tracki
     return profile
 
 
+def _iq_recorder_factory(
+    radio: _Radio,
+    record_dir: Path,
+    station_hz: float | None,
+    stream: IqStream,
+) -> Callable[[IqSubscription], IqRecorder]:
+    """A recorder-building closure for one radio, for :class:`Branch`.
+
+    Built here, where the device's actual settings and the downlink are
+    in hand, and applied to the branch's own recorder subscription. The
+    loss it reports at the end is the *stream's* USB loss, read when the
+    sidecar is written -- a callable, not a stored value, because that
+    number is only final once the run has stopped.
+    """
+
+    def factory(subscription: IqSubscription) -> IqRecorder:
+        return IqRecorder(
+            subscription=subscription,
+            iq_path=record_dir / (safe_filename(radio.label) + ".iq"),
+            applied=radio.applied,
+            device_description=radio.sdr.info.describe() if radio.sdr.info else "unknown device",
+            station_hz=station_hz,
+            loss_source=lambda: stream.stats.loss,
+            label=radio.label,
+        )
+
+    return factory
+
+
 def _build_branches(
     args: argparse.Namespace,
     radios: Sequence[_Radio],
@@ -1807,6 +1936,8 @@ def _build_branches(
     *,
     window: bool,
     log: QuietingLog | None = None,
+    record_dir: Path | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> list[Branch]:
     """Turn configured radios into receive branches.
 
@@ -1825,6 +1956,10 @@ def _build_branches(
         log: Optional quieting log, shared by every branch. One log and
             not one per branch, because the whole point is a difference
             between two series and two files would be two time origins.
+        record_dir: Optional directory to record every branch's raw IQ
+            into. When given, each branch takes a recorder consumer
+            writing ``<antenna>.iq`` and its sidecar; ``None`` records
+            nothing and adds no consumer, so an ordinary run is unchanged.
     """
     spectrum_config = SpectrumConfig(
         fft_size=RECEIVE_FFT_SIZE,
@@ -1832,22 +1967,37 @@ def _build_branches(
         center_freq_hz=radios[listening].applied.center_hz,
     )
     factory = _spectrum_factory(window, spectrum_config)
-    return [
-        Branch(
-            label=radio.label,
-            stream=IqStream(radio.sdr),
-            nbfm=radio.nbfm,
-            doppler=radio.doppler,
-            squelch=radio.squelch,
-            # args.squelch is "let the gate's decision reach the
-            # speaker" - the gate itself is always deciding now, see
-            # _squelch_status_line.
-            mute_squelch=args.squelch,
-            spectrum_factory=factory if index == listening else None,
-            log=log,
+    # The downlink, in Hz, so each sidecar records where in its own
+    # capture the signal sits -- the same station_hz sdr capture records.
+    station_hz = args.downlink * 1e6 if args.downlink is not None else None
+    branches: list[Branch] = []
+    for index, radio in enumerate(radios):
+        # On a replay, every branch's stream reads the capture's clock, so
+        # block timestamps run at the capture's date; live runs pass None
+        # and IqStream keeps its own wall clock.
+        stream = IqStream(radio.sdr, now=clock) if clock is not None else IqStream(radio.sdr)
+        recorder_factory = (
+            _iq_recorder_factory(radio, record_dir, station_hz, stream)
+            if record_dir is not None
+            else None
         )
-        for index, radio in enumerate(radios)
-    ]
+        branches.append(
+            Branch(
+                label=radio.label,
+                stream=stream,
+                nbfm=radio.nbfm,
+                doppler=radio.doppler,
+                squelch=radio.squelch,
+                # args.squelch is "let the gate's decision reach the
+                # speaker" - the gate itself is always deciding now, see
+                # _squelch_status_line.
+                mute_squelch=args.squelch,
+                spectrum_factory=factory if index == listening else None,
+                log=log,
+                recorder_factory=recorder_factory,
+            )
+        )
+    return branches
 
 
 def _run_receive(
@@ -1865,17 +2015,29 @@ def _run_receive(
         track_log.open()
     ticker = TrackingThread(loop, log=track_log) if loop is not None else None
     quieting_log = _open_quieting_log(args)
+    record_dir = Path(args.record_iq) if args.record_iq is not None else None
+    replay_clock = _replay_clock_for(radios, listening)
+    _print_replay_banner(radios)
 
     session = ReceiveSession(
-        branches=_build_branches(args, radios, listening, window=args.window, log=quieting_log),
+        branches=_build_branches(
+            args,
+            radios,
+            listening,
+            window=args.window,
+            log=quieting_log,
+            record_dir=record_dir,
+            clock=replay_clock,
+        ),
         audio=AudioOutput(
             radios[listening].nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)
         ),
         # Always from the target, never from the rotor. A range rate
         # comes from the TLE and the observer's location; taking it from
         # a rotor tick was what made the rotor follow this cadence
-        # instead of its own profile's.
-        range_rate=TargetRangeRate(satellite, config.observer),
+        # instead of its own profile's. On a replay it reads the capture's
+        # clock, so the Doppler curve runs at the capture's date.
+        range_rate=_range_rate_source(satellite, config.observer, replay_clock),
         listening=listening,
         selector=_build_selector(args),
         tracking_interval_s=_range_rate_interval(args),
@@ -1966,6 +2128,7 @@ def _run_receive(
     print()
     print(stats.describe())
     _print_quieting_log(quieting_log)
+    _print_recordings(session, record_dir)
     if ticker is not None:
         print(ticker.describe())
         _print_track_log(ticker, track_log)
@@ -2227,6 +2390,37 @@ def _command_shell(
                 file=sys.stderr,
             )
             return 1
+    simulated_at = None
+    if args.at is not None:
+        if args.downlink is not None:
+            print(
+                "shell: --at is rotor-only and cannot be combined with --downlink. "
+                "It simulates the pass geometry for the rotor to follow; a live "
+                "radio would still be receiving now, so its Doppler would be "
+                "computed for a time the signal is not at. Simulate the signal with "
+                "a replay instead.",
+                file=sys.stderr,
+            )
+            return 1
+        if args.tle is None or not args.send:
+            print(
+                "shell: --at needs --tle and --send -- it simulates a pass for the "
+                "rotor to follow, and without them there is nothing to point at.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            simulated_at = _parse_time(args.at)
+        except ValueError as exc:
+            print(f"shell: {exc}", file=sys.stderr)
+            return 1
+    if args.record_iq is not None and args.downlink is None:
+        print(
+            "shell: --record-iq needs --downlink. It records a radio's raw IQ, "
+            "and a rotor-only shell has no radio to record.",
+            file=sys.stderr,
+        )
+        return 1
     if args.tle is None:
         if args.downlink is not None or args.send:
             print(
@@ -2245,7 +2439,7 @@ def _command_shell(
                 file=sys.stderr,
             )
             return 1
-        return _run_shell_tracking_only(args, config, rotor_factory)
+        return _run_shell_tracking_only(args, config, rotor_factory, simulated_at=simulated_at)
 
     if args.gain is None and not args.auto_gain:
         print(
@@ -2405,7 +2599,11 @@ def _run_shell_alone(args: argparse.Namespace, config: StationConfig) -> int:
 
 
 def _run_shell_tracking_only(
-    args: argparse.Namespace, config: StationConfig, rotor_factory: RotorFactory
+    args: argparse.Namespace,
+    config: StationConfig,
+    rotor_factory: RotorFactory,
+    *,
+    simulated_at: datetime | None = None,
 ) -> int:
     """The shell with a rotor and no radio.
 
@@ -2434,11 +2632,36 @@ def _run_shell_tracking_only(
     app = QApplication.instance() or QApplication([])
     themes = _shell_theme(args)
 
+    # --at: run the pointing job against a shifted clock so the rotor
+    # follows a chosen pass without waiting for it. The clock drives the
+    # loop's target computation only; TrackingThread still schedules in
+    # real time, so the pass unfolds over its real duration. Marked
+    # loudly here, in the track log, and in the closing report, because a
+    # simulated run that reads as a live one is the "reports state it
+    # does not own" failure at the level of the whole run.
+    now_fn = None
+    track_marker = None
+    if simulated_at is not None:
+        now_fn = _offset_clock(simulated_at)
+        offset_s = (simulated_at - datetime.now(UTC)).total_seconds()
+        print(
+            f"*** SIMULATED PASS: clock set to {simulated_at.isoformat()} "
+            f"({offset_s:+.0f} s from now). The geometry and the rotor motion are "
+            "real; the time is not. This is NOT a live pass. ***"
+        )
+        note = _below_horizon_note(satellite, config.observer, simulated_at, args.at)
+        if note is not None:
+            print(note, file=sys.stderr)
+        track_marker = (
+            f"SIMULATED pass: clock set to {simulated_at.isoformat()} at launch; not a live pass"
+        )
+
     with _Connected(config, rotor_factory) as rotor:
         print(f"Rotor:     connected, {rotor.firmware_version}")
         profile = _tracking_profile(args, config)
         print(_describe_cadence(profile))
         _push_profile_gains(rotor, profile, config)
+        loop_clock = {"now": now_fn} if now_fn is not None else {}
         loop = TrackingLoop(
             satellite,
             config.observer,
@@ -2450,8 +2673,13 @@ def _run_shell_tracking_only(
             profile=profile,
             on_stall=_report_stall,
             on_profile_change=_profile_pusher(rotor, config),
+            **loop_clock,
         )
-        track_log = TrackLog(args.track_log) if args.track_log is not None else None
+        track_log = (
+            TrackLog(args.track_log, preamble_comment=track_marker)
+            if args.track_log is not None
+            else None
+        )
         if track_log is not None:
             track_log.open()
         # The ticker is built BEFORE the hub, because the hub needs its
@@ -2499,6 +2727,8 @@ def _run_shell_tracking_only(
     print()
     print(ticker.describe())
     _print_track_log(ticker, track_log)
+    if simulated_at is not None:
+        print("(SIMULATED pass -- the clock was offset; the timing above is not live.)")
     return 0
 
 
@@ -2576,15 +2806,26 @@ def _run_shell(
         track_log.open()
     ticker = TrackingThread(loop, log=track_log) if loop is not None else None
     quieting_log = _open_quieting_log(args)
+    record_dir = Path(args.record_iq) if args.record_iq is not None else None
+    replay_clock = _replay_clock_for(radios, listening)
+    _print_replay_banner(radios)
     session = ReceiveSession(
         # window=True unconditionally here, unlike `receive`, where it
         # follows --window: a shell always has a Radio tab, so there is
         # always something that would drain the frames.
-        branches=_build_branches(args, radios, listening, window=True, log=quieting_log),
+        branches=_build_branches(
+            args,
+            radios,
+            listening,
+            window=True,
+            log=quieting_log,
+            record_dir=record_dir,
+            clock=replay_clock,
+        ),
         audio=AudioOutput(
             radios[listening].nbfm.audio_rate_hz, device=_parse_audio_device(args.audio_device)
         ),
-        range_rate=TargetRangeRate(satellite, config.observer),
+        range_rate=_range_rate_source(satellite, config.observer, replay_clock),
         listening=listening,
         selector=_build_selector(args),
         tracking_interval_s=_range_rate_interval(args),
@@ -2651,6 +2892,7 @@ def _run_shell(
     print()
     print(stats.describe())
     _print_quieting_log(quieting_log)
+    _print_recordings(session, record_dir)
     if ticker is not None:
         print(ticker.describe())
         _print_track_log(ticker, track_log)
@@ -2816,6 +3058,135 @@ def _note_single_device(config: StationConfig) -> None:
     )
 
 
+def _parse_replay_map(spec: str) -> dict[str | None, str]:
+    """Parse ``--replay`` into a map of branch label to ``.iq`` path.
+
+    ``LABEL=FILE,LABEL=FILE`` maps by label; a bare ``FILE`` (no ``=``)
+    maps the single unnamed branch, keyed by ``None``. Mixing the two, an
+    empty spec, or a half-written entry is a usage error rather than a
+    guess.
+    """
+    entries = [part.strip() for part in spec.split(",") if part.strip()]
+    mapping: dict[str | None, str] = {}
+    for entry in entries:
+        if "=" in entry:
+            label, _, path = entry.partition("=")
+            if not label.strip() or not path.strip():
+                raise ValueError(f"--replay entry {entry!r} must be LABEL=FILE.iq.")
+            mapping[label.strip()] = path.strip()
+        else:
+            mapping[None] = entry
+    if not mapping:
+        raise ValueError("--replay needs at least one FILE.iq.")
+    if None in mapping and len(mapping) > 1:
+        raise ValueError(
+            "--replay: give one bare FILE.iq for a single unnamed branch, or "
+            "LABEL=FILE.iq per branch, but not both."
+        )
+    return mapping
+
+
+def _parse_attenuation_map(spec: str) -> dict[str | None, float]:
+    """Parse ``--replay-attenuate`` into a map of branch label to dB.
+
+    Same shape as :func:`_parse_replay_map` -- ``LABEL=DB`` per branch, or a
+    bare ``DB`` for a single unnamed branch -- but the values are decibels,
+    and a value that is not a number is a usage error.
+    """
+    entries = [part.strip() for part in spec.split(",") if part.strip()]
+    mapping: dict[str | None, float] = {}
+    for entry in entries:
+        label: str | None
+        if "=" in entry:
+            raw_label, _, raw_db = entry.partition("=")
+            label = raw_label.strip()
+            raw_db = raw_db.strip()
+            if not label or not raw_db:
+                raise ValueError(f"--replay-attenuate entry {entry!r} must be LABEL=DB.")
+        else:
+            label, raw_db = None, entry
+        try:
+            mapping[label] = float(raw_db)
+        except ValueError:
+            raise ValueError(f"--replay-attenuate: {raw_db!r} is not a number of dB.") from None
+    if not mapping:
+        raise ValueError("--replay-attenuate needs at least one LABEL=DB.")
+    if None in mapping and len(mapping) > 1:
+        raise ValueError("--replay-attenuate: give one bare DB or LABEL=DB per branch, not both.")
+    return mapping
+
+
+def _replay_sdr_factory(
+    replay_map: dict[str | None, str],
+    attenuation_map: dict[str | None, float] | None = None,
+) -> SdrFactory:
+    """An :data:`SdrFactory` that returns a :class:`ReplaySdr` per branch.
+
+    Matches each branch by its config label (``None`` for a single
+    unnamed branch); a branch with no file in the map is refused rather
+    than opened as a live radio, so a typo can't quietly half-replay.
+    ``attenuation_map`` pads a branch down by its dB for the known-answer
+    control; a branch not in it is replayed at full amplitude.
+    """
+    attenuation = attenuation_map or {}
+
+    def factory(config: StationConfig, branch: SdrBranch | None = None) -> RtlSdr:
+        key = branch.label if branch is not None else None
+        if key not in replay_map:
+            declared = ", ".join(sorted(k for k in replay_map if k is not None)) or "a bare file"
+            raise SdrError(f"--replay has no file for branch {key!r}; it maps: {declared}.")
+        return ReplaySdr(replay_map[key], attenuation_db=attenuation.get(key, 0.0))
+
+    return factory
+
+
+def _replay_clock_for(radios: Sequence[_Radio], listening: int) -> Callable[[], datetime] | None:
+    """The shared capture-epoch clock for a replay run, or ``None`` if live.
+
+    Taken from the listening branch's :class:`ReplaySdr`, so block
+    timestamps and the Doppler curve run at the capture's date. One clock
+    for the whole session -- two branches replaying the same file then
+    stamp identical timestamps, which is the identical-input control's
+    whole premise.
+    """
+    device = radios[listening].sdr
+    if isinstance(device, ReplaySdr):
+        return device.capture_clock()
+    return None
+
+
+def _range_rate_source(
+    satellite: Satellite, observer: ObserverLocation, clock: Callable[[], datetime] | None
+) -> TargetRangeRate:
+    """The range-rate source, reading a replay's clock when one is given.
+
+    A live run uses the wall clock; a replay uses the capture's, so the
+    Doppler curve is computed for the pass that was recorded rather than
+    for whenever the replay happens to run.
+    """
+    if clock is not None:
+        return TargetRangeRate(satellite, observer, now=clock)
+    return TargetRangeRate(satellite, observer)
+
+
+def _print_replay_banner(radios: Sequence[_Radio]) -> None:
+    """Announce a replay run and what each file actually is, if replaying."""
+    replays = [radio for radio in radios if isinstance(radio.sdr, ReplaySdr)]
+    if not replays:
+        return
+    print(
+        "*** REPLAY: reading captured IQ, not a live receive. Rate and tuning "
+        "come from each file's own sidecar. ***"
+    )
+    for radio in replays:
+        applied = radio.sdr.applied
+        if applied is not None:
+            print(
+                f"    {radio.label}: {applied.sample_rate_hz / 1e6:.3f} Msps, "
+                f"centre {applied.center_hz / 1e6:.4f} MHz"
+            )
+
+
 def _open_sdr(config: StationConfig, branch: SdrBranch | None = None) -> RtlSdr:
     """Build an :class:`RtlSdr` from the station's ``[sdr]`` settings.
 
@@ -2850,6 +3221,62 @@ def _open_sdr(config: StationConfig, branch: SdrBranch | None = None) -> RtlSdr:
 def _report_homing_wait(elapsed_s: float) -> None:
     """Say something while the controller is deaf, so it doesn't look hung."""
     print(f"Waiting for the controller ({elapsed_s:.0f}s) - it is deaf while homing.")
+
+
+def _below_horizon_note(
+    satellite: Satellite,
+    observer: ObserverLocation,
+    simulated_at: datetime,
+    at_arg: str,
+) -> str | None:
+    """Warn if a simulated target starts below the horizon, else ``None``.
+
+    Extracted from :func:`_run_shell_tracking_only` (which needs Qt) so
+    this check runs under a plain unit test. The version this replaces
+    read ``state.elevation`` and crashed: elevation lives on
+    ``state.sky_position`` (an :class:`~qsorbit.core.geometry.AzEl`), the
+    same access the ``describe`` command uses. Below the horizon the loop
+    commands nothing until the satellite rises, so the operator gets told
+    rather than watching a still rotor and wondering.
+
+    Args:
+        satellite: The target whose geometry is being simulated.
+        observer: The station location the elevation is measured from.
+        simulated_at: The clock instant the run is pinned to at launch.
+        at_arg: The raw ``--at`` string, echoed into the suggested
+            ``plan`` command so the hint is copy-pasteable.
+
+    Returns:
+        The warning to print to stderr, or ``None`` if the target is at
+        or above the horizon.
+    """
+    elevation = satellite.topocentric_state(observer, simulated_at).sky_position.elevation
+    if elevation >= 0.0:
+        return None
+    return (
+        f"Note: {satellite.name} is below the horizon at the simulated time "
+        f"(elevation {elevation:.1f} deg), so nothing is commanded until it "
+        f"rises. Pick an --at during a pass; `qsorbit plan --at {at_arg}` shows "
+        "what is up then."
+    )
+
+
+def _offset_clock(simulated_at: datetime) -> Callable[[], datetime]:
+    """A wall clock shifted so it reads ``simulated_at`` at first call.
+
+    The offset is fixed when this is built, so the returned clock
+    advances at real time from the simulated instant -- a pass unfolds
+    over its real duration, just shifted in when it happens. ``shell
+    --at`` uses it to drive the tracking loop's target computation while
+    the tick scheduling stays on the real clock, so the rotor follows a
+    chosen pass without waiting for it to come round.
+    """
+    offset = simulated_at - datetime.now(UTC)
+
+    def _now() -> datetime:
+        return datetime.now(UTC) + offset
+
+    return _now
 
 
 def _parse_time(text: str | None) -> datetime:

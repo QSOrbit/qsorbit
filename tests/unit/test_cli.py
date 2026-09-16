@@ -12,6 +12,7 @@ import argparse
 import json
 import signal
 import textwrap
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -22,23 +23,31 @@ from qsorbit.__main__ import (
     DEFAULT_PLAN_HOURS,
     DEFAULT_TUNING_OFFSET_KHZ,
     UNNAMED_BRANCH_LABEL,
+    _below_horizon_note,
     _build_branches,
     _build_selector,
     _command_receive,
+    _command_shell,
     _declared_branches,
     _describe_mechanics,
     _listening_index,
     _note_single_device,
+    _offset_clock,
     _open_quieting_log,
     _open_sdr,
+    _parse_attenuation_map,
     _parse_audio_device,
+    _parse_replay_map,
     _print_quieting_log,
+    _print_recordings,
     _profile_pusher,
     _push_profile_gains,
     _quit_on_sigint,
     _range_rate_interval,
     _readout_poll_interval_ms,
     _receive_shell_hub,
+    _replay_clock_for,
+    _replay_sdr_factory,
     _sdr_ppm,
     _spectrum_factory,
     _squelch_status_line,
@@ -59,8 +68,10 @@ from qsorbit.core.sdr import (
     DeviceError,
     DeviceInfo,
     DeviceNotFoundError,
+    SdrError,
     TunerType,
 )
+from qsorbit.core.sdr.replay import ReplaySdr
 from qsorbit.core.station import load_station_config
 from qsorbit.ui.theme import DEFAULT_THEME_NAME, DEFAULT_THEMES_DIR, discover_themes
 
@@ -2588,6 +2599,199 @@ class TestQuietingLogWiring:
         assert "q.csv" in capsys.readouterr().out
 
 
+class TestRecordIqWiring:
+    """``--record-iq`` gives every branch a recorder writing into DIR."""
+
+    def branches_with(self, tmp_path, tle_path, *extra, record_dir=None):
+        def run(args, config, satellite, radios, listening, *, loop=None):
+            run.branches = _build_branches(
+                args, radios, listening, window=False, record_dir=record_dir
+            )
+            return 0
+
+        run.branches = None
+        _command_receive(
+            receive_args(tle_path, *extra),
+            config_with(tmp_path, TWO_BRANCHES),
+            None,
+            branch_sdr_factory(),
+            runner=run,
+        )
+        return run.branches
+
+    def test_the_flag_defaults_to_off(self, tle_path):
+        assert receive_args(tle_path).record_iq is None
+
+    def test_the_shell_takes_it_too(self, tmp_path):
+        # Both commands run the same receive path, so a flag on one and not
+        # the other would be a difference with no reason behind it.
+        args = build_parser().parse_args(
+            [
+                "shell",
+                "--tle",
+                "x",
+                "--downlink",
+                "145.95",
+                "--gain",
+                "32.8",
+                "--record-iq",
+                str(tmp_path / "iq"),
+            ]
+        )
+
+        assert args.record_iq == str(tmp_path / "iq")
+
+    def test_no_record_dir_means_no_recorder_on_any_branch(self, tmp_path, tle_path):
+        branches = self.branches_with(tmp_path, tle_path)
+
+        assert [branch.recorder for branch in branches] == [None, None]
+
+    def test_a_record_dir_gives_every_branch_a_recorder(self, tmp_path, tle_path):
+        branches = self.branches_with(tmp_path, tle_path, record_dir=tmp_path / "iq")
+
+        assert all(branch.recorder is not None for branch in branches)
+
+    def test_each_recorder_is_named_for_its_antenna_filename_safe(self, tmp_path, tle_path):
+        branches = self.branches_with(tmp_path, tle_path, record_dir=tmp_path / "iq")
+
+        assert sorted(b.recorder.iq_path.name for b in branches) == [
+            "A-Arrow-V.iq",
+            "B-Arrow-H.iq",
+        ]
+        # The true label is preserved on the recorder for the report and
+        # the sidecar, even though the filename is sanitised.
+        assert sorted(b.recorder.label for b in branches) == ["A - Arrow V", "B - Arrow H"]
+
+    def test_the_shell_refuses_record_iq_without_a_downlink(self, capsys):
+        # --record-iq records a radio, and a rotor-only shell has none.
+        args = SimpleNamespace(
+            track_log=None, at=None, record_iq="iq", downlink=None, tle="x", send=True
+        )
+
+        code = _command_shell(args, MagicMock(), MagicMock(), MagicMock())
+
+        assert code == 1
+        assert "--record-iq needs --downlink" in capsys.readouterr().err
+
+    def test_the_report_says_nothing_without_a_dir_and_names_files_with_one(self, tmp_path, capsys):
+        _print_recordings(SimpleNamespace(branches=()), None)
+        assert capsys.readouterr().out == ""
+
+        recorder = SimpleNamespace(
+            label="A - Arrow V",
+            bytes_written=2048,
+            iq_path=tmp_path / "A-Arrow-V.iq",
+            sidecar_path=tmp_path / "A-Arrow-V.json",
+        )
+        session = SimpleNamespace(branches=(SimpleNamespace(recorder=recorder),))
+
+        _print_recordings(session, tmp_path)
+
+        out = capsys.readouterr().out
+        assert "A - Arrow V" in out
+        assert "A-Arrow-V.iq" in out
+        assert "2,048 bytes" in out
+
+
+class TestReplayWiring:
+    """``--replay`` maps captured files to branches at the SdrFactory seam."""
+
+    def test_a_bare_file_maps_the_unnamed_branch(self):
+        assert _parse_replay_map("cap.iq") == {None: "cap.iq"}
+
+    def test_labelled_entries_map_by_label(self):
+        got = _parse_replay_map("A - Arrow V=a.iq, B - Arrow H=b.iq")
+
+        assert got == {"A - Arrow V": "a.iq", "B - Arrow H": "b.iq"}
+
+    def test_mixing_a_bare_file_and_labels_is_refused(self):
+        with pytest.raises(ValueError, match="not both"):
+            _parse_replay_map("a.iq, B - Arrow H=b.iq")
+
+    def test_a_half_written_entry_is_refused(self):
+        with pytest.raises(ValueError, match="LABEL=FILE"):
+            _parse_replay_map("A - Arrow V=")
+
+    def test_an_empty_spec_is_refused(self):
+        with pytest.raises(ValueError, match="at least one"):
+            _parse_replay_map("   ")
+
+    def test_the_factory_returns_a_replay_for_a_matching_branch(self):
+        factory = _replay_sdr_factory({"A - Arrow V": "a.iq"})
+
+        device = factory(object(), SimpleNamespace(label="A - Arrow V"))
+
+        assert isinstance(device, ReplaySdr)
+        assert device.iq_path.name == "a.iq"
+
+    def test_the_factory_maps_the_unnamed_branch_from_a_bare_file(self):
+        factory = _replay_sdr_factory({None: "cap.iq"})
+
+        device = factory(object(), None)
+
+        assert isinstance(device, ReplaySdr)
+        assert device.iq_path.name == "cap.iq"
+
+    def test_the_factory_refuses_an_unmapped_branch(self):
+        # A typo'd label must not quietly fall through to opening a radio.
+        factory = _replay_sdr_factory({"A - Arrow V": "a.iq"})
+
+        with pytest.raises(SdrError, match="no file for branch"):
+            factory(object(), SimpleNamespace(label="B - Arrow H"))
+
+    def test_the_flag_defaults_to_off(self, tle_path):
+        assert receive_args(tle_path).replay is None
+
+    def test_the_shell_takes_it_too(self):
+        # Both commands run the same receive path, so the flag lives on both.
+        args = build_parser().parse_args(
+            ["shell", "--tle", "x", "--downlink", "145.95", "--gain", "32.8", "--replay", "cap.iq"]
+        )
+
+        assert args.replay == "cap.iq"
+
+    def test_a_live_run_has_no_replay_clock(self):
+        # _replay_clock_for returns a clock only when the listening branch is
+        # a replay; an ordinary radio run keeps IqStream's own wall clock.
+        radios = [SimpleNamespace(sdr=object())]
+
+        assert _replay_clock_for(radios, 0) is None
+
+
+class TestReplayAttenuation:
+    """--replay-attenuate pads a branch down for the known-answer control."""
+
+    def test_the_flag_defaults_to_off(self, tle_path):
+        assert receive_args(tle_path).replay_attenuate is None
+
+    def test_parses_a_bare_value_and_labelled_values(self):
+        assert _parse_attenuation_map("20") == {None: 20.0}
+        assert _parse_attenuation_map("A - Arrow V=20, B - Arrow H=6.5") == {
+            "A - Arrow V": 20.0,
+            "B - Arrow H": 6.5,
+        }
+
+    def test_a_non_number_is_refused(self):
+        with pytest.raises(ValueError, match="not a number"):
+            _parse_attenuation_map("A - Arrow V=loud")
+
+    def test_the_factory_applies_the_attenuation_to_the_named_branch(self):
+        factory = _replay_sdr_factory({"A - Arrow V": "a.iq"}, {"A - Arrow V": 20.0})
+
+        device = factory(object(), SimpleNamespace(label="A - Arrow V"))
+
+        assert device.attenuation_db == 20.0
+
+    def test_an_unlisted_branch_is_replayed_at_full_amplitude(self):
+        factory = _replay_sdr_factory(
+            {"A - Arrow V": "a.iq", "B - Arrow H": "b.iq"}, {"A - Arrow V": 20.0}
+        )
+
+        device = factory(object(), SimpleNamespace(label="B - Arrow H"))
+
+        assert device.attenuation_db == 0.0
+
+
 class TestCombinerFlags:
     def test_combining_is_off_by_default(self, tle_path):
         # Not timidity: "combined beats either branch alone" is a
@@ -2675,3 +2879,105 @@ class TestWindowTitleWithACombiner:
             assert _window_title(SimpleNamespace(name="AO-91"), session) == (
                 "QSOrbit - receiving AO-91"
             )
+
+
+class TestSimulatedPass:
+    """`shell --at` simulates a pass for the rotor without waiting for one."""
+
+    def test_the_parser_accepts_at_on_the_shell(self):
+        args = build_parser().parse_args(
+            ["shell", "--tle", "x", "--send", "--at", "2026-09-10T08:44:00+00:00"]
+        )
+        assert args.at == "2026-09-10T08:44:00+00:00"
+
+    def test_at_defaults_to_none(self):
+        args = build_parser().parse_args(["shell", "--tle", "x", "--send"])
+        assert args.at is None
+
+    def test_at_refuses_a_live_downlink(self, capsys):
+        # Geometry is simulated by the clock; signal is simulated by
+        # replay. A live radio at a simulated time would compute Doppler
+        # for a time the signal is not at, so the combination is refused.
+        args = SimpleNamespace(
+            track_log=None, at="2026-09-10T08:44:00Z", downlink=145.9, tle="x", send=True
+        )
+        code = _command_shell(args, MagicMock(), MagicMock(), MagicMock())
+        assert code == 1
+        assert "rotor-only" in capsys.readouterr().err
+
+    def test_at_needs_tle_and_send(self, capsys):
+        args = SimpleNamespace(
+            track_log=None, at="2026-09-10T08:44:00Z", downlink=None, tle="x", send=False
+        )
+        code = _command_shell(args, MagicMock(), MagicMock(), MagicMock())
+        assert code == 1
+        assert "--at needs --tle and --send" in capsys.readouterr().err
+
+    def test_offset_clock_reads_the_simulated_time_and_advances(self):
+        from datetime import UTC, datetime, timedelta
+
+        future = datetime.now(UTC) + timedelta(hours=5)
+        clock = _offset_clock(future)
+        assert abs((clock() - future).total_seconds()) < 2.0
+
+        first = clock()
+        time.sleep(0.02)
+        assert clock() > first
+
+    def test_offset_clock_handles_a_past_time(self):
+        from datetime import UTC, datetime, timedelta
+
+        past = datetime.now(UTC) - timedelta(days=1)
+        clock = _offset_clock(past)
+        assert abs((clock() - past).total_seconds()) < 2.0
+
+    # --- below-horizon note (the Qt-gated seam, extracted so it can be
+    # unit-tested; the version this replaces read state.elevation, which
+    # does not exist, and crashed only on a real --at run) ---
+
+    @staticmethod
+    def _fake_satellite(elevation_deg: float, *, name: str = "AO-73"):
+        """A satellite stub whose topocentric elevation is fixed.
+
+        Exercises _below_horizon_note without skyfield: it only touches
+        ``.name`` and ``state.sky_position.elevation``, the exact surface
+        the crash was on.
+        """
+
+        state = SimpleNamespace(sky_position=SimpleNamespace(elevation=elevation_deg))
+        return SimpleNamespace(
+            name=name,
+            topocentric_state=lambda observer, when: state,
+        )
+
+    def test_below_horizon_note_is_none_when_the_target_is_up(self):
+        from datetime import UTC, datetime
+
+        sat = self._fake_satellite(12.3)
+        note = _below_horizon_note(
+            sat, MagicMock(), datetime(2026, 9, 10, 8, 44, tzinfo=UTC), "2026-09-10T08:44:00Z"
+        )
+        assert note is None
+
+    def test_below_horizon_note_is_none_exactly_at_the_horizon(self):
+        from datetime import UTC, datetime
+
+        sat = self._fake_satellite(0.0)
+        note = _below_horizon_note(
+            sat, MagicMock(), datetime(2026, 9, 10, 8, 44, tzinfo=UTC), "2026-09-10T08:44:00Z"
+        )
+        assert note is None
+
+    def test_below_horizon_note_warns_when_the_target_is_down(self):
+        from datetime import UTC, datetime
+
+        sat = self._fake_satellite(-7.5, name="AO-73")
+        note = _below_horizon_note(
+            sat, MagicMock(), datetime(2026, 9, 10, 8, 44, tzinfo=UTC), "2026-09-10T08:44:00Z"
+        )
+        assert note is not None
+        assert "AO-73" in note
+        assert "below the horizon" in note
+        assert "-7.5 deg" in note
+        # The suggested command echoes the raw --at value verbatim.
+        assert "qsorbit plan --at 2026-09-10T08:44:00Z" in note
