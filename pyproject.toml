@@ -40,6 +40,11 @@ qsorbit = "qsorbit.__main__:main"
 dev = [
     "ruff>=0.5",
     "pytest>=8.0",
+    # Used only by tools/generate_star_catalog.py and
+    # tools/generate_celestial_oracle.py, to derive the bright-star
+    # catalogue and its reference positions from an independent source.
+    # Nothing shipped imports it.
+    "ephem>=4.1",
 ]
 
 [tool.hatch.build.targets.wheel]

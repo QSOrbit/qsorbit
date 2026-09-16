@@ -14,6 +14,7 @@ passing suite.
 | File | Rows | Source | What it pins down |
 |------|------|--------|-------------------|
 | `sun_gcrs.csv` | 20 | JPL DE421 via skyfield | The Sun's geocentric position vector, in GCRS kilometers, sampled 2000–2050 |
+| `oracle.csv` | 270 | DE421 (Sun) and PyEphem (stars) | Topocentric azimuth and elevation, from five observers across both hemispheres |
 
 ## Why an ephemeris is the checker and not a dependency
 
@@ -35,6 +36,33 @@ JPL, so it's right" — is true of some of this and not all of it.
 **`sun_gcrs.csv` is a genuinely independent check.** Nothing in QSOrbit
 contributed to these numbers. If the closed-form series is wrong in any way
 that moves the Sun's direction, this catches it.
+
+**`oracle.csv` is two different claims in one file, and the `source` column
+says which is which.**
+
+*Sun rows (`de421`)* are independent in the same way `sun_gcrs.csv` is, but
+one layer further out: they check the whole topocentric path — the observer's
+geodetic vertical, sidereal rotation, parallax — rather than just the
+geocentric vector.
+
+*Star rows (`pyephem`)* are **not** an independent check on the coordinates.
+PyEphem is where `star_catalog.py` came from, so these rows can only prove
+that the *transformation* is right — precession, nutation, Earth rotation,
+proper motion — and would happily agree with a catalogue full of wrong stars.
+
+What closes that gap is a separate test, not this fixture:
+`TestCatalogueProvenance` in `tests/unit/tracker/test_celestial.py` checks the
+fourteen stars inherited from the bench script `rotor-track.py`, whose
+coordinates were sourced elsewhere entirely, against the shipped catalogue.
+They agree to **4.49 arcseconds worst** (Caph), most to well under one. That
+is the second opinion; everything else here is one library agreeing with
+itself.
+
+**The observers are chosen to break things**, not to be representative: a
+southern-hemisphere site (azimuth conventions and the sign of everything), one
+inside the Arctic circle, the equator (where the geodetic and geocentric
+verticals coincide, so a bug in that correction hides), and the prime meridian
+(where a longitude sign error is invisible).
 
 **The epochs are the point, not just the coverage.** They run from 2000 to
 2050 because the fault this fixture was created in response to was a *frame*
@@ -70,7 +98,14 @@ is 60″, roughly half again as much headroom; the fault it guards against is
 uv run python tools/generate_sun_reference.py \
     --ephemeris /path/to/de421.bsp \
     --out tests/fixtures/celestial/sun_gcrs.csv
+
+uv run python tools/generate_celestial_oracle.py \
+    --ephemeris /path/to/de421.bsp \
+    --out tests/fixtures/celestial/oracle.csv
 ```
+
+The second also needs PyEphem, which is a development dependency (`uv sync`
+installs it). Nothing shipped imports it.
 
 `de421.bsp` is not in this repository and is not needed to *run* the tests.
 Skyfield will fetch it:
