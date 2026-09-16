@@ -50,9 +50,7 @@ from __future__ import annotations
 import math
 from datetime import datetime
 
-from skyfield.framelib import true_equator_and_equinox_of_date
-
-from qsorbit.core.tracker._shared import require_timezone_aware, ts
+from qsorbit.core.tracker._shared import of_date_to_gcrs, require_timezone_aware, ts
 from qsorbit.core.tracker.observer import ObserverLocation
 
 #: Mean equatorial Earth radius, in kilometers (the WGS84 semi-major
@@ -67,30 +65,6 @@ EARTH_RADIUS_KM = 6378.137
 #: formula's output (given in AU) into the kilometers everything else
 #: in this project already works in.
 AU_KM = 149_597_870.7
-
-
-def _of_date_to_gcrs(vector_km: tuple[float, float, float], t) -> tuple[float, float, float]:
-    """Rotate an equator-of-date vector into GCRS.
-
-    Skyfield's frame object supplies the rotation that takes GCRS *to*
-    the equator and equinox of date, so the transpose is what brings a
-    vector the other way. Doing it by hand rather than reaching for
-    numpy keeps this module's arithmetic in one readable place.
-
-    The frame used includes nutation while the Almanac's formula is
-    referred to the *mean* equinox, so the rotation is wrong by the
-    nutation of the day -- at most about 17 arcseconds, comfortably
-    inside the formula's own 36-arcsecond accuracy, and skyfield
-    exposes this frame publicly where it does not expose a mean-only
-    one. Measured against DE421 the result lands within 39 arcseconds
-    across 2000-2050, so nothing here is being hidden by the choice.
-    """
-    rotation = true_equator_and_equinox_of_date.rotation_at(t)
-    return (
-        float(sum(rotation[axis][0] * vector_km[axis] for axis in range(3))),
-        float(sum(rotation[axis][1] * vector_km[axis] for axis in range(3))),
-        float(sum(rotation[axis][2] * vector_km[axis] for axis in range(3))),
-    )
 
 
 def sun_gcrs_km(time: datetime) -> tuple[float, float, float]:
@@ -151,7 +125,7 @@ def sun_gcrs_km(time: datetime) -> tuple[float, float, float]:
         distance_km * math.cos(obliquity_rad) * math.sin(ecliptic_longitude_rad),
         distance_km * math.sin(obliquity_rad) * math.sin(ecliptic_longitude_rad),
     )
-    return _of_date_to_gcrs(of_date_km, t)
+    return of_date_to_gcrs(of_date_km, t)
 
 
 def is_illuminated(satellite_gcrs_km: tuple[float, float, float], time: datetime) -> bool:

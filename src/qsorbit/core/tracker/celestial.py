@@ -57,6 +57,7 @@ from skyfield.vectorlib import VectorFunction
 
 from qsorbit.core.geometry import AzEl
 from qsorbit.core.tracker._shared import require_timezone_aware, ts
+from qsorbit.core.tracker.moon import moon_gcrs_km
 from qsorbit.core.tracker.observer import ObserverLocation
 from qsorbit.core.tracker.star_catalog import STARS, Star
 from qsorbit.core.tracker.state import TopocentricState
@@ -184,6 +185,50 @@ class SunTarget:
         return _topocentric_state(_GeocentricBody("Sun", sun_gcrs_km), observer, time)
 
 
+class MoonTarget:
+    """The Moon, as something the pointing path can track.
+
+    Satisfies :class:`~qsorbit.core.tracker.target.Target` structurally.
+
+    The Moon is the brightest pointing reference available and the easiest
+    to confirm by eye, which makes it the natural check on a new rotator's
+    alignment -- available most clear nights, needing no TLE and no pass
+    window. It is also the one target where the observer's own position on
+    the Earth genuinely matters: it is close enough that where you stand
+    shifts it by up to about 0.95 degrees, which is twice its own apparent
+    diameter. That correction is not computed here; it falls out of
+    differencing against the observer before reading ``altaz()``, the same
+    way a satellite's does.
+
+    Args:
+        None.
+    """
+
+    @property
+    def name(self) -> str:
+        """A human-readable name, for logs and display."""
+        return "Moon"
+
+    def topocentric_state(self, observer: ObserverLocation, time: datetime) -> TopocentricState:
+        """Compute where the Moon appears from ``observer`` at ``time``.
+
+        Args:
+            observer: The ground observer's location.
+            time: The instant to compute, as a timezone-aware datetime.
+
+        Returns:
+            The Moon's sky position, range and range rate. The range is
+            the *topocentric* distance -- from the observer rather than
+            from Earth's centre -- so it varies by an Earth radius over a
+            night.
+
+        Raises:
+            ValueError: If ``time`` is naive (has no ``tzinfo``).
+        """
+        require_timezone_aware(time)
+        return _topocentric_state(_GeocentricBody("Moon", moon_gcrs_km), observer, time)
+
+
 class StarTarget:
     """A catalogued star, as something the pointing path can track.
 
@@ -257,7 +302,7 @@ def celestial_target(name: str):
     """Look up a celestial target by the name a user types.
 
     Args:
-        name: ``"sun"``, or a star's catalogue key such as ``"polaris"`` or
+        name: ``"sun"``, ``"moon"``, or a star's catalogue key such as ``"polaris"`` or
             ``"kaus-australis"``. Case-insensitive, and spaces are accepted
             in place of hyphens.
 
@@ -272,10 +317,12 @@ def celestial_target(name: str):
     key = name.strip().lower().replace(" ", "-")
     if key == "sun":
         return SunTarget()
+    if key == "moon":
+        return MoonTarget()
     if key in STARS:
         return StarTarget(STARS[key])
     raise ValueError(
-        f"No celestial target named {name!r}. Available: sun, " + ", ".join(sorted(STARS))
+        f"No celestial target named {name!r}. Available: sun, moon, " + ", ".join(sorted(STARS))
     )
 
 
@@ -285,4 +332,4 @@ def celestial_target_names() -> list[str]:
     Exists so a command-line parser can offer the list as choices rather
     than discovering a typo after the rotor has already connected.
     """
-    return sorted([*STARS, "sun"])
+    return sorted([*STARS, "sun", "moon"])
