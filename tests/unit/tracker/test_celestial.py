@@ -9,7 +9,8 @@ questions; see ``TestSunGcrsKmAgainstDe421`` in ``test_sun.py``.
 
 Two authorities are used, and they prove different things:
 
-* **DE421**, for the Sun. Wholly independent of anything in this project.
+* **DE421**, for the Sun and the Moon. Wholly independent of anything in
+  this project.
 * **PyEphem**, for the stars, because DE421 contains none. This validates the
   *transformation* -- precession, nutation, Earth rotation, proper motion --
   but not the catalogue's absolute correctness, since PyEphem is also where
@@ -26,6 +27,7 @@ import pytest
 
 from qsorbit.core.tracker.celestial import (
     STAR_DISTANCE_KM,
+    MoonTarget,
     StarTarget,
     SunTarget,
     celestial_target,
@@ -119,6 +121,9 @@ class TestProtocolConformance:
 
     def test_star_target_satisfies_the_protocol(self):
         assert isinstance(StarTarget(STARS["vega"]), Target)
+
+    def test_moon_target_satisfies_the_protocol(self):
+        assert isinstance(MoonTarget(), Target)
 
     def test_targets_report_a_display_name(self):
         assert SunTarget().name == "Sun"
@@ -278,8 +283,9 @@ class TestStarCatalogue:
 
 
 class TestCelestialTargetLookup:
-    def test_the_sun_is_available_by_name(self):
+    def test_the_solar_system_bodies_are_available_by_name(self):
         assert celestial_target("sun").name == "Sun"
+        assert celestial_target("moon").name == "Moon"
 
     def test_lookup_ignores_case_and_accepts_spaces(self):
         assert celestial_target("KAUS AUSTRALIS").name == "Kaus Australis"
@@ -302,8 +308,11 @@ class TestCelestialTargetLookup:
         for name in celestial_target_names():
             assert isinstance(celestial_target(name), Target)
 
-    def test_names_include_the_sun_and_every_star(self):
-        assert set(celestial_target_names()) == {*STARS, "sun"}
+    def test_names_include_every_target(self):
+        # Pins the complete set rather than a sample. Adding the Moon in PR2
+        # broke exactly this test and nothing else, which is what a
+        # completeness assertion is for.
+        assert set(celestial_target_names()) == {*STARS, "sun", "moon"}
 
 
 class TestSkyProperties:
@@ -353,6 +362,20 @@ class TestSkyProperties:
         )
 
         assert state.range_km == pytest.approx(STAR_DISTANCE_KM, rel=1e-6)
+
+    def test_the_moons_range_is_topocentric_rather_than_geocentric(self):
+        # The Moon is close enough that where you stand matters: over a day
+        # the observer is carried from one side of the Earth to the other,
+        # so the reported range must swing by something close to an Earth
+        # diameter. A geocentric range would barely move.
+        ranges = [
+            MoonTarget()
+            .topocentric_state(self.OBSERVER, datetime(2026, 9, 16, hour, 0, 0, tzinfo=UTC))
+            .range_km
+            for hour in range(0, 24, 2)
+        ]
+
+        assert max(ranges) - min(ranges) > 8000.0
 
     def test_the_sun_is_about_one_au_away(self):
         state = SunTarget().topocentric_state(

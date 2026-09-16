@@ -23,12 +23,20 @@ from qsorbit.core.doppler import (
     downlink_receive_frequency,
     uplink_transmit_frequency,
 )
+from qsorbit.core.tracker.celestial import (
+    MoonTarget,
+    StarTarget,
+    SunTarget,
+    celestial_target,
+    celestial_target_names,
+)
 from qsorbit.core.tracker.exceptions import PropagationError, TleError, TrackerError
 from qsorbit.core.tracker.ground_track import (
     DEFAULT_SPAN_MINUTES,
     DEFAULT_STEP_MINUTES,
     ground_track,
 )
+from qsorbit.core.tracker.moon import moon_gcrs_km
 from qsorbit.core.tracker.observer import ObserverLocation
 from qsorbit.core.tracker.pass_prediction import (
     DEFAULT_STEP_S,
@@ -38,6 +46,7 @@ from qsorbit.core.tracker.pass_prediction import (
     predict_passes,
 )
 from qsorbit.core.tracker.satellite import Satellite
+from qsorbit.core.tracker.star_catalog import STARS, Star
 from qsorbit.core.tracker.state import EciState, Subpoint, TopocentricState
 from qsorbit.core.tracker.sun import is_illuminated, sun_elevation_deg, sun_gcrs_km
 from qsorbit.core.tracker.target import Target
@@ -48,23 +57,31 @@ __all__ = [
     "DEFAULT_STEP_MINUTES",
     "DEFAULT_STEP_S",
     "DEFAULT_TWILIGHT_SUN_ELEVATION_DEG",
-    "SPEED_OF_LIGHT_KM_S",
     "EciState",
+    "MoonTarget",
     "ObserverLocation",
     "Pass",
     "PassEvent",
     "PropagationError",
+    "SPEED_OF_LIGHT_KM_S",
+    "STARS",
     "Satellite",
+    "Star",
+    "StarTarget",
     "Subpoint",
+    "SunTarget",
     "Target",
     "TleError",
     "TopocentricState",
     "TrackerError",
+    "celestial_target",
+    "celestial_target_names",
     "doppler_shifted_frequency",
     "downlink_receive_frequency",
     "ground_track",
     "is_illuminated",
     "load_satellites_by_norad_id",
+    "moon_gcrs_km",
     "predict_passes",
     "sun_elevation_deg",
     "sun_gcrs_km",

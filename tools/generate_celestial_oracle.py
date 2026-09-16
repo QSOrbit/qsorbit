@@ -8,8 +8,8 @@ this script produces the reference values offline and commits the numbers. The
 
 **Two sources, because no single one covers everything.**
 
-* **The Sun** comes from JPL's DE421 ephemeris through skyfield. Genuinely
-  independent of anything QSOrbit computes.
+* **The Sun and the Moon** come from JPL's DE421 ephemeris through skyfield.
+  Genuinely independent of anything QSOrbit computes.
 * **Stars** come from PyEphem. DE421 contains no stars, so there is nothing
   else to ask. Note carefully what this can and cannot prove: PyEphem is also
   where ``star_catalog.py``'s coordinates came from, so this validates the
@@ -104,30 +104,32 @@ FIELDS = [
 ]
 
 
-def sun_rows(ephemeris) -> list[dict[str, object]]:
-    """Reference Sun positions, from DE421 via skyfield."""
+def solar_system_rows(ephemeris) -> list[dict[str, object]]:
+    """Reference Sun and Moon positions, from DE421 via skyfield."""
     timescale = load.timescale(builtin=True)
-    earth, sun = ephemeris["earth"], ephemeris["sun"]
+    earth = ephemeris["earth"]
+    bodies = {"sun": ephemeris["sun"], "moon": ephemeris["moon"]}
 
     rows = []
-    for label, latitude, longitude, altitude_m in OBSERVERS:
-        here = wgs84.latlon(latitude, longitude, elevation_m=altitude_m)
-        for when in EPOCHS:
-            t = timescale.from_datetime(when)
-            altitude, azimuth, _ = (earth + here).at(t).observe(sun).apparent().altaz()
-            rows.append(
-                {
-                    "target": "sun",
-                    "observer": label,
-                    "latitude_deg": latitude,
-                    "longitude_deg": longitude,
-                    "altitude_m": altitude_m,
-                    "utc": when.isoformat(),
-                    "azimuth_deg": f"{azimuth.degrees % 360.0:.6f}",
-                    "elevation_deg": f"{altitude.degrees:.6f}",
-                    "source": "de421",
-                }
-            )
+    for name, body in bodies.items():
+        for label, latitude, longitude, altitude_m in OBSERVERS:
+            here = wgs84.latlon(latitude, longitude, elevation_m=altitude_m)
+            for when in EPOCHS:
+                t = timescale.from_datetime(when)
+                altitude, azimuth, _ = (earth + here).at(t).observe(body).apparent().altaz()
+                rows.append(
+                    {
+                        "target": name,
+                        "observer": label,
+                        "latitude_deg": latitude,
+                        "longitude_deg": longitude,
+                        "altitude_m": altitude_m,
+                        "utc": when.isoformat(),
+                        "azimuth_deg": f"{azimuth.degrees % 360.0:.6f}",
+                        "elevation_deg": f"{altitude.degrees:.6f}",
+                        "source": "de421",
+                    }
+                )
     return rows
 
 
@@ -193,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
         names = [star.name for star in STARS.values()]
 
     ephemeris = load(str(args.ephemeris))
-    rows = sun_rows(ephemeris) + star_rows(names)
+    rows = solar_system_rows(ephemeris) + star_rows(names)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", newline="", encoding="utf-8") as handle:

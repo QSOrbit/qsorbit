@@ -14,7 +14,7 @@ passing suite.
 | File | Rows | Source | What it pins down |
 |------|------|--------|-------------------|
 | `sun_gcrs.csv` | 20 | JPL DE421 via skyfield | The Sun's geocentric position vector, in GCRS kilometers, sampled 2000–2050 |
-| `oracle.csv` | 270 | DE421 (Sun) and PyEphem (stars) | Topocentric azimuth and elevation, from five observers across both hemispheres |
+| `oracle.csv` | 300 | DE421 (Sun, Moon) and PyEphem (stars) | Topocentric azimuth and elevation, from five observers across both hemispheres |
 
 ## Why an ephemeris is the checker and not a dependency
 
@@ -40,10 +40,12 @@ that moves the Sun's direction, this catches it.
 **`oracle.csv` is two different claims in one file, and the `source` column
 says which is which.**
 
-*Sun rows (`de421`)* are independent in the same way `sun_gcrs.csv` is, but
-one layer further out: they check the whole topocentric path — the observer's
-geodetic vertical, sidereal rotation, parallax — rather than just the
-geocentric vector.
+*Sun and Moon rows (`de421`)* are independent in the same way `sun_gcrs.csv`
+is, but one layer further out: they check the whole topocentric path — the
+observer's geodetic vertical, sidereal rotation, parallax — rather than just
+the geocentric vector. The Moon is where that matters most: it is close
+enough that parallax moves it by up to 0.95°, twice its own diameter, so a
+Moon row exercises corrections a Sun row barely touches.
 
 *Star rows (`pyephem`)* are **not** an independent check on the coordinates.
 PyEphem is where `star_catalog.py` came from, so these rows can only prove
