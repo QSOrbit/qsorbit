@@ -71,6 +71,37 @@ class PassEvent:
 
 
 @dataclass(frozen=True)
+class VisibleWindow:
+    """When during a pass a satellite can actually be seen by eye.
+
+    Naked-eye visibility needs two things at once: the satellite lit by
+    the Sun, and the observer's own sky dark. Neither holds for a whole
+    pass in general -- a satellite can rise already sunlit and fly into
+    Earth's shadow partway across, which is what the station watched
+    SL-14 R/B do at 21:34 on the evening this feature was first
+    proposed. A single flag at closest approach cannot say that, which
+    is why this carries an interval instead.
+
+    ``VisibleWindow`` is a value object: immutable and comparable by
+    value.
+
+    Args:
+        begins: When the satellite becomes visible -- either the moment
+            it leaves Earth's shadow, or the pass's own AOS if it was
+            already lit when it rose.
+        ends: When it stops being visible -- shadow entry, or LOS.
+    """
+
+    begins: PassEvent
+    ends: PassEvent
+
+    @property
+    def duration_s(self) -> float:
+        """How long the satellite is visible for, in seconds."""
+        return (self.ends.time - self.begins.time).total_seconds()
+
+
+@dataclass(frozen=True)
 class Pass:
     """One continuous period a target is above the visibility threshold.
 
@@ -99,6 +130,13 @@ class Pass:
             and a caller that needs the fade-in/fade-out shape of that
             should sample :func:`~qsorbit.core.tracker.sun.is_illuminated`
             itself across ``az_track``'s own times.
+            visible_window: When during the pass the satellite is actually
+            visible, or ``None`` if it never is -- also ``None`` when
+            illumination wasn't requested. This is the honest form of
+            :attr:`illuminated`, which only answers for the single
+            instant of closest approach; a pass can be visible for
+            ninety seconds of its six minutes and ``illuminated`` would
+            report whichever happened to be true at TCA. Prefer this.
     """
 
     aos: PassEvent
@@ -107,6 +145,7 @@ class Pass:
     max_elevation_deg: float
     az_track: tuple[PassEvent, ...]
     illuminated: bool | None = None
+    visible_window: VisibleWindow | None = None
 
 
 def _effective_min_elevation_deg(
@@ -248,6 +287,128 @@ def _is_visually_illuminated(
     )
 
 
+#: How finely the visible-window search samples a pass before refining,
+#: in seconds. A satellite crosses Earth's shadow boundary sharply, so
+#: this only has to be fine enough not to step over a short window
+#: entirely; the boundary itself is then found by bisection. Fifteen
+#: seconds puts roughly forty samples across a typical LEO pass.
+VISIBILITY_STEP_S = 15.0
+
+#: How many bisection halvings refine each edge of a visible window.
+#: Twelve halvings of a 15 s step is under 4 ms -- far finer than the
+#: minute-resolution anything displays it at, and cheap.
+VISIBILITY_REFINEMENTS = 12
+
+
+def _refine_visibility_edge(
+    is_visible,
+    dark_time: datetime,
+    lit_time: datetime,
+) -> datetime:
+    """Bisect between a known-dark and a known-lit instant.
+
+    Unlike :func:`_refine_crossing`, which brackets a sign change in a
+    continuous margin, this brackets a change in a *boolean*. There is
+    no value to interpolate, so plain bisection is all that is
+    available -- and all that is needed, since the underlying shadow
+    boundary is geometrically sharp.
+    """
+    for _ in range(VISIBILITY_REFINEMENTS):
+        midpoint = dark_time + (lit_time - dark_time) / 2
+        if is_visible(midpoint):
+            lit_time = midpoint
+        else:
+            dark_time = midpoint
+    return lit_time
+
+
+def _visible_window(
+    target: Target,
+    observer: ObserverLocation,
+    aos_time: datetime,
+    los_time: datetime,
+    *,
+    twilight_sun_elevation_deg: float,
+) -> VisibleWindow | None:
+    """Find when during a pass the satellite is visible to the naked eye.
+
+    Samples the pass, finds the contiguous stretches where the target is
+    both sunlit and the observer's sky is dark, and refines the edges of
+    the longest one by bisection.
+
+    **The longest stretch, not the first.** A pass can in principle
+    produce more than one -- a grazing shadow crossing, or a long pass
+    straddling the twilight threshold -- and reporting the first would
+    hand the operator a ten-second sliver while ignoring the four
+    minutes after it. Rare, but silently wrong when it happens.
+
+    Returns:
+        The window, or ``None`` if the satellite is never visible during
+        this pass.
+
+    Raises:
+        TypeError: If ``target`` has no ``state_at`` method, via
+            :func:`_is_visually_illuminated`.
+    """
+
+    def is_visible(when: datetime) -> bool:
+        return _is_visually_illuminated(
+            target,
+            observer,
+            PassEvent(
+                time=when, sky_position=target.topocentric_state(observer, when).sky_position
+            ),
+            twilight_sun_elevation_deg=twilight_sun_elevation_deg,
+        )
+
+    duration_s = (los_time - aos_time).total_seconds()
+    steps = max(2, int(duration_s // VISIBILITY_STEP_S) + 1)
+    samples = [aos_time + timedelta(seconds=duration_s * n / steps) for n in range(steps + 1)]
+    flags = [is_visible(when) for when in samples]
+
+    # Contiguous runs of True, as (first_index, last_index) inclusive.
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, lit in enumerate(flags):
+        if lit and start is None:
+            start = index
+        elif not lit and start is not None:
+            runs.append((start, index - 1))
+            start = None
+    if start is not None:
+        runs.append((start, len(flags) - 1))
+
+    if not runs:
+        return None
+
+    first_index, last_index = max(runs, key=lambda run: run[1] - run[0])
+
+    # An edge that sits on the pass's own boundary is not a shadow
+    # crossing -- the satellite was already lit when it rose, or still
+    # lit when it set -- so there is nothing to bisect toward.
+    begins_at = (
+        samples[first_index]
+        if first_index == 0
+        else _refine_visibility_edge(is_visible, samples[first_index - 1], samples[first_index])
+    )
+    ends_at = (
+        samples[last_index]
+        if last_index == len(samples) - 1
+        else _refine_visibility_edge(is_visible, samples[last_index + 1], samples[last_index])
+    )
+
+    return VisibleWindow(
+        begins=PassEvent(
+            time=begins_at,
+            sky_position=target.topocentric_state(observer, begins_at).sky_position,
+        ),
+        ends=PassEvent(
+            time=ends_at,
+            sky_position=target.topocentric_state(observer, ends_at).sky_position,
+        ),
+    )
+
+
 def _build_pass(
     target: Target,
     observer: ObserverLocation,
@@ -264,9 +425,17 @@ def _build_pass(
     tca_event = _find_tca(target, observer, aos_time, los_time)
 
     illuminated: bool | None = None
+    window: VisibleWindow | None = None
     if include_illumination:
         illuminated = _is_visually_illuminated(
             target, observer, tca_event, twilight_sun_elevation_deg=twilight_sun_elevation_deg
+        )
+        window = _visible_window(
+            target,
+            observer,
+            aos_time,
+            los_time,
+            twilight_sun_elevation_deg=twilight_sun_elevation_deg,
         )
 
     return Pass(
@@ -276,6 +445,7 @@ def _build_pass(
         max_elevation_deg=tca_event.sky_position.elevation,
         az_track=az_track,
         illuminated=illuminated,
+        visible_window=window,
     )
 
 

@@ -695,7 +695,7 @@ class TestPlan:
 
         out = capsys.readouterr().out
         assert code == 0
-        assert "naked-eye visible near TCA:" in out
+        assert "naked-eye visible:" in out
 
     def test_without_visual_no_illumination_line(
         self, plan_config_path, tle_dir_path, profiles_dir_path, capsys
