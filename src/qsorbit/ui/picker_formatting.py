@@ -34,6 +34,7 @@ from typing import Final
 
 from qsorbit.core.picker import Band, PickerEntry, primary_transmitter
 from qsorbit.core.profiles import AliveStatus, CatalogManifest, ReliabilityClass
+from qsorbit.core.tracker import Pass
 
 #: Shown wherever a row has nothing to say for a cell -- no pass in the
 #: search window, no transmitter to read a downlink or mode from, or no
@@ -42,6 +43,13 @@ from qsorbit.core.profiles import AliveStatus, CatalogManifest, ReliabilityClass
 #: established: a placeholder, never a number that looks measured but
 #: isn't.
 NO_DATA_LABEL: Final = "-"
+
+#: What the naked-eye column says for a window shorter than a minute.
+#: ``"0 min"`` is what rounding would produce and it reads as a bug --
+#: a window exists, so the cell must not say there is nothing. This
+#: says "real, but not worth walking outside for", which is the honest
+#: reading of a twenty-second sliver of visibility.
+SUB_MINUTE_LABEL: Final = "<1 min"
 
 #: The mockup's tier letters, in :data:`~qsorbit.core.profiles.profile.
 #: _RELIABILITY_ORDER`'s own order -- A is the most favorable
@@ -71,6 +79,42 @@ _BAND_LABELS: dict[Band, str] = {
     Band.SEVENTY_CM: "70 cm",
     Band.OTHER: "other",
 }
+
+
+def naked_eye_text(one_pass: Pass | None, *, local_zone: tzinfo | None = None) -> str:
+    """When to be outside for a pass, as ``"HH:MM · N min"`` in local time.
+
+    **Deliberately not the same shape as the pass column.** That column
+    already reads ``"HH:MM → HH:MM"``, and rendering the window the
+    same way puts two near-identical cells side by side that a reader
+    has to diff character by character to tell apart. A start time and
+    a duration answers the operator's actual question -- *when do I go
+    out, and how long am I standing there* -- and cannot be mistaken
+    for the pass itself at a glance.
+
+    Args:
+        one_pass: The pass whose window to describe, or ``None``.
+        local_zone: The zone to show the start time in, following
+            :func:`picker_row_text`'s identical parameter.
+
+    Returns:
+        The window's start and duration, or :data:`NO_DATA_LABEL` when
+        there is no pass, no window on it, or the window was never
+        computed at all -- see
+        :func:`~qsorbit.core.picker.build_picker_entries`'s
+        ``include_visible_window``. **All three read the same**, which
+        is a real limitation: a column of dashes looks identical
+        whether every pass is in daylight or the caller simply never
+        asked. The widget avoids it by always asking.
+    """
+    if one_pass is None or one_pass.visible_window is None:
+        return NO_DATA_LABEL
+
+    window = one_pass.visible_window
+    begins_local = window.begins.time.astimezone(local_zone)
+    if window.duration_s < 60.0:
+        return f"{begins_local:%H:%M} · {SUB_MINUTE_LABEL}"
+    return f"{begins_local:%H:%M} · {window.duration_s / 60.0:.0f} min"
 
 
 def reliability_letter(reliability: ReliabilityClass) -> str:
@@ -104,6 +148,9 @@ class PickerRowText:
         pass_text: ``"HH:MM → HH:MM"`` (AOS to LOS) in local time, or
             :data:`NO_DATA_LABEL` if this satellite has no pass in the
             picker's search window.
+        naked_eye_text: When during the pass the satellite is visible
+            to the naked eye, as ``"HH:MM · N min"``, or
+            :data:`NO_DATA_LABEL` -- see :func:`naked_eye_text`.
         max_elevation_text: The pass's peak elevation, e.g. ``"62°"``,
             or :data:`NO_DATA_LABEL`.
         downlink_text: The primary transmitter's downlink frequency in
@@ -119,6 +166,7 @@ class PickerRowText:
     name: str
     status_role: str
     pass_text: str
+    naked_eye_text: str
     max_elevation_text: str
     downlink_text: str
     mode_text: str
@@ -170,6 +218,7 @@ def picker_row_text(entry: PickerEntry, *, local_zone: tzinfo | None = None) -> 
         name=profile.name,
         status_role=alive_status_role(profile.alive.status),
         pass_text=pass_text,
+        naked_eye_text=naked_eye_text(entry.next_pass, local_zone=local_zone),
         max_elevation_text=max_elevation_text,
         downlink_text=downlink_text,
         mode_text=mode_text,

@@ -21,6 +21,7 @@ from qsorbit.core.tracker.pass_prediction import (
     DEFAULT_TWILIGHT_SUN_ELEVATION_DEG,
     VisibleWindow,
     predict_passes,
+    visible_window,
 )
 from qsorbit.core.tracker.satellite import Satellite
 from qsorbit.core.tracker.state import EciState
@@ -192,6 +193,47 @@ class TestTheWindowSaysWhatTheFlagCannot:
                     <= one_pass.tca.time
                     <= one_pass.visible_window.ends.time
                 )
+
+
+class TestTheStandaloneEntryPoint:
+    """``visible_window()`` must be the same search, not a similar one.
+
+    It exists purely so a caller holding one :class:`Pass` can pay for
+    that pass alone instead of for every pass in a search window. That
+    is only a saving if the answer is *identical* -- a cheaper function
+    that quietly disagrees with the one it replaces would be a far
+    worse bug than the cost it avoided, and it would show up as the
+    picker and ``qsorbit plan --visual`` contradicting each other about
+    the same pass.
+    """
+
+    def test_it_agrees_exactly_with_the_search_that_computes_them_in_bulk(self, satellite, passes):
+        checked = 0
+        for one_pass in passes:
+            standalone = visible_window(satellite, OBSERVER, one_pass)
+            in_bulk = one_pass.visible_window
+
+            if in_bulk is None:
+                assert standalone is None
+            else:
+                assert standalone is not None
+                assert standalone.begins.time == in_bulk.begins.time
+                assert standalone.ends.time == in_bulk.ends.time
+                checked += 1
+
+        # Without this the loop above passes on a sample where every
+        # window is None, which proves only that None == None.
+        assert checked > 0
+
+    def test_a_target_without_state_at_is_refused(self, satellite, passes):
+        from qsorbit.core.tracker.celestial import celestial_target
+
+        # The same category error predict_passes refuses, refused at
+        # this entry point too -- a public function that accepted a
+        # star and returned None would be a quieter way to get the
+        # wrong answer than the one TestNonSatelliteTargets guards.
+        with pytest.raises(TypeError, match="state_at"):
+            visible_window(celestial_target("vega"), OBSERVER, passes[0])
 
 
 class TestNonSatelliteTargets:

@@ -45,6 +45,7 @@ from qsorbit.core.tracker.pass_prediction import (
     PassEvent,
     VisibleWindow,
     predict_passes,
+    visible_window,
 )
 from qsorbit.core.tracker.satellite import Satellite
 from qsorbit.core.tracker.star_catalog import STARS, Star
@@ -88,4 +89,5 @@ __all__ = [
     "sun_elevation_deg",
     "sun_gcrs_km",
     "uplink_transmit_frequency",
+    "visible_window",
 ]

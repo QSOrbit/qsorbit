@@ -7,13 +7,14 @@ its tier-1 alive status. No Qt here, same reasoning
 the filtering logic is worth testing without a display, and this
 module is what makes that possible.
 
-**The fifth filter axis lives on the entry, not the profile.**
+**Two filter axes live on the entry, not the profile.**
 "Ever-visible-from-this-latitude" (Chunk D PR2b) is a fact about an
 orbit and this station's latitude -- see
-:mod:`qsorbit.core.orbit_geometry` -- not about a
-:class:`~qsorbit.core.profiles.profile.SatelliteProfile` itself, so it
-does not fit :func:`passes_filters`'s ``profile``-only signature.
-:func:`entry_passes_filters` wraps it around the untouched
+:mod:`qsorbit.core.orbit_geometry` -- and "naked-eye visible" (Chunk F
+PR4b) is a fact about one particular pass. Neither is about a
+:class:`~qsorbit.core.profiles.profile.SatelliteProfile` itself, so
+neither fits :func:`passes_filters`'s ``profile``-only signature.
+:func:`entry_passes_filters` wraps both around the untouched
 :func:`passes_filters` instead of reworking that already-shipped
 function.
 
@@ -34,7 +35,7 @@ list.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -48,7 +49,14 @@ from qsorbit.core.profiles import (
     SatelliteProfile,
     Transmitter,
 )
-from qsorbit.core.tracker import ObserverLocation, Pass, Satellite, TrackerError, predict_passes
+from qsorbit.core.tracker import (
+    ObserverLocation,
+    Pass,
+    Satellite,
+    TrackerError,
+    predict_passes,
+    visible_window,
+)
 
 #: How far ahead the picker looks for a next pass, by default. A
 #: separate constant from __main__.py's DEFAULT_PLAN_HOURS -- core/
@@ -147,7 +155,7 @@ def primary_transmitter(profile: SatelliteProfile) -> Transmitter | None:
 
 @dataclass(frozen=True)
 class PickerFilters:
-    """The picker's active filter state -- five axes, all "no restriction" by default.
+    """The picker's active filter state -- six axes, all "no restriction" by default.
 
     Every set (or bool) field means "if active, keep only entries
     matching it; if not, this axis restricts nothing" -- so the
@@ -178,6 +186,17 @@ class PickerFilters:
             orbit_geometry`. Checked by :func:`entry_passes_filters`,
             not :func:`passes_filters` -- it needs the entry, not just
             the profile.
+        require_naked_eye_visible: If ``True``, keep only entries whose
+            next pass carries a naked-eye visible window. **Note what
+            this axis is not.** It is a fact about *this* pass, not
+            about the satellite: the same bird fails this filter at
+            noon and passes it after dusk, where
+            ``require_visible_from_latitude`` above is permanent. It is
+            also the one axis that depends on data the entry may not
+            have -- an entry built without
+            ``include_visible_window=True`` has no window on any pass,
+            so this filter would empty the table. See
+            :func:`build_picker_entries`.
     """
 
     needs_transmitter: bool = False
@@ -185,6 +204,7 @@ class PickerFilters:
     mode_groups: frozenset[ModeGroup] = frozenset()
     reliability_classes: frozenset[ReliabilityClass] = frozenset()
     require_visible_from_latitude: bool = False
+    require_naked_eye_visible: bool = False
 
 
 def passes_filters(profile: SatelliteProfile, filters: PickerFilters) -> bool:
@@ -209,13 +229,21 @@ def passes_filters(profile: SatelliteProfile, filters: PickerFilters) -> bool:
 def entry_passes_filters(entry: PickerEntry, filters: PickerFilters) -> bool:
     """Whether ``entry`` survives every active axis of ``filters``, including the latitude axis.
 
-    Combines :func:`passes_filters` on ``entry.profile`` with the one
-    filter axis :func:`passes_filters` cannot check itself --
+    Combines :func:`passes_filters` on ``entry.profile`` with the two
+    filter axes :func:`passes_filters` cannot check itself --
     ``require_visible_from_latitude`` needs ``entry.
-    visible_from_latitude``, a fact about the matched satellite's
-    orbit and this station, not about the profile alone.
+    visible_from_latitude``, and ``require_naked_eye_visible`` needs
+    ``entry.next_pass``. Neither is a fact about the profile alone.
+
+    An entry with no pass at all fails ``require_naked_eye_visible``:
+    there is nothing to go outside for, which is the same answer as a
+    pass in daylight even though the reason differs.
     """
     if filters.require_visible_from_latitude and not entry.visible_from_latitude:
+        return False
+    if filters.require_naked_eye_visible and (
+        entry.next_pass is None or entry.next_pass.visible_window is None
+    ):
         return False
     return passes_filters(entry.profile, filters)
 
@@ -233,7 +261,11 @@ class PickerEntry:
             tracker.pass_prediction.Pass` within the search window, or
             ``None`` if this satellite has none in that window -- still
             a real entry (it has a curated profile and a matching TLE),
-            just with nothing to show in the time columns.
+            just with nothing to show in the time columns. Carries a
+            :attr:`~qsorbit.core.tracker.pass_prediction.Pass.
+            visible_window` only when the entry was built with
+            ``include_visible_window=True`` -- see
+            :func:`build_picker_entries`.
         visible_from_latitude: Whether this satellite's orbit can ever
             put it above this station's flat horizon at all, per
             :func:`~qsorbit.core.orbit_geometry.is_ever_visible_from_latitude`
@@ -256,6 +288,7 @@ def build_picker_entries(
     now: datetime,
     *,
     hours: float = DEFAULT_LOOKAHEAD_HOURS,
+    include_visible_window: bool = False,
 ) -> tuple[PickerEntry, ...]:
     """Build one :class:`PickerEntry` per TLE in ``tle_dir`` with a matching curated profile.
 
@@ -276,6 +309,14 @@ def build_picker_entries(
         now: Search window start.
         hours: Search window length. Defaults to
             :data:`DEFAULT_LOOKAHEAD_HOURS`.
+        include_visible_window: When ``True``, attach a naked-eye
+            :class:`~qsorbit.core.tracker.pass_prediction.VisibleWindow`
+            to each entry's ``next_pass``. Off by default because it is
+            not free -- this walks every TLE and runs a full SGP4 pass
+            search already, on the GUI thread when the picker widget is
+            the caller, and this adds roughly a further 4%. Required
+            for ``PickerFilters.require_naked_eye_visible`` to mean
+            anything.
 
     Returns:
         Entries sorted with an upcoming pass first (earliest AOS
@@ -295,6 +336,18 @@ def build_picker_entries(
 
         passes = predict_passes(satellite, observer, now, end, horizon_mask=horizon)
         next_pass = min(passes, key=lambda one_pass: one_pass.aos.time) if passes else None
+        if include_visible_window and next_pass is not None:
+            # Only the pass that will actually be displayed, which is
+            # the whole reason this uses visible_window() rather than
+            # predict_passes(include_illumination=True). Pass.
+            # illuminated stays None deliberately: nothing here reads
+            # it, and computing it would be a second Sun position per
+            # entry to answer a question the window already answers
+            # better.
+            next_pass = replace(
+                next_pass,
+                visible_window=visible_window(satellite, observer, next_pass),
+            )
         visible_from_latitude = is_ever_visible_from_latitude(
             satellite.inclination_deg, satellite.mean_altitude_km, observer.latitude
         )

@@ -46,8 +46,28 @@ from qsorbit.core.profiles import (  # noqa: E402
     SatelliteProfile,
     Transmitter,
 )
-from qsorbit.core.tracker import ObserverLocation, Pass, PassEvent  # noqa: E402
+from qsorbit.core.tracker import (  # noqa: E402
+    ObserverLocation,
+    Pass,
+    PassEvent,
+    VisibleWindow,
+)
 from qsorbit.ui.picker_widget import _COLUMN_HEADERS, PickerWidget  # noqa: E402
+
+
+def _column(header: str) -> int:
+    """Which table column a header occupies.
+
+    Tests used to spell these as literal indexes, which went quietly
+    wrong the moment Chunk F PR4b inserted a column in the middle: the
+    tier assertion below started reading the mode cell and failed with
+    a confusing message about ``"SSB"``. Deriving the index from the
+    widget's own header tuple means inserting a column moves the test
+    with it, and a *renamed* column fails here with a clear
+    ``KeyError`` rather than an assertion about the wrong cell.
+    """
+    return _COLUMN_HEADERS.index(header)
+
 
 TEME_EXAMPLE_TLE = """\
 TEME EXAMPLE
@@ -75,6 +95,35 @@ def _profile(norad_id=5, name="RS-44", transmitters=(), alive=None):
         name=name,
         transmitters=transmitters,
         alive=alive if alive is not None else _alive(),
+    )
+
+
+def _pass(*, with_window: bool):
+    """A hand-built pass, optionally carrying a naked-eye window.
+
+    Built here rather than propagated, for the reason the module
+    docstring gives: what the widget *does with* a window is the
+    subject, and whether the sky was really dark at that instant is
+    ``test_picker.py``'s and ``test_visible_window.py``'s job.
+    """
+    aos = PassEvent(time=NOW + timedelta(minutes=30), sky_position=AzEl(180.0, 5.0))
+    tca = PassEvent(time=NOW + timedelta(minutes=45), sky_position=AzEl(90.0, 62.0))
+    los = PassEvent(time=NOW + timedelta(minutes=60), sky_position=AzEl(20.0, 5.0))
+    window = (
+        VisibleWindow(
+            begins=PassEvent(time=NOW + timedelta(minutes=35), sky_position=AzEl(150.0, 20.0)),
+            ends=PassEvent(time=NOW + timedelta(minutes=52), sky_position=AzEl(50.0, 18.0)),
+        )
+        if with_window
+        else None
+    )
+    return Pass(
+        aos=aos,
+        los=los,
+        tca=tca,
+        max_elevation_deg=62.0,
+        az_track=(aos, tca, los),
+        visible_window=window,
     )
 
 
@@ -129,7 +178,7 @@ class TestFilterChips:
         widget._needs_transmitter_chip.setChecked(True)
 
         assert widget._table.rowCount() == 1
-        assert widget._table.item(0, 1).text() == "A"
+        assert widget._table.item(0, _column("satellite")).text() == "A"
 
     def test_band_chip_keeps_only_matching_profiles(self, widget):
         seventy_cm = _profile(
@@ -144,7 +193,7 @@ class TestFilterChips:
         widget._band_chips[Band.SEVENTY_CM].setChecked(True)
 
         assert widget._table.rowCount() == 1
-        assert widget._table.item(0, 1).text() == "SEVENTY"
+        assert widget._table.item(0, _column("satellite")).text() == "SEVENTY"
 
     def test_mode_chip_keeps_only_matching_profiles(self, widget):
         fm = _profile(name="FM-SAT", transmitters=(_transmitter(mode=Mode.FM),))
@@ -157,7 +206,7 @@ class TestFilterChips:
         widget._mode_chips[ModeGroup.FM].setChecked(True)
 
         assert widget._table.rowCount() == 1
-        assert widget._table.item(0, 1).text() == "FM-SAT"
+        assert widget._table.item(0, _column("satellite")).text() == "FM-SAT"
 
     def test_reliability_chip_keeps_only_matching_profiles(self, widget):
         beacon = _profile(
@@ -176,7 +225,7 @@ class TestFilterChips:
         widget._reliability_chips[ReliabilityClass.UNCONDITIONAL].setChecked(True)
 
         assert widget._table.rowCount() == 1
-        assert widget._table.item(0, 1).text() == "BEACON"
+        assert widget._table.item(0, _column("satellite")).text() == "BEACON"
 
     def test_two_band_chips_together_are_an_or_not_an_and(self, widget):
         seventy_cm = _profile(
@@ -204,10 +253,71 @@ class TestFilterChips:
         widget._visible_from_latitude_chip.setChecked(True)
 
         assert widget._table.rowCount() == 1
-        assert widget._table.item(0, 1).text() == "REACHABLE"
+        assert widget._table.item(0, _column("satellite")).text() == "REACHABLE"
+
+    def test_naked_eye_chip_keeps_only_entries_whose_pass_has_a_window(self, widget):
+        widget._entries = (
+            PickerEntry(
+                profile=_profile(name="TONIGHT", transmitters=(_transmitter(),)),
+                next_pass=_pass(with_window=True),
+                visible_from_latitude=True,
+            ),
+            PickerEntry(
+                profile=_profile(name="DAYLIGHT", transmitters=(_transmitter(),)),
+                next_pass=_pass(with_window=False),
+                visible_from_latitude=True,
+            ),
+        )
+
+        widget._naked_eye_chip.setChecked(True)
+
+        assert widget._table.rowCount() == 1
+        assert widget._table.item(0, _column("satellite")).text() == "TONIGHT"
+
+    def test_the_naked_eye_chip_does_not_say_visible(self, widget):
+        # "visible from here" next door already means something else
+        # entirely -- whether this orbit can rise at this latitude at
+        # all. Two chips both saying "visible" about different
+        # questions is the confusion this wording exists to avoid.
+        assert widget._naked_eye_chip.text() == "naked-eye"
+        assert "visible" not in widget._naked_eye_chip.text()
 
 
 class TestRowRendering:
+    def test_the_naked_eye_column_shows_the_window(self, widget):
+        widget._entries = (
+            PickerEntry(
+                profile=_profile(name="TONIGHT", transmitters=(_transmitter(),)),
+                next_pass=_pass(with_window=True),
+                visible_from_latitude=True,
+            ),
+        )
+        widget._render_table()
+
+        cell = widget._table.item(0, _column("naked-eye")).text()
+
+        assert cell != "-"
+        assert cell.endswith("min")
+
+    def test_a_pass_with_no_window_shows_the_placeholder(self, widget):
+        widget._entries = (
+            PickerEntry(
+                profile=_profile(name="DAYLIGHT", transmitters=(_transmitter(),)),
+                next_pass=_pass(with_window=False),
+                visible_from_latitude=True,
+            ),
+        )
+        widget._render_table()
+
+        assert widget._table.item(0, _column("naked-eye")).text() == "-"
+
+    def test_the_naked_eye_column_sits_beside_the_pass_it_qualifies(self):
+        # Deliberate placement, not incidental: the two cells are only
+        # useful read together ("is that whole pass worth going out
+        # for, or a slice of it?"). Pinned so that separating them
+        # later has to be a decision rather than a side effect.
+        assert _column("naked-eye") == _column("next pass (local)") + 1
+
     def test_a_dead_satellite_gets_a_dim_status_dot(self, widget):
         dead = _profile(
             name="DEAD-SAT",
@@ -219,7 +329,7 @@ class TestRowRendering:
 
         dot = widget._table.cellWidget(0, 0)
         assert dot.property("role") == "dim"
-        assert widget._table.item(0, 6).text() == "dead 2025-06"
+        assert widget._table.item(0, _column("tier")).text() == "dead 2025-06"
 
 
 class TestColumnWidths:
@@ -238,26 +348,21 @@ class TestColumnWidths:
     a test written against it passes on the broken widget. The header's
     ``sectionSizeHint`` is the number Qt actually needs (117 px), and
     comparing against it is what makes this test able to fail.
+
+    The naked-eye column raised the stake rather than changing the
+    argument: a clipped ``"21:03 · 9 min"`` loses the duration,
+    which is the whole payload of the cell.
     """
 
-    def _entry_with_a_full_width_pass(self):
-        aos = PassEvent(time=NOW + timedelta(minutes=37), sky_position=AzEl(204.0, 5.0))
-        tca = PassEvent(time=NOW + timedelta(minutes=45), sky_position=AzEl(120.0, 62.0))
-        los = PassEvent(time=NOW + timedelta(minutes=52), sky_position=AzEl(8.0, 5.0))
+    def _row(self):
         return PickerEntry(
             profile=_profile(name="RS-44", transmitters=(_transmitter(),)),
-            next_pass=Pass(
-                aos=aos,
-                los=los,
-                tca=tca,
-                max_elevation_deg=62.0,
-                az_track=(aos, tca, los),
-            ),
+            next_pass=_pass(with_window=True),
             visible_from_latitude=True,
         )
 
     def test_no_column_is_narrower_than_the_width_qt_asks_for(self, widget):
-        widget._entries = (self._entry_with_a_full_width_pass(),)
+        widget._entries = (self._row(),)
         widget._render_table()
         widget.resize(1000, 320)
 
@@ -276,12 +381,12 @@ class TestColumnWidths:
         # on the right. The test above would pass perfectly well with
         # the Stretch mode deleted, so this pins it: `satellite` is the
         # one column given more room than its own contents need.
-        widget._entries = (self._entry_with_a_full_width_pass(),)
+        widget._entries = (self._row(),)
         widget._render_table()
         widget.resize(1000, 320)
 
         header = widget._table.horizontalHeader()
-        satellite = _COLUMN_HEADERS.index("satellite")
+        satellite = _column("satellite")
 
         assert widget._table.columnWidth(satellite) > header.sectionSizeHint(satellite)
 
@@ -387,7 +492,8 @@ class TestRefreshEndToEnd:
         )
 
         assert subject._table.rowCount() == 1
-        assert subject._table.item(0, 1).text() == "TEME EXAMPLE"
-        assert subject._table.item(0, 2).text() != "-"  # a real pass, not the placeholder
+        assert subject._table.item(0, _column("satellite")).text() == "TEME EXAMPLE"
+        # A real pass, not the placeholder.
+        assert subject._table.item(0, _column("next pass (local)")).text() != "-"
         assert "catalogue: shipped 2026-08-25 (3 d)" == subject._status_label.text()
         assert subject._status_label.property("role") == "dim"

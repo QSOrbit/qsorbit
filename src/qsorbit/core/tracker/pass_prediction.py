@@ -409,6 +409,55 @@ def _visible_window(
     )
 
 
+def visible_window(
+    target: Target,
+    observer: ObserverLocation,
+    one_pass: Pass,
+    *,
+    twilight_sun_elevation_deg: float = DEFAULT_TWILIGHT_SUN_ELEVATION_DEG,
+) -> VisibleWindow | None:
+    """When during an already-predicted pass the target is visible to the naked eye.
+
+    The same search :func:`predict_passes` runs internally when
+    ``include_illumination=True``, exposed for a caller that already
+    holds a :class:`Pass` and wants the window for *that one* rather
+    than for every pass in a search window.
+
+    **Why this exists as a separate entry point.** The picker predicts
+    a full day of passes per satellite and then displays exactly one of
+    them -- the next. Asking :func:`predict_passes` for illumination
+    would compute a window for every pass it found and throw all but
+    one away, measured at roughly seven times the cost of computing the
+    one actually shown.
+
+    Args:
+        target: The target the pass belongs to. Must be a concrete
+            :class:`~qsorbit.core.tracker.satellite.Satellite`, for the
+            reason :func:`predict_passes` gives.
+        observer: The observer the pass was predicted for. Passing a
+            different one answers about a different sky, silently.
+        one_pass: The pass to search within. Only its
+            :attr:`Pass.aos` and :attr:`Pass.los` times are read.
+        twilight_sun_elevation_deg: How low the Sun must be for the sky
+            to count as dark. Defaults to
+            :data:`DEFAULT_TWILIGHT_SUN_ELEVATION_DEG`.
+
+    Returns:
+        The window, or ``None`` if the target is never visible during
+        this pass.
+
+    Raises:
+        TypeError: If ``target`` has no ``state_at`` method.
+    """
+    return _visible_window(
+        target,
+        observer,
+        one_pass.aos.time,
+        one_pass.los.time,
+        twilight_sun_elevation_deg=twilight_sun_elevation_deg,
+    )
+
+
 def _build_pass(
     target: Target,
     observer: ObserverLocation,

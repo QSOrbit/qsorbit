@@ -14,7 +14,10 @@ property on a timer because that read costs nothing.
 :func:`~qsorbit.core.picker.build_picker_entries` does not: it walks
 every ``*.tle`` file in the configured directory and runs a full SGP4
 pass search per matched satellite, which is real CPU work on the GUI
-thread. Phil's call (Chunk D PR2): a **Refresh** button, matching the
+thread -- and Chunk F PR4b added a naked-eye visibility search on top
+of it, measured at about 4% more (it runs only on the one pass each
+row displays, not on every pass the search found). Phil's call (Chunk
+D PR2): a **Refresh** button, matching the
 CLI's own explicit ``--refresh-catalogue`` rather than a background
 timer that could stutter the shell on an interval nobody asked for.
 Filtering, by contrast, is instant -- toggling a chip re-renders the
@@ -68,10 +71,20 @@ from qsorbit.ui.picker_formatting import catalogue_staleness_text, format_band, 
 #: Column headers, in table order. The leading blank header is the
 #: status-dot column -- a dot needs no label, the mockup gives it none
 #: either.
+#:
+#: ``naked-eye`` sits directly after the pass it qualifies, because the
+#: question it answers ("is that whole pass worth going outside for, or
+#: a slice of it?") is only answerable by reading the two together. The
+#: wording matches ``qsorbit plan --visual``'s own output rather than
+#: introducing a second name for one concept -- and deliberately avoids
+#: the word "visible", which the ``visible from here`` chip already
+#: spends on a completely different question (can this orbit rise here
+#: at all).
 _COLUMN_HEADERS: Final = (
     "",
     "satellite",
     "next pass (local)",
+    "naked-eye",
     "max el",
     "downlink",
     "mode",
@@ -197,12 +210,13 @@ class PickerWidget(QWidget):
             ReliabilityClass.DEPENDENT: _make_chip("C"),
         }
         self._visible_from_latitude_chip = _make_chip("visible from here")
+        self._naked_eye_chip = _make_chip("naked-eye")
         all_chips = (
             (self._needs_transmitter_chip,)
             + tuple(self._band_chips.values())
             + tuple(self._mode_chips.values())
             + tuple(self._reliability_chips.values())
-            + (self._visible_from_latitude_chip,)
+            + (self._visible_from_latitude_chip, self._naked_eye_chip)
         )
         for chip in all_chips[1:]:
             chip_row.addWidget(chip)
@@ -255,6 +269,12 @@ class PickerWidget(QWidget):
             self._horizon,
             self._now(),
             hours=self._hours,
+            # Always on, never a constructor option. The naked-eye
+            # column and its chip are part of this widget, so a picker
+            # that skipped the computation would render a column of
+            # dashes indistinguishable from "no pass is visible
+            # tonight" -- see picker_formatting.naked_eye_text.
+            include_visible_window=True,
         )
         staleness = catalogue_staleness_text(self._manifest, today)
         self._status_label.setText(staleness or "")
@@ -290,6 +310,7 @@ class PickerWidget(QWidget):
                 rc for rc, chip in self._reliability_chips.items() if chip.isChecked()
             ),
             require_visible_from_latitude=self._visible_from_latitude_chip.isChecked(),
+            require_naked_eye_visible=self._naked_eye_chip.isChecked(),
         )
 
     def _render_table(self) -> None:
@@ -309,6 +330,7 @@ class PickerWidget(QWidget):
             cells = (
                 text.name,
                 text.pass_text,
+                text.naked_eye_text,
                 text.max_elevation_text,
                 text.downlink_text,
                 text.mode_text,

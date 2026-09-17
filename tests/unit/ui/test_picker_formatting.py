@@ -13,6 +13,7 @@ doesn't need a real orbit, only the shapes these functions read.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta, timezone
 
 from qsorbit.core.geometry import AzEl
@@ -26,13 +27,14 @@ from qsorbit.core.profiles import (
     SatelliteProfile,
     Transmitter,
 )
-from qsorbit.core.tracker import Pass, PassEvent
+from qsorbit.core.tracker import Pass, PassEvent, VisibleWindow
 from qsorbit.ui.picker_formatting import (
     NO_DATA_LABEL,
     PickerRowText,
     alive_status_role,
     catalogue_staleness_text,
     format_band,
+    naked_eye_text,
     picker_row_text,
     reliability_letter,
 )
@@ -70,6 +72,53 @@ def _pass(aos_hour=1.0, los_hour=1.25, max_elevation_deg=62.0):
     return Pass(
         aos=aos, los=los, tca=tca, max_elevation_deg=max_elevation_deg, az_track=(aos, tca, los)
     )
+
+
+def _window(begins_hour=1.05, ends_hour=1.25):
+    """A visible window inside ``_pass()``'s own AOS/LOS bracket."""
+    return VisibleWindow(
+        begins=PassEvent(time=NOW + timedelta(hours=begins_hour), sky_position=AzEl(170.0, 20.0)),
+        ends=PassEvent(time=NOW + timedelta(hours=ends_hour), sky_position=AzEl(40.0, 12.0)),
+    )
+
+
+class TestNakedEyeText:
+    def test_a_window_reads_as_a_start_time_and_a_duration(self):
+        one_pass = _pass()
+        one_pass = replace(one_pass, visible_window=_window())
+
+        assert naked_eye_text(one_pass, local_zone=_EASTERN) == "21:03 · 12 min"
+
+    def test_it_does_not_look_like_the_pass_column(self):
+        # The design decision this column was built on, pinned so that
+        # "make the two time columns consistent" cannot be done by
+        # accident: two adjacent cells reading "21:00 → 21:15" and
+        # "21:03 → 21:15" are a reading puzzle, not a table.
+        one_pass = replace(_pass(), visible_window=_window())
+
+        assert "→" not in naked_eye_text(one_pass, local_zone=_EASTERN)
+
+    def test_the_start_time_is_shown_in_the_given_zone(self):
+        # UTC and Eastern differ by four hours here, so a formatter
+        # that forgot astimezone() lands on a different clock hour and
+        # this fails rather than passing by coincidence.
+        one_pass = replace(_pass(), visible_window=_window())
+
+        assert naked_eye_text(one_pass, local_zone=UTC).startswith("01:03")
+        assert naked_eye_text(one_pass, local_zone=_EASTERN).startswith("21:03")
+
+    def test_a_window_under_a_minute_does_not_round_to_zero(self):
+        # "0 min" reads as a bug in a cell that is claiming a window
+        # exists. See SUB_MINUTE_LABEL.
+        brief = replace(_pass(), visible_window=_window(begins_hour=1.05, ends_hour=1.055))
+
+        assert naked_eye_text(brief, local_zone=_EASTERN) == "21:03 · <1 min"
+
+    def test_a_pass_with_no_window_is_the_placeholder(self):
+        assert naked_eye_text(_pass(), local_zone=_EASTERN) == NO_DATA_LABEL
+
+    def test_no_pass_at_all_is_the_placeholder(self):
+        assert naked_eye_text(None, local_zone=_EASTERN) == NO_DATA_LABEL
 
 
 class TestReliabilityLetter:
@@ -120,11 +169,28 @@ class TestPickerRowText:
             name="RS-44",
             status_role="ok",
             pass_text="21:00 → 21:15",
+            naked_eye_text=NO_DATA_LABEL,
             max_elevation_text="62°",
             downlink_text="435.640",
             mode_text="SSB",
             tier_text="A",
         )
+
+    def test_a_pass_carrying_a_window_reaches_the_naked_eye_cell(self):
+        # The row builder has to actually consult the pass's window.
+        # Above, the same entry without one produces NO_DATA_LABEL --
+        # so a picker_row_text that hardcoded the placeholder would
+        # pass that test and fail this one.
+        entry = PickerEntry(
+            profile=_profile(transmitters=(_transmitter(),)),
+            next_pass=replace(_pass(), visible_window=_window()),
+            visible_from_latitude=True,
+        )
+
+        text = picker_row_text(entry, local_zone=_EASTERN)
+
+        assert text.naked_eye_text == "21:03 · 12 min"
+        assert text.pass_text == "21:00 → 21:15"
 
     def test_no_pass_in_the_window_shows_the_placeholder(self):
         entry = PickerEntry(
@@ -137,6 +203,7 @@ class TestPickerRowText:
 
         assert text.pass_text == NO_DATA_LABEL
         assert text.max_elevation_text == NO_DATA_LABEL
+        assert text.naked_eye_text == NO_DATA_LABEL
 
     def test_no_transmitter_shows_the_placeholder_for_downlink_mode_and_tier(self):
         """A profile that exists only to carry a curated alive fact.
