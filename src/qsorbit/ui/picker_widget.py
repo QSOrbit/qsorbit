@@ -217,6 +217,14 @@ class PickerWidget(QWidget):
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         header = self._table.horizontalHeader()
+        # Every column wide enough for what is in it, then `satellite`
+        # absorbs whatever slack is left. Without the first loop the
+        # narrow columns keep Qt's default 100 px, which is not enough
+        # for a pass ("19:37 -> 19:52" needs about 117 px at the shipped
+        # 13 px font) and silently elides it to "19:37 -> ..." -- the
+        # part that got cut being the half an operator actually needs.
+        for column in range(len(_COLUMN_HEADERS)):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self._table, 1)
 
