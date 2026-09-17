@@ -1212,7 +1212,20 @@ def _print_pass(profile: SatelliteProfile, one_pass: Pass) -> None:
     print(f"  TCA {one_pass.tca.time.isoformat()}  el {one_pass.max_elevation_deg:5.1f}")
     print(f"  LOS {one_pass.los.time.isoformat()}  az {one_pass.los.sky_position.azimuth:5.1f}")
     if one_pass.illuminated is not None:
-        print(f"  naked-eye visible near TCA: {'yes' if one_pass.illuminated else 'no'}")
+        window = one_pass.visible_window
+        if window is None:
+            print("  naked-eye visible: no")
+        else:
+            # The window rather than the old single flag, because the flag
+            # answered only for closest approach and over a three-day
+            # sample of one orbit it reported "no" for five passes out of
+            # eighteen that carried real visibility -- one of them nearly
+            # twenty-four minutes of it.
+            print(
+                f"  naked-eye visible: {window.begins.time.isoformat()}"
+                f" -> {window.ends.time.isoformat()}"
+                f"  ({window.duration_s / 60.0:.0f} min)"
+            )
     for transmitter in profile.transmitters:
         print(f"  {_format_transmitter(transmitter)}")
     print()

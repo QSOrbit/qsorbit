@@ -43,6 +43,7 @@ from qsorbit.core.tracker.pass_prediction import (
     DEFAULT_TWILIGHT_SUN_ELEVATION_DEG,
     Pass,
     PassEvent,
+    VisibleWindow,
     predict_passes,
 )
 from qsorbit.core.tracker.satellite import Satellite
@@ -74,6 +75,7 @@ __all__ = [
     "TleError",
     "TopocentricState",
     "TrackerError",
+    "VisibleWindow",
     "celestial_target",
     "celestial_target_names",
     "doppler_shifted_frequency",
