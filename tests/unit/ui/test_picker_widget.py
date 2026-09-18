@@ -22,7 +22,7 @@ Two different strategies, deliberately kept apart:
 from __future__ import annotations
 
 import textwrap
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -33,6 +33,7 @@ import pytest
 # test_waterfall_widget.py's own note).
 pytest.importorskip("PySide6.QtWidgets")
 
+from qsorbit.core.geometry import AzEl  # noqa: E402
 from qsorbit.core.horizon import HorizonMask  # noqa: E402
 from qsorbit.core.picker import Band, ModeGroup, PickerEntry  # noqa: E402
 from qsorbit.core.profiles import (  # noqa: E402
@@ -45,8 +46,8 @@ from qsorbit.core.profiles import (  # noqa: E402
     SatelliteProfile,
     Transmitter,
 )
-from qsorbit.core.tracker import ObserverLocation  # noqa: E402
-from qsorbit.ui.picker_widget import PickerWidget  # noqa: E402
+from qsorbit.core.tracker import ObserverLocation, Pass, PassEvent  # noqa: E402
+from qsorbit.ui.picker_widget import _COLUMN_HEADERS, PickerWidget  # noqa: E402
 
 TEME_EXAMPLE_TLE = """\
 TEME EXAMPLE
@@ -219,6 +220,70 @@ class TestRowRendering:
         dot = widget._table.cellWidget(0, 0)
         assert dot.property("role") == "dim"
         assert widget._table.item(0, 6).text() == "dead 2025-06"
+
+
+class TestColumnWidths:
+    """Every column wide enough for what is in it.
+
+    Found by rendering the widget rather than by a test: the pass
+    column had been eliding to ``"19:37 → ..."`` since Chunk D
+    shipped it, because six of the seven columns were left in Qt's
+    default ``Interactive`` mode at a flat 100 px. Nothing failed,
+    nothing warned -- the text is intact in the model and only the
+    *painted* cell is cut, so every assertion about cell contents kept
+    passing while the operator saw half a pass time.
+
+    ``sizeHintForColumn`` is not what this asserts against: it reports
+    the item's own hint (94 px here) and misses the view's margins, so
+    a test written against it passes on the broken widget. The header's
+    ``sectionSizeHint`` is the number Qt actually needs (117 px), and
+    comparing against it is what makes this test able to fail.
+    """
+
+    def _entry_with_a_full_width_pass(self):
+        aos = PassEvent(time=NOW + timedelta(minutes=37), sky_position=AzEl(204.0, 5.0))
+        tca = PassEvent(time=NOW + timedelta(minutes=45), sky_position=AzEl(120.0, 62.0))
+        los = PassEvent(time=NOW + timedelta(minutes=52), sky_position=AzEl(8.0, 5.0))
+        return PickerEntry(
+            profile=_profile(name="RS-44", transmitters=(_transmitter(),)),
+            next_pass=Pass(
+                aos=aos,
+                los=los,
+                tca=tca,
+                max_elevation_deg=62.0,
+                az_track=(aos, tca, los),
+            ),
+            visible_from_latitude=True,
+        )
+
+    def test_no_column_is_narrower_than_the_width_qt_asks_for(self, widget):
+        widget._entries = (self._entry_with_a_full_width_pass(),)
+        widget._render_table()
+        widget.resize(1000, 320)
+
+        header = widget._table.horizontalHeader()
+        too_narrow = [
+            _COLUMN_HEADERS[column]
+            for column in range(len(_COLUMN_HEADERS))
+            if widget._table.columnWidth(column) < header.sectionSizeHint(column)
+        ]
+
+        assert too_narrow == []
+
+    def test_the_satellite_column_still_absorbs_the_slack(self, widget):
+        # The other half of the same layout decision: sizing every
+        # column to its contents and stopping there leaves a ragged gap
+        # on the right. The test above would pass perfectly well with
+        # the Stretch mode deleted, so this pins it: `satellite` is the
+        # one column given more room than its own contents need.
+        widget._entries = (self._entry_with_a_full_width_pass(),)
+        widget._render_table()
+        widget.resize(1000, 320)
+
+        header = widget._table.horizontalHeader()
+        satellite = _COLUMN_HEADERS.index("satellite")
+
+        assert widget._table.columnWidth(satellite) > header.sectionSizeHint(satellite)
 
 
 class TestVisibleEntriesAndSignal:
