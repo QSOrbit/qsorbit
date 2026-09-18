@@ -338,6 +338,136 @@ class TestBuildPickerEntries:
         assert entries[0].visible_from_latitude is False
 
 
+class TestVisibleWindowOnTheEntry:
+    """The naked-eye window, and the flag that decides whether it is computed.
+
+    The two instants below are the same TLE seen from the same station
+    on the same day, chosen because the answer genuinely differs:
+
+    * ``NOW`` (28 Aug 00:00 UTC) -- the next pass begins 01:30 UTC and
+      carries a real 39-minute window. The satellite is sunlit and the
+      Ohio sky is dark, which is the whole point of the feature.
+    * ``NOW + 10 h`` -- the next pass begins 19:01 UTC with no window
+      at all. Sunlit still, but the observer's sky is not dark yet.
+
+    Using a real difference in the sky rather than a fabricated one
+    means a bug that always answers "no window" and a bug that always
+    answers "some window" each fail one of these.
+    """
+
+    DAYLIGHT_NEXT_PASS = NOW + timedelta(hours=10)
+
+    def _tle_dir(self, tmp_path, text=TEME_EXAMPLE_TLE):
+        directory = tmp_path / "tles"
+        directory.mkdir()
+        (directory / "teme.tle").write_text(textwrap.dedent(text), encoding="utf-8")
+        return directory
+
+    def _catalog(self):
+        return ProfileCatalog([_profile(norad_id=5, name="TEME EXAMPLE")])
+
+    def test_the_flag_attaches_a_window_when_the_pass_has_one(self, tmp_path):
+        entries = build_picker_entries(
+            self._catalog(),
+            self._tle_dir(tmp_path),
+            OBSERVER,
+            HorizonMask(),
+            NOW,
+            hours=24.0,
+            include_visible_window=True,
+        )
+
+        assert entries[0].next_pass.visible_window is not None
+
+    def test_without_the_flag_the_same_pass_carries_no_window(self, tmp_path):
+        # The load-bearing half. On its own "window is None" proves
+        # nothing -- it is also what a satellite in daylight returns,
+        # and what a build_picker_entries that never computed anything
+        # would return. Paired with the test above, on the identical
+        # inputs, it can only pass if the flag is what decides.
+        entries = build_picker_entries(
+            self._catalog(),
+            self._tle_dir(tmp_path),
+            OBSERVER,
+            HorizonMask(),
+            NOW,
+            hours=24.0,
+        )
+
+        assert entries[0].next_pass is not None
+        assert entries[0].next_pass.visible_window is None
+
+    def test_a_pass_with_no_window_reports_none_even_with_the_flag(self, tmp_path):
+        # The other half of the same argument: the flag must not be a
+        # switch that manufactures a window. This pass is in daylight.
+        entries = build_picker_entries(
+            self._catalog(),
+            self._tle_dir(tmp_path),
+            OBSERVER,
+            HorizonMask(),
+            self.DAYLIGHT_NEXT_PASS,
+            hours=24.0,
+            include_visible_window=True,
+        )
+
+        assert entries[0].next_pass is not None
+        assert entries[0].next_pass.visible_window is None
+
+    def test_illuminated_stays_uncomputed(self, tmp_path):
+        # Deliberate, not an oversight: nothing in the picker reads the
+        # TCA flag, and computing it would be a second Sun position per
+        # row. If a future change starts relying on it, this test is
+        # where that decision gets revisited rather than discovered.
+        entries = build_picker_entries(
+            self._catalog(),
+            self._tle_dir(tmp_path),
+            OBSERVER,
+            HorizonMask(),
+            NOW,
+            hours=24.0,
+            include_visible_window=True,
+        )
+
+        assert entries[0].next_pass.illuminated is None
+
+    def test_the_naked_eye_filter_keeps_a_pass_that_has_a_window(self, tmp_path):
+        entries = build_picker_entries(
+            self._catalog(),
+            self._tle_dir(tmp_path),
+            OBSERVER,
+            HorizonMask(),
+            NOW,
+            hours=24.0,
+            include_visible_window=True,
+        )
+
+        assert entry_passes_filters(entries[0], PickerFilters(require_naked_eye_visible=True))
+
+    def test_the_naked_eye_filter_drops_a_pass_that_has_none(self, tmp_path):
+        entries = build_picker_entries(
+            self._catalog(),
+            self._tle_dir(tmp_path),
+            OBSERVER,
+            HorizonMask(),
+            self.DAYLIGHT_NEXT_PASS,
+            hours=24.0,
+            include_visible_window=True,
+        )
+
+        assert not entry_passes_filters(entries[0], PickerFilters(require_naked_eye_visible=True))
+
+    def test_the_filter_empties_the_table_when_windows_were_never_computed(self, tmp_path):
+        # The trap PickerFilters' own docstring warns about, pinned so
+        # the warning cannot quietly stop being true. A caller that
+        # ships this filter without include_visible_window=True sees an
+        # empty table and no error.
+        entries = build_picker_entries(
+            self._catalog(), self._tle_dir(tmp_path), OBSERVER, HorizonMask(), NOW, hours=24.0
+        )
+
+        assert not entry_passes_filters(entries[0], PickerFilters(require_naked_eye_visible=True))
+
+
 class TestSortKey:
     """Direct tests of the private sort key, since proving order needs
     more than one distinct satellite and a real second orbit isn't
